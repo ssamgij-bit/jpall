@@ -1,0 +1,73 @@
+name: JP_ALL
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # 10분마다 시작 시도(실행 중이면 대기) → 끊김 없이 이어서 실행
+  workflow_dispatch: {}
+
+concurrency:
+  group: jpall
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: 이전 상태 불러오기(state 브랜치)
+        run: |
+          git clone --depth 1 -b state "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" state \
+            || mkdir -p state
+
+      - name: 채널 ID 확인
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHANNEL_SECRET: ${{ secrets.CHANNEL_ID }}
+        run: |
+          if [ -n "$CHANNEL_SECRET" ]; then echo "CHANNEL_ID=$CHANNEL_SECRET" >> "$GITHUB_ENV"; exit 0; fi
+          if [ -s state/channel.txt ]; then echo "CHANNEL_ID=$(cat state/channel.txt)" >> "$GITHUB_ENV"; exit 0; fi
+          # 봇이 관리자로 추가된 채널을 텔레그램 업데이트에서 자동으로 찾음(최근 24시간)
+          ID=$(curl -s "https://api.telegram.org/bot${TELEGRAM_TOKEN}/getUpdates" | python3 -c '
+          import sys, json
+          r = json.load(sys.stdin).get("result", [])
+          chats = []
+          for u in r:
+              for k in ("my_chat_member", "channel_post"):
+                  c = (u.get(k) or {}).get("chat") or {}
+                  if c.get("type") == "channel": chats.append(c)
+          pick = [c for c in chats if "공시" in c.get("title", "")] or chats
+          print(pick[-1]["id"] if pick else "")')
+          if [ -z "$ID" ]; then echo "::error::채널을 찾지 못했습니다. 채널에 글을 하나 올린 뒤 다시 실행하세요."; exit 1; fi
+          echo "$ID" > state/channel.txt
+          echo "CHANNEL_ID=$ID" >> "$GITHUB_ENV"
+          echo "채널 ID: $ID"
+
+      - name: 공시 게시
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          RUN_SECONDS: "1680"
+        run: python jpall.py
+
+      - name: 상태 저장(state 브랜치에 덮어쓰기)
+        if: always()
+        run: |
+          cd state
+          rm -rf .git
+          git init -q -b state
+          git config user.name "jpall-bot"
+          git config user.email "jpall-bot@users.noreply.github.com"
+          git add -A
+          git commit -qm "state $(date -u +%FT%TZ)" || exit 0
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" state
