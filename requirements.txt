@@ -1,0 +1,6 @@
+pandas
+openpyxl
+lxml
+pdfminer.six
+pykakasi
+yfinance
