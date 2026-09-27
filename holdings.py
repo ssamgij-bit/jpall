@@ -67,11 +67,16 @@ def pick(d, el, agg=True):
         if v not in ("", "－", "-"): return v
     return None
 
-PURPOSE = [("重要提案", "경영 제안(행동주의)"), ("経営参加", "경영 참여"), ("支配", "경영권"), ("政策投資", "정책투자"), ("純投資", "순투자"),
+PURPOSE = [("商品在庫", "증권사 재고"), ("重要提案", "경영 제안(행동주의)"), ("経営参加", "경영 참여"), ("支配", "경영권"), ("政策投資", "정책투자"), ("純投資", "순투자"),
            ("担保", "담보"), ("業務", "사업상"), ("事業", "사업상"), ("貸株", "대차"), ("運用", "운용"), ("トレーディング", "트레이딩")]
+NEG = re.compile(r"^[^。]{0,25}?(ない|せず|しない|ありません|予定はな|意図はな)")
 def purpose_ko(p):
     p = J.nfkc(p or "")
-    got = [k for j, k in PURPOSE if j in p]
+    got = []
+    for j, k in PURPOSE:
+        i = p.find(j)
+        # "重要提案行為等を行うことは予定していない"처럼 부정문이면 제외
+        if i >= 0 and not (j in ("重要提案", "経営参加", "支配") and NEG.search(p[i:])) and not (j == "業務" and "商品在庫" in p): got.append(k)
     return "·".join(dict.fromkeys(got))[:20] if got else ("기타" if p else "")
 
 def record(meta, d):
@@ -87,20 +92,22 @@ def record(meta, d):
         "issuer": J.nfkc(pick(d, "NameOfIssuer") or ""), "holder": J.nfkc(pick(d, "Name", agg=False) or meta.get("filerName") or ""),
         "joint": max(1, len(holders)), "cur": cur, "prev": prev,
         "delta": round(cur - prev, 2) if cur is not None and prev is not None else None,
-        "purpose": purpose_ko(pick(d, "PurposeOfHolding")), "url": PDF.format(meta["docID"]),
+        "praw": J.nfkc(pick(d, "PurposeOfHolding") or "")[:300], "url": PDF.format(meta["docID"]),
     }
 
 ASCII_IN_PAREN = re.compile(r"[（(]\s*([A-Za-z0-9][A-Za-z0-9 .,&'’\-/]+?)\s*[)）]")
+LEGAL = re.compile(r"(株式会社|合同会社|有限会社|合資会社|合名会社|一般社団法人|一般財団法人|公益財団法人|公益社団法人|有限責任事業組合)")
 def holder_label(st, names):
-    """보유자명 한국어/영문 표기: 괄호 안 영문이 있으면 그것, 없으면 번역"""
-    out, need = {}, []
+    """보유자명 한국어/영문 표기: 괄호 안 영문이 있으면 그것, 없으면 일본어 읽기(고유명사는 번역하지 않음)"""
+    out = {}
     for n in names:
         m = ASCII_IN_PAREN.search(n)
-        if m: out[n] = m.group(1).strip()
-        elif re.fullmatch(r"[A-Za-z0-9 .,&'’\-/]+", n): out[n] = n
-        else: need.append(n)
-    tr = J.translate(st, need) if need else {}
-    for n in need: out[n] = tr.get(n) or n
+        if m: out[n] = m.group(1).strip(); continue
+        if re.fullmatch(r"[A-Za-z0-9 .,&'’\-/]+", n): out[n] = n; continue
+        core = LEGAL.sub("", n).replace("證券", "証券").strip(" ・") or n
+        tail = next((ko for jp, ko in (("投資信託", "투자신탁"), ("投信", "투신")) if core.endswith(jp) and core != jp), None)
+        if tail: core = core[:-len(next(jp for jp in ("投資信託", "投信") if core.endswith(jp)))]
+        out[n] = (J.jp2ko(core) or core) + (tail or "")
     return out
 
 def main():
@@ -108,7 +115,7 @@ def main():
         print("EDINET_API_KEY 없음 → 대량보유 수집 건너뜀"); return
     st = J.load("state.json", {})
     names = J.load_names(st)
-    db = J.load("holdings_db.json", {})           # docID → record
+    db = {k: v for k, v in J.load("holdings_db.json", {}).items() if "praw" in v}   # docID → record (구버전 기록은 다시 받음)
     prog = J.load("holdings_prog.json", {})       # 날짜별 목록 처리 상태
     today = J.now().date()
     days = [(today - dt.timedelta(days=i)).isoformat() for i in range(DAYS)]
@@ -148,10 +155,18 @@ def main():
     J.save("state.json", st)  # 번역 캐시 저장
     def slim(r):
         nm = names.get(r["code"]) or {}
+        r = {k: v for k, v in r.items() if k != "praw"}
+        r["purpose"] = purpose_ko(db[r["id"]].get("praw"))
         return {**r, "issuer_ko": nm.get("ko") or J.jp2ko(r["issuer"].replace("株式会社", "")), "holder_ko": hl.get(r["holder"], r["holder"])}
     main_recs = [r for r in recs if r["kind"] != "fix"]
-    ups = sorted([r for r in main_recs if (r["delta"] or 0) > 0], key=lambda r: -r["delta"])[:10]
-    downs = sorted([r for r in main_recs if (r["delta"] or 0) < 0], key=lambda r: r["delta"])[:10]
+    def uniq(rs):  # 같은 보고가 두 번 제출된 경우(보유자·종목·비율 동일) 하나만
+        seen, out = set(), []
+        for r in rs:
+            k = (r["code"], r["holder"], r["prev"], r["cur"])
+            if k not in seen: seen.add(k); out.append(r)
+        return out
+    ups = uniq(sorted([r for r in main_recs if (r["delta"] or 0) > 0], key=lambda r: -r["delta"]))[:10]
+    downs = uniq(sorted([r for r in main_recs if (r["delta"] or 0) < 0], key=lambda r: r["delta"]))[:10]
     new5 = [r for r in main_recs if r["kind"] == "new"]
     by_holder = {}
     for r in main_recs:
