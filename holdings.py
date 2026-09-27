@@ -7,7 +7,7 @@
 - 대상: docTypeCode 350(大量保有報告書·変更報告書), 360(訂正報告書)
 - 환경 변수: EDINET_API_KEY(필수), STATE_DIR(기본 state), HOLD_DAYS(기본 30), HOLD_BUDGET(초, 기본 480)
 """
-import os, re, io, json, time, zipfile, datetime as dt, urllib.request, urllib.parse, sys
+import os, re, io, json, time, zipfile, html, datetime as dt, urllib.request, urllib.parse, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import jpall as J
@@ -97,17 +97,19 @@ def record(meta, d):
 
 ASCII_IN_PAREN = re.compile(r"[（(]\s*([A-Za-z0-9][A-Za-z0-9 .,&'’\-/]+?)\s*[)）]")
 LEGAL = re.compile(r"(株式会社|合同会社|有限会社|合資会社|合名会社|一般社団法人|一般財団法人|公益財団法人|公益社団法人|有限責任事業組合)")
+TITLE = re.compile(r"(代表取締役社長|代表取締役|取締役社長|取締役|代表社員|代表理事|会長|社長|理事長)")
 def holder_label(st, names):
     """보유자명 한국어/영문 표기: 괄호 안 영문이 있으면 그것, 없으면 일본어 읽기(고유명사는 번역하지 않음)"""
     out = {}
-    for n in names:
+    for n0 in names:
+        n = html.unescape(n0)
         m = ASCII_IN_PAREN.search(n)
-        if m: out[n] = m.group(1).strip(); continue
-        if re.fullmatch(r"[A-Za-z0-9 .,&'’\-/]+", n): out[n] = n; continue
-        core = LEGAL.sub("", n).replace("證券", "証券").strip(" ・") or n
+        if m: out[n0] = m.group(1).strip(); continue
+        if re.fullmatch(r"[A-Za-z0-9 .,&'’\-/]+", n): out[n0] = n; continue
+        core = TITLE.sub(" ", LEGAL.sub("", n)).replace("證券", "証券").strip(" ・") or n
         tail = next((ko for jp, ko in (("投資信託", "투자신탁"), ("投信", "투신")) if core.endswith(jp) and core != jp), None)
         if tail: core = core[:-len(next(jp for jp in ("投資信託", "投信") if core.endswith(jp)))]
-        out[n] = (J.jp2ko(core) or core) + (tail or "")
+        out[n0] = re.sub(r"\s+", " ", (J.jp2ko(core) or core) + (tail or "")).strip()
     return out
 
 def main():
