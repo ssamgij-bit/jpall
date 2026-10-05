@@ -38,6 +38,15 @@ jobs:
           HOLD_BUDGET: "540"
         run: python holdings.py
 
+      - name: 업종 PER·순이익 이력(JPX, 하루 1회)
+        continue-on-error: true
+        env:
+          STATE_DIR: data
+        run: |
+          command -v pdftotext >/dev/null || sudo apt-get install -y -qq poppler-utils >/dev/null
+          pip install -q xlrd
+          python sector_hist.py
+
       - name: 데이터 저장(data 브랜치에 덮어쓰기)
         if: always()
         run: |
