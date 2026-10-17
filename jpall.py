@@ -26,6 +26,8 @@ CHANNEL = os.environ.get("CHANNEL_ID", "")
 SEND_GAP = 3.3          # 채널 게시 간격(초) — 텔레그램 채널 한도(분당 약 20건) 대응
 UA = {"User-Agent": "Mozilla/5.0 (JP_ALL disclosure bot)"}
 SKIP = ["日々の開示事項", "基準価額と市場価格"]  # ETF·ETN 일일 공시(수십 건/일, 내용 없음)
+DIGEST_HOUR = int(os.environ.get("DIGEST_HOUR", "19"))  # 하이라이트 요약 발송 시각(JST=KST)
+HL = {}  # 공시 1건 처리 중 본문 함수가 남기는 핵심 수치(하이라이트 판정용)
 
 def now(): return dt.datetime.now(JST)
 def nfkc(s): return unicodedata.normalize("NFKC", s or "")
@@ -270,6 +272,8 @@ def body_results(row, st):
             if cons and cons.get("eps"):
                 ex = f" (예상치 {cons['eps']:,.1f}엔 / {pct(e, cons['eps']):+.0f}%)" if cons["eps"] > 0 else f" (예상치 {cons['eps']:,.1f}엔)"
             lines.append(f"EPS : {e:,.1f}엔{ex}")
+        HL.update(kind="res", q=q, single=single, cons=cons, end=r["end"])
+        if py and py[3] is not None: HL["op_py"] = py[3] * 1e6
         if cons and (cons.get("rev") or cons.get("eps")):
             lines.append(f"<i>예상치: Yahoo Finance 애널리스트 평균(매출 {cons.get('rev_n', 0)}명·EPS {cons.get('eps_n', 0)}명)</i>")
         lines.append("")
@@ -290,6 +294,7 @@ def body_results(row, st):
             if fc.get(m) is None: continue
             c = chg_txt(fc[m], r.get(m)) if q == 4 else ""
             parts.append(f"{lab} {oku(fc[m])}" + (f"({c})" if c else ""))
+        HL.update(fc=fc, fc_fy=fyl, op_cum=r.get("op"), ord_cum=r.get("ord"), q=q, kind="res")
         if lines[-1]: lines.append("")
         lines.append(f"<b>회사 가이던스({fyl}{', ' + r['fc_kind'] if r.get('fc_kind') else ''})</b> : " + " / ".join(parts))
         if q < 4:
@@ -322,6 +327,7 @@ def body_revision(row):
         mm = d.month + add; fy = f"FY{(mm - 1) % 12 + 1}/{str(d.year + (mm - 1) // 12)[2:]}"
     except Exception: pass
     lines = [f"<b>[실적 전망 수정 · {fy} {per} · {r['scope']}]</b>"]
+    HL.update(kind="rev", fy=fy, per=per, rows=r["rows"])
     for m, lab in [("rev", "매출액"), ("op", "영업익"), ("ord", "경상익"), ("ni", "순이익")]:
         a, b = r["rows"][m]
         if b is None: continue
@@ -337,6 +343,7 @@ def body_dividend(row):
     r = X.summarize_dividend(facts, ctx)
     if not r: return None
     f = lambda v: f"{v:,.2f}엔" if v is not None else "미정"
+    HL.update(kind="div", prev=r["prev"], curr=r["curr"])
     s = f"<b>[배당 전망 수정 · 연간 주당배당]</b>\n{f(r['prev'])} → {f(r['curr'])}"
     if r["prev"] and r["curr"] is not None: s += f" ({pct(r['curr'], r['prev']):+.1f}%)"
     if r["last"] is not None: s += f"\n전기 실적 : {f(r['last'])}"
@@ -362,6 +369,7 @@ def body_buyback(row):
     if amt:
         yen = float(amt[0].replace(",", "")) * {"": 1, "千": 1e3, "百万": 1e6, "億": 1e8}[amt[1]]
         parts.append(f"{oku(yen)}엔")
+    HL.update(kind="bb", ratio=float(ratio) if ratio else None, yen=yen if amt else None)
     s = "<b>[자사주 취득 결정]</b>\n" + " / ".join(parts)
     if per: s += f"\n기간 : {per[0]}.{int(per[1]):02d}.{int(per[2]):02d}~{per[3]}.{int(per[4]):02d}.{int(per[5]):02d}"
     return s
@@ -372,6 +380,7 @@ def body_tob(row):
     per = re.search(r"買付け?等の期間" + DATE + r".{0,4}?" + DATE, t)
     prem = re.search(r"([\d.]+)%(?:\([^)]*\))?のプレミアム", t)
     if not p: return None
+    HL.update(kind="tob", price=p.group(1), prem=prem.group(1) if prem else None)
     s = f"<b>[공개매수]</b>\n매수가격 : 주당 {p.group(1)}엔"
     if prem: s += f" (공표 전일 종가 대비 프리미엄 {prem.group(1)}%)"
     if per: s += f"\n기간 : {per.group(1)}.{int(per.group(2)):02d}.{int(per.group(3)):02d}~{per.group(4)}.{int(per.group(5)):02d}.{int(per.group(6)):02d}"
@@ -388,6 +397,7 @@ def build(row, st, names, quotes, trmap):
             f"보고서명: {trmap.get(row['title']) or row['title']}"]
     body = None
     title = row["title"]
+    HL.clear()
     try:
         if row.get("xbrl"):
             if "決算短信" in title and "訂正" not in title: body = body_results(row, st)
@@ -399,10 +409,245 @@ def build(row, st, names, quotes, trmap):
             body = body_tob(row)
     except Exception as e:
         log("body error", code, title[:30], e)
+    try:
+        if body: record_hl(row, st, name_ko, quotes.get(code), trmap.get(title) or title)
+    except Exception as e:
+        log("highlight error", code, e)
     msg = "\n".join(head)
     if body: msg += "\n\n" + body
     msg += f"\n\n공시링크: {row['pdf']}\n회사정보: https://kabutan.jp/stock/?code={code}"
     return msg
+
+# ───────────────────────── 하이라이트(매일 19시 요약) ─────────────────────────
+# 판정 기준
+BEAT_EPS = 10      # 분기 EPS가 컨센서스 대비 +10% 이상
+BEAT_REV = 5       # 분기 매출이 컨센서스 대비 +5% 이상
+NEWFC_OP = 20      # 연간 결산 때 새 회계연도 영업익 가이던스가 전기 대비 +20% 이상
+HIGROWTH = 50      # 컨센서스 없는 종목: 분기 영업익 YoY +50% 이상
+HIGROWTH_MCAP = 3e10  # …이면서 시가총액 300억엔 이상
+BB_RATIO = 1.0     # 자사주 취득 한도가 발행주식의 1% 이상
+MISS_EPS = -10     # 분기 EPS가 컨센서스 대비 -10% 이하(또는 예상 흑자인데 적자)
+MISS_REV = -5      # 분기 매출이 컨센서스 대비 -5% 이하
+SECTIONS = [("beat", "① 컨센서스 상회 실적"), ("up", "② 실적 가이던스 상향"), ("newfc", "③ 결산 + 새 회계연도 가이던스 고성장"),
+            ("grow", "④ 고성장 실적 (컨센서스 없음, 시총 300억엔↑)"), ("ret", "⑤ 증배 · 자사주 · 공개매수"),
+            ("miss", "⑥ 컨센서스 하회 실적"), ("down", "⑦ 실적 가이던스 하향")]
+
+def _p(x): return f"{x:+.0f}%"
+def record_hl(row, st, name_ko, q, title_ko):
+    """방금 처리한 공시가 하이라이트 기준에 맞으면 st['hl']에 저장"""
+    h = dict(HL); items = []
+    if h.get("kind") == "res":
+        qq = h.get("q"); sg = h.get("single") or {}; cons = h.get("cons") or {}
+        ql = f"{qq}Q" if qq and qq < 4 else "4Q"
+        e, ce = sg.get("eps"), cons.get("eps"); rv, cr = sg.get("rev"), cons.get("rev")
+        es = pct(e, ce) if (e is not None and ce and ce > 0) else None
+        rs = pct(rv, cr) if (rv is not None and cr) else None
+        op, opp = sg.get("op"), h.get("op_py")
+        oy = chg_txt(op, opp) if op is not None and opp is not None else ""
+        beat = (es is not None and es >= BEAT_EPS and e > 0) or (rs is not None and rs >= BEAT_REV and not (es is not None and es <= MISS_EPS))
+        miss = not beat and ((es is not None and (es <= MISS_EPS or e < 0)) or (rs is not None and rs <= MISS_REV))
+        if beat or miss:
+            parts = []
+            if es is not None: parts.append(f"EPS {e:,.1f}엔(예상 {ce:,.1f}엔, " + ("적자" if e < 0 else _p(es)) + ")")
+            if rs is not None: parts.append(f"매출 {oku(rv)}엔(예상 대비 {_p(rs)})")
+            if oy: parts.append(f"영업익 {oku(op)}엔(YoY {oy})")
+            n = max(cons.get("eps_n", 0), cons.get("rev_n", 0))
+            items.append(("beat" if beat else "miss", f"{ql} 단독 " + " · ".join(parts) + (f" [애널 {n}명]" if n else "")))
+        elif not cons and op is not None and opp and opp > 0 and op > 0 and pct(op, opp) >= HIGROWTH \
+                and ((q or {}).get("marketCap") or 0) >= HIGROWTH_MCAP:
+            items.append(("grow", f"{ql} 단독 영업익 {oku(op)}엔(YoY {oy})" + (f" · 매출 {oku(rv)}엔" if rv is not None else "")))
+        fc = h.get("fc") or {}
+        if qq == 4 and fc:
+            key = "op" if fc.get("op") is not None and h.get("op_cum") else ("ord" if fc.get("ord") is not None and h.get("ord_cum") else None)
+            if key:
+                a, b = h[key + "_cum"], fc[key]
+                g = pct(b, a) if a > 0 else None
+                if (g is not None and g >= NEWFC_OP) or (a <= 0 < b):
+                    lab = {"op": "영업익", "ord": "경상익"}[key]
+                    items.append(("newfc", f"{h.get('fc_fy','')} {lab} 가이던스 {oku(b)}엔(전기 {oku(a)}엔 대비 {chg_txt(b, a)})"))
+    elif h.get("kind") == "rev":
+        rows = h["rows"]
+        for key, lab in [("op", "영업익"), ("ord", "경상익"), ("ni", "순이익")]:
+            a, b = rows.get(key, (None, None))
+            if a is None or b is None: continue
+            if b != a and (a > 0 or b > 0):
+                extra = []
+                for k2, l2 in [("rev", "매출"), ("ni", "순이익")]:
+                    a2, b2 = rows.get(k2, (None, None))
+                    if k2 != key and a2 is not None and b2 is not None and chg_txt(b2, a2): extra.append(f"{l2} {chg_txt(b2, a2)}")
+                items.append(("up" if b > a else "down", f"{h['fy']} {h['per']} {lab} {oku(a)}→{oku(b)}엔({chg_txt(b, a)})" + (f" · {' · '.join(extra)}" if extra else "")))
+            break  # 영업익 기준(없으면 경상익→순이익)으로 한 번만 판정
+    elif h.get("kind") == "div":
+        a, b = h.get("prev"), h.get("curr")
+        if a and b is not None and b > a: items.append(("ret", f"증배 : 연간 배당 {a:,.2f}→{b:,.2f}엔({pct(b, a):+.1f}%)"))
+    elif h.get("kind") == "bb":
+        if h.get("ratio") and h["ratio"] >= BB_RATIO:
+            items.append(("ret", f"자사주 취득 : 발행주식의 {h['ratio']:g}%" + (f" / {oku(h['yen'])}엔" if h.get("yen") else "")))
+    elif h.get("kind") == "tob":
+        items.append(("ret", f"공개매수 : 주당 {h['price']}엔" + (f"(프리미엄 {h['prem']}%)" if h.get("prem") else "") + f" — {esc(title_ko)[:40]}"))
+    if not items: return
+    src = ""
+    try: src = reason_src(row, h.get("kind"))
+    except Exception as e: log("reason src error", row["code"], e)
+    hl = st.setdefault("hl", [])
+    have = {(x["id"], x["sec"]) for x in hl}
+    mc = (q or {}).get("marketCap") or 0
+    for sec, txt in items:
+        if (row["id"], sec) in have: continue
+        hl.append({"id": row["id"], "sec": sec, "code": row["code"], "name": name_ko, "mc": mc, "mct": mcap_txt(q),
+                   "txt": txt, "pdf": row["pdf"], "ts": time.time(), "sent": False, "src": src})
+
+# 공시 PDF에서 '이유'가 적힌 부분(일본어 원문)을 잘라 둠 → 19시 요약 때 AI가 한 줄로 정리
+REASON_HEAD = {
+    "res": ["経営成績に関する説明", "経営成績等の概況", "経営成績の概況", "当四半期決算に関する定性的情報", "経営成績の状況", "業績の状況"],
+    "rev": ["修正の理由", "修正理由", "差異の理由", "理由"],
+    "div": ["修正の理由", "理由"],
+    "bb": ["取得を行う理由", "取得する理由", "理由"],
+    "tob": ["公開買付けの目的", "買付け等の目的", "目的", "理由"],
+}
+def reason_src(row, kind):
+    heads = REASON_HEAD.get(kind)
+    if not heads: return ""
+    from pdfminer.high_level import extract_text
+    t = nfkc(extract_text(io.BytesIO(http(row["pdf"], timeout=40)), maxpages=6 if kind == "res" else 3))
+    t = re.sub(r"[ \t\u3000]+", "", t); t = re.sub(r"\n+", "\n", t)
+    n = 2500 if kind == "res" else 1200
+    out = ""
+    for hd in heads:
+        best = ""
+        for m in re.finditer(re.escape(hd), t):
+            seg = t[m.end():m.end() + n]
+            if "」" in seg[:25] or "目次" in seg[:60]: continue  # 다른 절 참조·목차
+            if re.match(r"[.…‥・\s\d]{0,6}[.…‥]{3}", seg) or re.match(r"[.…‥\s]*\d+\s*\n", seg): continue  # 목차 줄
+            if len(re.sub(r"[\d,.%△▲\s]", "", seg[:300])) < 80: continue  # 숫자 표
+            best = seg; break
+        if best: out = best.replace("\n", ""); break
+    if kind == "res":  # 결산이면 '향후 전망'(새 가이던스 근거)도 덧붙임
+        for m in re.finditer(r"今後の見通し", t):
+            seg = t[m.end():m.end() + 800]
+            if "」" in seg[:25] or re.match(r"[.…‥\s\d]{0,6}[.…‥]{3}", seg): continue
+            out += " [今後の見通し] " + seg.replace("\n", ""); break
+    return out
+
+GEMINI_MODELS = [m.strip() for m in os.environ.get("GEMINI_MODELS", "gemini-3.8-flash,gemini-3.7-flash,gemini-3.5-flash,gemini-3.1-flash-lite").split(",") if m.strip()]
+def gemini_json(prompt):
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key: return None
+    for model in GEMINI_MODELS:
+        try:
+            body = json.dumps({"contents": [{"parts": [{"text": prompt}]}],
+                               "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8000, "responseMimeType": "application/json"}}).encode()
+            r = json.loads(http(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}",
+                                timeout=150, data=body, headers={"content-type": "application/json"}))
+            txt = "".join(p.get("text", "") for p in r["candidates"][0]["content"]["parts"])
+            return json.loads(re.sub(r"^```(json)?|```$", "", txt.strip()))
+        except Exception as e:
+            log("gemini error", model, str(e)[:150])
+    return None
+
+AI_PROMPT = """너는 일본 주식 애널리스트다. 아래는 오늘 도쿄증시 적시공시 중 하이라이트로 뽑힌 항목들이다.
+각 항목에는 [분류], 기업, 핵심 수치, 그리고 공시 원문(일본어)에서 이유·설명 부분을 잘라낸 글이 있다.
+
+할 일
+1. reasons: 항목마다 "왜 이런 결과/결정이 나왔는지"를 한국어 한 문장(60자 이내)으로. 원문에 적힌 사유만 쓰고, 원문에 사유가 없으면 "공시에 사유 기재 없음". 추측 금지. 일본어 고유명사는 한글로.
+2. top: 투자자 관점에서 오늘 가장 중요한 공시 최대 3개를 골라, 왜 중요한지 한국어 한 문장(80자 이내)으로. 시가총액, 서프라이즈·수정 폭, 사유의 지속성(일회성인지 구조적인지)을 고려.
+
+출력은 JSON만: {{"reasons": {{"번호": "사유"}}, "top": [{{"i": 번호, "why": "이유"}}]}}
+
+항목:
+{items}
+"""
+def ai_reasons(items):
+    """{item 위치: 사유}, [(위치, 중요한 이유)]"""
+    reasons, top = {}, []
+    for i0 in range(0, len(items), 25):
+        part = items[i0:i0 + 25]
+        lines = []
+        for j, x in enumerate(part):
+            lines.append(f"#{i0 + j + 1} [{dict(SECTIONS)[x['sec']]}] {x['name']} {x['code']} (시총 {x['mct'] or '?'}) : {x['txt']}\n원문: {x.get('src') or '(없음)'}")
+        out = gemini_json(AI_PROMPT.format(items="\n\n".join(lines)))
+        if not out: break
+        for k, v in (out.get("reasons") or {}).items():
+            try: reasons[int(str(k).strip("#")) - 1] = str(v).strip()
+            except ValueError: pass
+        for t in out.get("top") or []:
+            try: top.append((int(str(t["i"]).strip("#")) - 1, str(t["why"]).strip()))
+            except Exception: pass
+    if len(items) > 25: top = top[:3]
+    return reasons, top
+
+def fallback_reasons(st, items):
+    """AI 키가 없을 때: 원문 사유의 첫 문장을 번역"""
+    srcs = {}
+    for i, x in enumerate(items):
+        s = (x.get("src") or "").split(" [今後の見通し] ")[0]
+        sents = re.findall(r"[^。]{15,200}。", s)
+        pick = [z for z in sents if re.search(r"増収|減収|増益|減益|上回|下回|増加|減少|伸長|好調|低調|不振|寄与|影響|理由|ため", z) and "経済" not in z]
+        if pick or sents: srcs[i] = (pick or sents)[0]
+    tr = translate(st, list(srcs.values()))
+    return {i: tr.get(v) for i, v in srcs.items() if tr.get(v)}
+
+def digest_text(items, day, reasons=None, top=None):
+    reasons = reasons or {}; top = top or []
+    wd = "월화수목금토일"[day.weekday()]
+    out = [f"📊 <b>{day.month}/{day.day}({wd}) 일본 공시 하이라이트</b>", f"<i>{DIGEST_HOUR}:00 기준 · 섹션별 시가총액순 · 기업명 누르면 공시 원문</i>"]
+    if not items:
+        return "\n".join(out + ["", "오늘은 기준에 맞는 공시가 없습니다."])
+    if top:
+        out += ["", "<b>⭐ 오늘의 핵심</b>"]
+        for i, why in top:
+            if 0 <= i < len(items):
+                x = items[i]; out.append(f"• <a href=\"{x['pdf']}\">{esc(x['name'])}</a> {x['code']} — {esc(why)}")
+    idx = {id(x): i for i, x in enumerate(items)}
+    for sec, lab in SECTIONS:
+        xs = [x for x in items if x["sec"] == sec]
+        seen = set(); uniq = []
+        for x in sorted(xs, key=lambda x: -x["mc"]):
+            if (x["code"], x["txt"]) in seen: continue
+            seen.add((x["code"], x["txt"])); uniq.append(x)
+        if not uniq: continue
+        out += ["", f"<b>{lab} ({len(uniq)}건)</b>"]
+        for x in uniq[:20]:
+            out.append(f"• <a href=\"{x['pdf']}\">{esc(x['name'])}</a>" + (f"({x['mct']})" if x["mct"] else "") + f" {x['code']}\n   {x['txt']}")
+            rs = reasons.get(idx[id(x)])
+            if rs: out.append(f"   └ 이유: {esc(rs)}")
+        if len(uniq) > 20: out.append(f"   …외 {len(uniq) - 20}건")
+    out += ["", f"<i>기준: 컨센 상회 = 분기 EPS +{BEAT_EPS}%↑ 또는 매출 +{BEAT_REV}%↑ / 하회 = EPS {MISS_EPS}%↓(또는 적자) 또는 매출 {MISS_REV}%↓ (Yahoo Finance 애널리스트 평균, 발표 전 저장) · 가이던스 상·하향 = 회사 실적예상 수정 공시의 영업익(없으면 경상익·순이익) 기준 · 이유 = 공시 원문의 설명 부분을 "
+            + ("AI(Gemini)가 요약" if os.environ.get("GEMINI_API_KEY") else "기계 번역") + ", 원문 확인 권장</i>"]
+    return "\n".join(out)
+
+def split_msg(text, limit=3900):
+    parts, cur = [], ""
+    for blk in text.split("\n"):
+        if len(cur) + len(blk) + 1 > limit and cur: parts.append(cur); cur = ""
+        cur += ("\n" if cur else "") + blk
+    if cur: parts.append(cur)
+    return parts
+
+def maybe_digest(st, force=False):
+    """매일 DIGEST_HOUR시 이후 1회: 그날(TDnet 날짜) 이전 하이라이트를 모아 발송"""
+    t = now(); today = t.strftime("%Y%m%d")
+    if not force and (t.hour < DIGEST_HOUR or st.get("digest_date") == today): return
+    # 그날 오후 공시 처리가 아직 밀려 있으면 최대 1시간 기다림
+    if not force and t.hour < DIGEST_HOUR + 1 and any(r["d"] == today for r in st.get("queue", [])): return
+    hl = st.setdefault("hl", [])
+    items = [x for x in hl if not x["sent"]]
+    has_disc = bool(st.get("seen", {}).get(today))
+    if items or (has_disc and t.weekday() < 5):
+        ok = True
+        reasons, top = {}, []
+        if items:
+            try:
+                reasons, top = ai_reasons(items)
+                if not reasons: reasons = fallback_reasons(st, items)
+            except Exception: traceback.print_exc()
+        for part in split_msg(digest_text(items, t.date(), reasons, top)):
+            ok = tg_send(part) and ok; time.sleep(SEND_GAP)
+        if not ok: log("digest send failed"); return
+        for x in items: x["sent"] = True
+        log("digest sent", len(items))
+    st["digest_date"] = today
+    st["hl"] = [x for x in hl if time.time() - x["ts"] < 86400 * 3]
 
 # ───────────────────────── 텔레그램 ─────────────────────────
 def tg_send(text):
@@ -466,6 +711,8 @@ def main():
     last_scan = time.time(); last_send = 0
     quotes = {}
     while time.time() - t0 < RUN_SECONDS:
+        try: maybe_digest(st)
+        except Exception: traceback.print_exc()
         q = st.get("queue", [])
         if not q:
             if time.time() - last_scan > 60 and time.time() - t0 < RUN_SECONDS - 30:
