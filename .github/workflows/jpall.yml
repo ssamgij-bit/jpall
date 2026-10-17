@@ -57,6 +57,7 @@ jobs:
       - name: 공시 게시
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           RUN_SECONDS: "1680"
         run: python jpall.py
 
