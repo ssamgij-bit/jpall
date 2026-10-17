@@ -160,6 +160,10 @@ def consensus_work(st, limit=60):
                 rec["rev"] = float(re_.loc["0q", "avg"]); rec["rev_n"] = int(re_.loc["0q", "numberOfAnalysts"] or 0)
             if ee is not None and "0q" in ee.index and ee.loc["0q", "avg"] == ee.loc["0q", "avg"]:
                 rec["eps"] = float(ee.loc["0q", "avg"]); rec["eps_n"] = int(ee.loc["0q", "numberOfAnalysts"] or 0)
+            if re_ is not None and "+1y" in re_.index and re_.loc["+1y", "avg"] == re_.loc["+1y", "avg"]:
+                rec["rev_y1"] = float(re_.loc["+1y", "avg"])
+            if ee is not None and "+1y" in ee.index and ee.loc["+1y", "avg"] == ee.loc["+1y", "avg"]:
+                rec["eps_y1"] = float(ee.loc["+1y", "avg"]); rec["eps_y1_n"] = int(ee.loc["+1y", "numberOfAnalysts"] or 0)
             if len(rec) > 1: cons[c] = rec
         except Exception as e:
             log("cons error", c, e)
@@ -225,6 +229,18 @@ def mcap_txt(q):
     x = mc / 1e8
     return f"{x/1e4:,.1f}조엔" if x >= 1e4 else f"{x:,.0f}억엔"
 
+def hist_progress(kq, start, q, idx):
+    """가부탄 분기표로 과거 회계연도의 같은 분기 누적 진척률(누적 이익 ÷ 연간 실적, %) 목록"""
+    out = []
+    for back in (1, 2):
+        s0 = dt.date(start.year - back, start.month, 1); s1 = dt.date(start.year - back + 1, start.month, 1)
+        qs = sorted([k for k in kq if s0 <= k[0] < s1], key=lambda k: k[0])
+        if len(qs) != 4 or any(k[idx] is None for k in qs): continue
+        full = sum(k[idx] for k in qs)
+        if full <= 0: continue
+        out.append(sum(k[idx] for k in qs[:q]) / full * 100)
+    return out
+
 # ───────────────────────── 공시 종류별 본문 ─────────────────────────
 def body_results(row, st):
     blob = http(row["xbrl"], timeout=40)
@@ -253,6 +269,7 @@ def body_results(row, st):
     qlabel = f"{q}Q" if q < 4 else "4Q"
     cons = st.get("cons", {}).get(row["code"])
     if cons and time.time() - cons["ts"] > 86400 * 8: cons = None
+    HL.update(cons_all=cons or {})
     if single:
         m0 = (end.month - 2 - 1) % 12 + 1
         lines.append(f"<b>[{qlabel} 단독 · {m0}~{end.month}월 · {r['scope']}]</b>")
@@ -301,7 +318,11 @@ def body_results(row, st):
             key = "op" if fc.get("op") and r.get("op") is not None else ("ord" if fc.get("ord") and r.get("ord") is not None else None)
             if key and fc[key] > 0 and r[key] >= 0:
                 lab = {"op": "영업익", "ord": ordlab}[key]
-                lines.append(f"{lab} 진척률 : {r[key] / fc[key] * 100:.0f}% (누적 {q}Q 기준)")
+                prog = r[key] / fc[key] * 100
+                hp = hist_progress(kq, start, q, 3 if key == "op" else 4)
+                avg = sum(hp) / len(hp) if hp else None
+                lines.append(f"{lab} 진척률 : {prog:.0f}% (누적 {q}Q 기준" + (f" · 과거 {len(hp)}년 평균 {avg:.0f}%" if avg is not None else "") + ")")
+                HL.update(prog=prog, prog_hist=avg, prog_n=len(hp), prog_lab=lab)
     # 최근 분기 추이
     hist = []
     if single and single.get("rev") is not None:
@@ -423,27 +444,34 @@ def build(row, st, names, quotes, trmap):
 BEAT_EPS = 10      # 분기 EPS가 컨센서스 대비 +10% 이상
 BEAT_REV = 5       # 분기 매출이 컨센서스 대비 +5% 이상
 NEWFC_OP = 20      # 연간 결산 때 새 회계연도 영업익 가이던스가 전기 대비 +20% 이상
+NEWFC_CONS = 5     # …또는 새 회계연도 EPS 가이던스가 컨센서스 대비 +5% 이상 (-10% 이하면 하향 섹션)
+PROG_GAP = 10      # 누적 영업익 진척률이 과거 같은 분기 평균보다 +10%p 이상
 HIGROWTH = 50      # 컨센서스 없는 종목: 분기 영업익 YoY +50% 이상
 HIGROWTH_MCAP = 3e10  # …이면서 시가총액 300억엔 이상
 BB_RATIO = 1.0     # 자사주 취득 한도가 발행주식의 1% 이상
 MISS_EPS = -10     # 분기 EPS가 컨센서스 대비 -10% 이하(또는 예상 흑자인데 적자)
 MISS_REV = -5      # 분기 매출이 컨센서스 대비 -5% 이하
-SECTIONS = [("beat", "① 컨센서스 상회 실적"), ("up", "② 실적 가이던스 상향"), ("newfc", "③ 결산 + 새 회계연도 가이던스 고성장"),
-            ("grow", "④ 고성장 실적 (컨센서스 없음, 시총 300억엔↑)"), ("ret", "⑤ 증배 · 자사주 · 공개매수"),
-            ("miss", "⑥ 컨센서스 하회 실적"), ("down", "⑦ 실적 가이던스 하향")]
+SECTIONS = [("beat", "① 컨센서스 상회 실적"), ("up", "② 실적 가이던스 상향"), ("prog", "③ 상향 후보 (진척률이 과거 평균보다 빠름)"),
+            ("newfc", "④ 결산 + 새 회계연도 가이던스 (고성장·컨센 상회)"), ("grow", "⑤ 고성장 실적 (컨센서스 없음, 시총 300억엔↑)"),
+            ("ret", "⑥ 증배 · 자사주 · 공개매수"), ("miss", "⑦ 컨센서스 하회 실적"), ("down", "⑧ 실적 가이던스 하향")]
 
 def _p(x): return f"{x:+.0f}%"
+def per_txt(q, eps, lab="가이던스"):
+    px = (q or {}).get("regularMarketPrice")
+    if not px or not eps or eps <= 0: return ""
+    return f" · {lab} PER {px / eps:.1f}배"
 def record_hl(row, st, name_ko, q, title_ko):
-    """방금 처리한 공시가 하이라이트 기준에 맞으면 st['hl']에 저장"""
+    """방금 처리한 공시가 하이라이트 기준에 맞으면 st['hl']에 저장. 항목: (섹션, 문구, 점수)"""
     h = dict(HL); items = []
     if h.get("kind") == "res":
-        qq = h.get("q"); sg = h.get("single") or {}; cons = h.get("cons") or {}
+        qq = h.get("q"); sg = h.get("single") or {}; cons = h.get("cons") or {}; fc = h.get("fc") or {}
         ql = f"{qq}Q" if qq and qq < 4 else "4Q"
         e, ce = sg.get("eps"), cons.get("eps"); rv, cr = sg.get("rev"), cons.get("rev")
         es = pct(e, ce) if (e is not None and ce and ce > 0) else None
         rs = pct(rv, cr) if (rv is not None and cr) else None
         op, opp = sg.get("op"), h.get("op_py")
         oy = chg_txt(op, opp) if op is not None and opp is not None else ""
+        pe = per_txt(q, fc.get("eps"), "가이던스" if qq < 4 else "새 가이던스")
         beat = (es is not None and es >= BEAT_EPS and e > 0) or (rs is not None and rs >= BEAT_REV and not (es is not None and es <= MISS_EPS))
         miss = not beat and ((es is not None and (es <= MISS_EPS or e < 0)) or (rs is not None and rs <= MISS_REV))
         if beat or miss:
@@ -452,19 +480,40 @@ def record_hl(row, st, name_ko, q, title_ko):
             if rs is not None: parts.append(f"매출 {oku(rv)}엔(예상 대비 {_p(rs)})")
             if oy: parts.append(f"영업익 {oku(op)}엔(YoY {oy})")
             n = max(cons.get("eps_n", 0), cons.get("rev_n", 0))
-            items.append(("beat" if beat else "miss", f"{ql} 단독 " + " · ".join(parts) + (f" [애널 {n}명]" if n else "")))
+            txt = f"{ql} 단독 " + " · ".join(parts) + (f" [애널 {n}명]" if n else "") + pe
+            # 일회성 의심: 컨센은 넘었는데 본업(영업익)은 역성장·적자
+            if beat and op is not None and (op < 0 or (opp is not None and opp > 0 and op < opp)):
+                txt += " ⚠ 영업익은 감소(일회성 이익 가능성)"
+            sc = min(max(es or -999, (rs or -999) * 2), 100)
+            items.append(("beat", txt, sc) if beat else ("miss", txt, -min(es if es is not None else 999, (rs if rs is not None else 999) * 2)))
         elif not cons and op is not None and opp and opp > 0 and op > 0 and pct(op, opp) >= HIGROWTH \
                 and ((q or {}).get("marketCap") or 0) >= HIGROWTH_MCAP:
-            items.append(("grow", f"{ql} 단독 영업익 {oku(op)}엔(YoY {oy})" + (f" · 매출 {oku(rv)}엔" if rv is not None else "")))
-        fc = h.get("fc") or {}
+            items.append(("grow", f"{ql} 단독 영업익 {oku(op)}엔(YoY {oy})" + (f" · 매출 {oku(rv)}엔" if rv is not None else "") + pe, min(pct(op, opp), 200)))
+        # 진척률 → 상향 후보
+        pr, ph = h.get("prog"), h.get("prog_hist")
+        # 과거 평균이 0~100% 사이(계절성 정상)이고, 이번 분기 영업익이 전년보다 줄지 않았을 때만
+        if qq and qq < 4 and pr is not None and ph is not None and 5 <= ph <= 100 and pr - ph >= PROG_GAP and pr >= qq * 25 + 5 \
+                and not (op is not None and opp is not None and op < opp):
+            items.append(("prog", f"누적 {qq}Q {h.get('prog_lab', '영업익')} 진척률 {pr:.0f}% (과거 {h.get('prog_n')}년 같은 분기 평균 {ph:.0f}%, +{pr - ph:.0f}%p)"
+                          + (" · 이미 연간 가이던스 초과" if pr >= 100 else "") + (f" · 이번 분기 영업익 YoY {oy}" if oy else "") + pe, min(pr - ph, 60)))
+        # 결산: 새 회계연도 가이던스
         if qq == 4 and fc:
+            ca = h.get("cons_all") or {}
             key = "op" if fc.get("op") is not None and h.get("op_cum") else ("ord" if fc.get("ord") is not None and h.get("ord_cum") else None)
+            g = None; txt = ""
             if key:
                 a, b = h[key + "_cum"], fc[key]
                 g = pct(b, a) if a > 0 else None
-                if (g is not None and g >= NEWFC_OP) or (a <= 0 < b):
-                    lab = {"op": "영업익", "ord": "경상익"}[key]
-                    items.append(("newfc", f"{h.get('fc_fy','')} {lab} 가이던스 {oku(b)}엔(전기 {oku(a)}엔 대비 {chg_txt(b, a)})"))
+                lab = {"op": "영업익", "ord": "경상익"}[key]
+                txt = f"{h.get('fc_fy','')} {lab} 가이던스 {oku(b)}엔(전기 {oku(a)}엔 대비 {chg_txt(b, a)})"
+                if a <= 0 < b: g = 100
+            cg = pct(fc.get("eps"), ca.get("eps_y1")) if fc.get("eps") and ca.get("eps_y1") and ca["eps_y1"] > 0 else None
+            if cg is not None:
+                txt += (" · " if txt else f"{h.get('fc_fy','')} ") + f"EPS 가이던스 {fc['eps']:,.1f}엔(컨센 {ca['eps_y1']:,.1f}엔 대비 {_p(cg)}, 애널 {ca.get('eps_y1_n', 0)}명)"
+            if (g is not None and g >= NEWFC_OP) or (cg is not None and cg >= NEWFC_CONS):
+                items.append(("newfc", txt + pe, min(max(g or -999, (cg or -999) * 2), 100)))
+            elif cg is not None and cg <= -10:
+                items.append(("down", "새 회계연도 가이던스가 컨센 하회 : " + txt + pe, -cg))
     elif h.get("kind") == "rev":
         rows = h["rows"]
         for key, lab in [("op", "영업익"), ("ord", "경상익"), ("ni", "순이익")]:
@@ -475,16 +524,19 @@ def record_hl(row, st, name_ko, q, title_ko):
                 for k2, l2 in [("rev", "매출"), ("ni", "순이익")]:
                     a2, b2 = rows.get(k2, (None, None))
                     if k2 != key and a2 is not None and b2 is not None and chg_txt(b2, a2): extra.append(f"{l2} {chg_txt(b2, a2)}")
-                items.append(("up" if b > a else "down", f"{h['fy']} {h['per']} {lab} {oku(a)}→{oku(b)}엔({chg_txt(b, a)})" + (f" · {' · '.join(extra)}" if extra else "")))
-            break  # 영업익 기준(없으면 경상익→순이익)으로 한 번만 판정
+                g = pct(b, a) if a > 0 else 100
+                eb = rows.get("eps", (None, None))[1]
+                items.append(("up" if b > a else "down", f"{h['fy']} {h['per']} {lab} {oku(a)}→{oku(b)}엔({chg_txt(b, a)})"
+                              + (f" · {' · '.join(extra)}" if extra else "") + (per_txt(q, eb, "수정 후") if h["per"] == "연간" else ""), min(abs(g), 100)))
+            break  # 영업익 기준(없으면 경상익→순이익)으로 한 번만 판정 — 순이익만 바뀐 수정(일회성)은 제외
     elif h.get("kind") == "div":
         a, b = h.get("prev"), h.get("curr")
-        if a and b is not None and b > a: items.append(("ret", f"증배 : 연간 배당 {a:,.2f}→{b:,.2f}엔({pct(b, a):+.1f}%)"))
+        if a and b is not None and b > a: items.append(("ret", f"증배 : 연간 배당 {a:,.2f}→{b:,.2f}엔({pct(b, a):+.1f}%)", 0))
     elif h.get("kind") == "bb":
         if h.get("ratio") and h["ratio"] >= BB_RATIO:
-            items.append(("ret", f"자사주 취득 : 발행주식의 {h['ratio']:g}%" + (f" / {oku(h['yen'])}엔" if h.get("yen") else "")))
+            items.append(("ret", f"자사주 취득 : 발행주식의 {h['ratio']:g}%" + (f" / {oku(h['yen'])}엔" if h.get("yen") else ""), 0))
     elif h.get("kind") == "tob":
-        items.append(("ret", f"공개매수 : 주당 {h['price']}엔" + (f"(프리미엄 {h['prem']}%)" if h.get("prem") else "") + f" — {esc(title_ko)[:40]}"))
+        items.append(("ret", f"공개매수 : 주당 {h['price']}엔" + (f"(프리미엄 {h['prem']}%)" if h.get("prem") else "") + f" — {esc(title_ko)[:40]}", 0))
     if not items: return
     src = ""
     try: src = reason_src(row, h.get("kind"))
@@ -492,10 +544,10 @@ def record_hl(row, st, name_ko, q, title_ko):
     hl = st.setdefault("hl", [])
     have = {(x["id"], x["sec"]) for x in hl}
     mc = (q or {}).get("marketCap") or 0
-    for sec, txt in items:
+    for sec, txt, sc in items:
         if (row["id"], sec) in have: continue
         hl.append({"id": row["id"], "sec": sec, "code": row["code"], "name": name_ko, "mc": mc, "mct": mcap_txt(q),
-                   "txt": txt, "pdf": row["pdf"], "ts": time.time(), "sent": False, "src": src})
+                   "txt": txt, "pdf": row["pdf"], "ts": time.time(), "sent": False, "src": src, "score": sc or 0})
 
 # 공시 PDF에서 '이유'가 적힌 부분(일본어 원문)을 잘라 둠 → 19시 요약 때 AI가 한 줄로 정리
 REASON_HEAD = {
@@ -590,7 +642,7 @@ def fallback_reasons(st, items):
 def digest_text(items, day, reasons=None, top=None):
     reasons = reasons or {}; top = top or []
     wd = "월화수목금토일"[day.weekday()]
-    out = [f"📊 <b>{day.month}/{day.day}({wd}) 일본 공시 하이라이트</b>", f"<i>{DIGEST_HOUR}:00 기준 · 섹션별 시가총액순 · 기업명 누르면 공시 원문</i>"]
+    out = [f"📊 <b>{day.month}/{day.day}({wd}) 일본 공시 하이라이트</b>", f"<i>{DIGEST_HOUR}:00 기준 · 섹션별 서프라이즈·수정 폭 큰 순 · 기업명 누르면 공시 원문</i>"]
     if not items:
         return "\n".join(out + ["", "오늘은 기준에 맞는 공시가 없습니다."])
     if top:
@@ -599,10 +651,11 @@ def digest_text(items, day, reasons=None, top=None):
             if 0 <= i < len(items):
                 x = items[i]; out.append(f"• <a href=\"{x['pdf']}\">{esc(x['name'])}</a> {x['code']} — {esc(why)}")
     idx = {id(x): i for i, x in enumerate(items)}
+    up_codes = {x["code"] for x in items if x["sec"] == "up"}
     for sec, lab in SECTIONS:
-        xs = [x for x in items if x["sec"] == sec]
+        xs = [x for x in items if x["sec"] == sec and not (sec == "prog" and x["code"] in up_codes)]
         seen = set(); uniq = []
-        for x in sorted(xs, key=lambda x: -x["mc"]):
+        for x in sorted(xs, key=lambda x: (-(x.get("score") or 0), -x["mc"])):
             if (x["code"], x["txt"]) in seen: continue
             seen.add((x["code"], x["txt"])); uniq.append(x)
         if not uniq: continue
@@ -612,9 +665,42 @@ def digest_text(items, day, reasons=None, top=None):
             rs = reasons.get(idx[id(x)])
             if rs: out.append(f"   └ 이유: {esc(rs)}")
         if len(uniq) > 20: out.append(f"   …외 {len(uniq) - 20}건")
-    out += ["", f"<i>기준: 컨센 상회 = 분기 EPS +{BEAT_EPS}%↑ 또는 매출 +{BEAT_REV}%↑ / 하회 = EPS {MISS_EPS}%↓(또는 적자) 또는 매출 {MISS_REV}%↓ (Yahoo Finance 애널리스트 평균, 발표 전 저장) · 가이던스 상·하향 = 회사 실적예상 수정 공시의 영업익(없으면 경상익·순이익) 기준 · 이유 = 공시 원문의 설명 부분을 "
+    out += ["", f"<i>기준: 컨센 상회 = 분기 EPS +{BEAT_EPS}%↑ 또는 매출 +{BEAT_REV}%↑ / 하회 = EPS {MISS_EPS}%↓(또는 적자) 또는 매출 {MISS_REV}%↓ (Yahoo Finance 애널리스트 평균, 발표 전 저장) · 가이던스 상·하향 = 회사 실적예상 수정 공시의 영업익(없으면 경상익) 기준 · 상향 후보 = 누적 영업익 진척률이 과거 같은 분기 평균보다 +{PROG_GAP}%p↑ (가부탄 분기표) · PER = 직전 주가 ÷ 회사 가이던스 EPS · 이유 = 공시 원문의 설명 부분을 "
             + ("AI(Gemini)가 요약" if os.environ.get("GEMINI_API_KEY") else "기계 번역") + ", 원문 확인 권장</i>"]
     return "\n".join(out)
+
+FOLLOW_HM = (15, 40)  # 다음 거래일 장 마감 후 주가 반응 발송 시각(JST)
+def maybe_followup(st):
+    """하이라이트로 보낸 종목의 다음 거래일 주가 반응(종가 등락률)을 한 번 더 발송"""
+    t = now(); today = t.strftime("%Y%m%d")
+    if t.weekday() >= 5 or (t.hour, t.minute) < FOLLOW_HM or st.get("fu_date") == today: return
+    items = [x for x in st.get("hl", []) if x.get("sent") and x.get("dd") and x["dd"] < today and not x.get("fu")]
+    st["fu_date"] = today
+    if not items: return
+    qs = yf_quotes([x["code"] for x in items])
+    rows = []
+    for x in items:
+        qd = qs.get(x["code"]) or {}
+        ts = qd.get("regularMarketTime")
+        if not ts or dt.datetime.fromtimestamp(ts, JST).strftime("%Y%m%d") != today: continue  # 오늘 거래 없음(휴장 등)
+        rows.append((qd.get("regularMarketChangePercent") or 0, x))
+    if not rows:
+        st["fu_date"] = None if t.weekday() < 5 and not qs else today; return
+    wd = "월화수목금토일"[t.weekday()]
+    out = [f"📈 <b>{t.month}/{t.day}({wd}) 하이라이트 종목 주가 반응</b>", "<i>직전 하이라이트에 나온 종목의 오늘 종가 등락률 · 섹션별 상승률순</i>"]
+    for sec, lab in SECTIONS:
+        xs = sorted([(c, x) for c, x in rows if x["sec"] == sec], key=lambda z: -z[0])
+        seen = set(); lines = []
+        for c, x in xs:
+            if x["code"] in seen: continue
+            seen.add(x["code"])
+            lines.append(f"{'🔺' if c > 0 else '🔻' if c < 0 else '▪'} {c:+.1f}% <a href=\"{x['pdf']}\">{esc(x['name'])}</a> {x['code']}")
+        if lines: out += ["", f"<b>{lab}</b>"] + lines[:25] + ([f"   …외 {len(lines) - 25}건"] if len(lines) > 25 else [])
+    out += ["", "<i>장중 공시는 공시 당일에 이미 일부 반영됐을 수 있음 · 시세: Yahoo Finance</i>"]
+    for part in split_msg("\n".join(out)):
+        tg_send(part); time.sleep(SEND_GAP)
+    for c, x in rows: x["fu"] = True
+    log("followup sent", len(rows))
 
 def split_msg(text, limit=3900):
     parts, cur = [], ""
@@ -644,10 +730,10 @@ def maybe_digest(st, force=False):
         for part in split_msg(digest_text(items, t.date(), reasons, top)):
             ok = tg_send(part) and ok; time.sleep(SEND_GAP)
         if not ok: log("digest send failed"); return
-        for x in items: x["sent"] = True
+        for x in items: x["sent"] = True; x["dd"] = today
         log("digest sent", len(items))
     st["digest_date"] = today
-    st["hl"] = [x for x in hl if time.time() - x["ts"] < 86400 * 3]
+    st["hl"] = [x for x in hl if time.time() - x["ts"] < 86400 * 6]
 
 # ───────────────────────── 텔레그램 ─────────────────────────
 def tg_send(text):
@@ -712,6 +798,8 @@ def main():
     quotes = {}
     while time.time() - t0 < RUN_SECONDS:
         try: maybe_digest(st)
+        except Exception: traceback.print_exc()
+        try: maybe_followup(st)
         except Exception: traceback.print_exc()
         q = st.get("queue", [])
         if not q:
