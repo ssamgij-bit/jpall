@@ -58,6 +58,7 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          WATCH_KEY: ${{ secrets.WATCH_KEY }}
           RUN_SECONDS: "1680"
         run: python jpall.py
 
