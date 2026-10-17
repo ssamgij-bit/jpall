@@ -78,8 +78,12 @@ def pre_tr(t):
 def translate(st, titles):
     cache = st.setdefault("tr", {})
     need = [t for t in dict.fromkeys(titles) if t and t not in cache]
-    for i in range(0, len(need), 20):
-        part = need[i:i + 20]
+    chunks, cur = [], []
+    for t in need:  # 주소 길이 한도 때문에 20건·1,500자 단위로 나눔
+        if cur and (len(cur) >= 20 or sum(len(x) for x in cur) + len(t) > 1500): chunks.append(cur); cur = []
+        cur.append(t)
+    if cur: chunks.append(cur)
+    for part in chunks:
         q = "\n".join(pre_tr(t) for t in part)
         try:
             url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=ja&tl=ko&dt=t&q=" + urllib.parse.quote(q)
@@ -133,6 +137,31 @@ def yf_quotes(codes):
         log("quote error", e)
     return out
 
+# ───────────────────────── JPX 실적 발표 예정일 ─────────────────────────
+JPX_SCHED = "https://www.jpx.co.jp/listing/event-schedules/financial-announcement/index.html"
+def jpx_schedule(st):
+    """JPX '결산 발표 예정일' 엑셀(1차 자료) → st['sched'] = {코드: [YYYY-MM-DD, 업종]} (하루 1회 갱신)"""
+    today = now().strftime("%Y-%m-%d")
+    if st.get("jpx_date") == today and st.get("sched"): return st["sched"]
+    st["jpx_date"] = today  # 실패해도 오늘은 다시 시도하지 않음
+    html = http(JPX_SCHED, timeout=30).decode("utf-8", "ignore")
+    sched = {}
+    for link in dict.fromkeys(re.findall(r'href="([^"]+\.xlsx?)"', html)):
+        try:
+            x = pd.read_excel(io.BytesIO(http("https://www.jpx.co.jp" + link, timeout=60)), header=None)
+        except Exception as e:
+            log("jpx xlsx error", link, e); continue
+        for _, r in x.iterrows():
+            d = r.iloc[0]
+            if not isinstance(d, (pd.Timestamp, dt.datetime)): continue
+            ds = d.strftime("%Y-%m-%d")
+            if ds < today: continue
+            code = nfkc(str(r.iloc[1])).strip()[:4]
+            if re.fullmatch(r"[0-9A-Z]{4}", code): sched[code] = [ds, nfkc(str(r.iloc[5])).strip()]
+    if sched: st["sched"] = sched
+    log("jpx schedule", len(sched))
+    return st.get("sched", {})
+
 # ───────────────────────── 컨센서스(Yahoo) 미리 저장 ─────────────────────────
 def consensus_scan(st, names):
     """하루 한 번: 4일 안에 실적 발표 예정인 종목을 찾아 대기열에 넣음"""
@@ -142,6 +171,8 @@ def consensus_scan(st, names):
     q = yf_quotes(codes)
     t0, t1 = time.time() - 86400, time.time() + 86400 * 4
     pend = [c for c, v in q.items() if v.get("earningsTimestampStart") and t0 <= v["earningsTimestampStart"] <= t1]
+    d0, d1 = (now() - dt.timedelta(days=1)).strftime("%Y-%m-%d"), (now() + dt.timedelta(days=4)).strftime("%Y-%m-%d")
+    pend += [c for c, (d, _) in (st.get("sched") or {}).items() if d0 <= d <= d1 and ((q.get(c) or {}).get("marketCap") or 0) >= 1e10]
     st["cons_q"] = list(dict.fromkeys(st.get("cons_q", []) + pend))
     st["cons_scan"] = today
     log("consensus queue", len(st["cons_q"]))
@@ -170,10 +201,35 @@ def consensus_work(st, limit=60):
     for k in [k for k, v in cons.items() if time.time() - v["ts"] > 86400 * 10]: cons.pop(k)
 
 # ───────────────────────── 가부탄 분기 실적 ─────────────────────────
-def kabutan_quarters(code):
+_KB = {}
+def kabutan_html(code):
+    c = _KB.get(code)
+    if c and time.time() - c[0] < 3600: return c[1]
+    s = http(f"https://kabutan.jp/stock/finance?code={code}", timeout=20).decode("utf-8", "ignore")
+    _KB[code] = (time.time(), s)
+    if len(_KB) > 400:
+        for k in sorted(_KB, key=lambda k: _KB[k][0])[:100]: _KB.pop(k, None)
+    return s
+def kabutan_fc(s):
+    """가부탄 연간 실적표의 회사 예상(予) 행 → {end, rev, op, ord, ni, eps} (백만엔·엔)"""
+    i = s.find("fin_year_result_d")
+    if i < 0: return None
+    seg = s[i:s.find("</table>", i)]
+    for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", seg, re.S):
+        cells = [nfkc(re.sub(r"<[^>]+>", "", c)).replace("&nbsp;", " ").replace("\xa0", " ").strip() for c in re.findall(r"<t[hd][^>]*>(.*?)</t[hd]>", tr, re.S)]
+        if not cells or "予" not in cells[0]: continue
+        m = re.search(r"(\d{4})\.(\d{2})", cells[0])
+        if not m: continue
+        def f(x):
+            try: return float(x.replace(",", "").replace("+", ""))
+            except Exception: return None
+        v = [f(c) for c in cells[1:6]] + [None] * 5
+        return {"end": dt.date(int(m.group(1)), int(m.group(2)), 28), "rev": v[0], "op": v[1], "ord": v[2], "ni": v[3], "eps": v[4]}
+    return None
+def kabutan_quarters(code, s=None):
     """[(시작일, 종료일, 매출, 영업익, 경상익, 순이익, EPS)] 백만엔 단위, 오래된 순"""
     try:
-        s = http(f"https://kabutan.jp/stock/finance?code={code}", timeout=20).decode("utf-8", "ignore")
+        s = s or kabutan_html(code)
     except Exception:
         return []
     i = s.find("3ヵ月決算");
@@ -431,7 +487,7 @@ def build(row, st, names, quotes, trmap):
     except Exception as e:
         log("body error", code, title[:30], e)
     try:
-        if body: record_hl(row, st, name_ko, quotes.get(code), trmap.get(title) or title)
+        record_hl(row, st, name_ko, quotes.get(code), trmap.get(title) or title)
     except Exception as e:
         log("highlight error", code, e)
     msg = "\n".join(head)
@@ -453,8 +509,16 @@ MISS_EPS = -10     # 분기 EPS가 컨센서스 대비 -10% 이하(또는 예상
 MISS_REV = -5      # 분기 매출이 컨센서스 대비 -5% 이하
 SECTIONS = [("beat", "① 컨센서스 상회 실적"), ("up", "② 실적 가이던스 상향"), ("prog", "③ 상향 후보 (진척률이 과거 평균보다 빠름)"),
             ("newfc", "④ 결산 + 새 회계연도 가이던스 (고성장·컨센 상회)"), ("grow", "⑤ 고성장 실적 (컨센서스 없음, 시총 300억엔↑)"),
-            ("ret", "⑥ 증배 · 자사주 · 공개매수"), ("miss", "⑦ 컨센서스 하회 실적"), ("down", "⑧ 실적 가이던스 하향")]
+            ("hold", "⑥ 대량보유 (행동주의·주요 투자자·신규 5%)"), ("evt", "⑦ 정책·구조 변화 (중기계획·PBR 대응·배당정책·완전자회사화 등)"),
+            ("ret", "⑧ 증배 · 자사주 · 공개매수"), ("mon", "⑨ 월차 매출"), ("miss", "⑩ 컨센서스 하회 실적"), ("down", "⑪ 실적 가이던스 하향")]
 
+MON_RE = r"月次|既存店|売上速報|営業概況|月間売上|売上高前年|月度売上|月次報告"
+EVT_RULES = [(r"中期経営計画|中期経営方針|長期ビジョン", "중기 경영계획"),
+             (r"資本コストや株価を意識|資本コスト.{0,12}株価", "PBR 개선 계획"),
+             (r"配当方針|株主還元方針|累進配当|DOE|資本政策の基本方針", "배당·환원 정책"),
+             (r"完全子会社化|株式交換|株式売渡請求|株式併合", "완전자회사화·스퀴즈아웃"),
+             (r"経営統合|合併契約|資本業務提携", "경영통합·제휴"),
+             (r"株式分割", "주식분할")]
 def _p(x): return f"{x:+.0f}%"
 def per_txt(q, eps, lab="가이던스"):
     px = (q or {}).get("regularMarketPrice")
@@ -463,6 +527,13 @@ def per_txt(q, eps, lab="가이던스"):
 def record_hl(row, st, name_ko, q, title_ko):
     """방금 처리한 공시가 하이라이트 기준에 맞으면 st['hl']에 저장. 항목: (섹션, 문구, 점수)"""
     h = dict(HL); items = []
+    t0 = row["title"]
+    if not h.get("kind") and "訂正" not in t0:
+        if re.search(MON_RE, t0):
+            h["kind"] = "mon"; items.append(("mon", title_ko, 0))
+        else:
+            lab = next((l for pat, l in EVT_RULES if re.search(pat, t0)), None)
+            if lab: h["kind"] = "evt"; items.append(("evt", f"[{lab}] {title_ko}", 0))
     if h.get("kind") == "res":
         qq = h.get("q"); sg = h.get("single") or {}; cons = h.get("cons") or {}; fc = h.get("fc") or {}
         ql = f"{qq}Q" if qq and qq < 4 else "4Q"
@@ -536,7 +607,7 @@ def record_hl(row, st, name_ko, q, title_ko):
         if h.get("ratio") and h["ratio"] >= BB_RATIO:
             items.append(("ret", f"자사주 취득 : 발행주식의 {h['ratio']:g}%" + (f" / {oku(h['yen'])}엔" if h.get("yen") else ""), 0))
     elif h.get("kind") == "tob":
-        items.append(("ret", f"공개매수 : 주당 {h['price']}엔" + (f"(프리미엄 {h['prem']}%)" if h.get("prem") else "") + f" — {esc(title_ko)[:40]}", 0))
+        items.append(("ret", f"공개매수 : 주당 {h['price']}엔" + (f"(프리미엄 {h['prem']}%)" if h.get("prem") else "") + f" — {title_ko[:40]}", 0))
     if not items: return
     src = ""
     try: src = reason_src(row, h.get("kind"))
@@ -556,13 +627,16 @@ REASON_HEAD = {
     "div": ["修正の理由", "理由"],
     "bb": ["取得を行う理由", "取得する理由", "理由"],
     "tob": ["公開買付けの目的", "買付け等の目的", "目的", "理由"],
+    "evt": ["目的", "理由", "背景", "趣旨", "概要"],
+    "mon": [],
 }
 def reason_src(row, kind):
     heads = REASON_HEAD.get(kind)
-    if not heads: return ""
+    if heads is None: return ""
     from pdfminer.high_level import extract_text
     t = nfkc(extract_text(io.BytesIO(http(row["pdf"], timeout=40)), maxpages=6 if kind == "res" else 3))
     t = re.sub(r"[ \t\u3000]+", "", t); t = re.sub(r"\n+", "\n", t)
+    if kind == "mon": return re.sub(r"\n", " ", t)[:2000]  # 월차: 표 전체(앞부분)를 AI가 읽음
     n = 2500 if kind == "res" else 1200
     out = ""
     for hd in heads:
@@ -574,6 +648,7 @@ def reason_src(row, kind):
             if len(re.sub(r"[\d,.%△▲\s]", "", seg[:300])) < 80: continue  # 숫자 표
             best = seg; break
         if best: out = best.replace("\n", ""); break
+    if not out and kind == "evt": out = t.replace("\n", " ")[:1200]
     if kind == "res":  # 결산이면 '향후 전망'(새 가이던스 근거)도 덧붙임
         for m in re.finditer(r"今後の見通し", t):
             seg = t[m.end():m.end() + 800]
@@ -602,6 +677,8 @@ AI_PROMPT = """너는 일본 주식 애널리스트다. 아래는 오늘 도쿄�
 
 할 일
 1. reasons: 항목마다 "왜 이런 결과/결정이 나왔는지"를 한국어 한 문장(60자 이내)으로. 원문에 적힌 사유만 쓰고, 원문에 사유가 없으면 "공시에 사유 기재 없음". 추측 금지. 일본어 고유명사는 한글로.
+   - [⑨ 월차 매출] 항목은 사유 대신 원문 표에서 가장 최근 월의 "기존점 매출 전년비"와 "전체 매출 전년비"(있으면 객수·객단가)를 "9월 기존점 +3.2%·전체 +5.1%(객수 +1.0%)" 형식으로. 102.3%처럼 전년 대비 비율이면 +2.3%로 환산. 숫자가 없으면 "수치 확인 불가".
+   - [⑦ 정책·구조 변화] 항목은 핵심 내용을 한 문장으로(목표 ROE·DOE·배당성향·교환비율·인수 가격 등 수치가 있으면 포함).
 2. top: 투자자 관점에서 오늘 가장 중요한 공시 최대 3개를 골라, 왜 중요한지 한국어 한 문장(80자 이내)으로. 시가총액, 서프라이즈·수정 폭, 사유의 지속성(일회성인지 구조적인지)을 고려.
 
 출력은 JSON만: {{"reasons": {{"번호": "사유"}}, "top": [{{"i": 번호, "why": "이유"}}]}}
@@ -612,11 +689,12 @@ AI_PROMPT = """너는 일본 주식 애널리스트다. 아래는 오늘 도쿄�
 def ai_reasons(items):
     """{item 위치: 사유}, [(위치, 중요한 이유)]"""
     reasons, top = {}, []
-    for i0 in range(0, len(items), 25):
-        part = items[i0:i0 + 25]
+    allx = [(i, x) for i, x in enumerate(items) if not x.get("noai")]
+    for i0 in range(0, len(allx), 25):
+        part = allx[i0:i0 + 25]
         lines = []
-        for j, x in enumerate(part):
-            lines.append(f"#{i0 + j + 1} [{dict(SECTIONS)[x['sec']]}] {x['name']} {x['code']} (시총 {x['mct'] or '?'}) : {x['txt']}\n원문: {x.get('src') or '(없음)'}")
+        for _, (j, x) in enumerate(part):
+            lines.append(f"#{j + 1} [{dict(SECTIONS)[x['sec']]}] {x['name']} {x['code']} (시총 {x['mct'] or '?'}) : {x['txt']}\n원문: {x.get('src') or '(없음)'}")
         out = gemini_json(AI_PROMPT.format(items="\n\n".join(lines)))
         if not out: break
         for k, v in (out.get("reasons") or {}).items():
@@ -625,13 +703,14 @@ def ai_reasons(items):
         for t in out.get("top") or []:
             try: top.append((int(str(t["i"]).strip("#")) - 1, str(t["why"]).strip()))
             except Exception: pass
-    if len(items) > 25: top = top[:3]
+    if len(allx) > 25: top = top[:3]
     return reasons, top
 
 def fallback_reasons(st, items):
     """AI 키가 없을 때: 원문 사유의 첫 문장을 번역"""
     srcs = {}
     for i, x in enumerate(items):
+        if x.get("noai") or x["sec"] == "mon": continue
         s = (x.get("src") or "").split(" [今後の見通し] ")[0]
         sents = re.findall(r"[^。]{15,200}。", s)
         pick = [z for z in sents if re.search(r"増収|減収|増益|減益|上回|下回|増加|減少|伸長|好調|低調|不振|寄与|影響|理由|ため", z) and "経済" not in z]
@@ -655,7 +734,11 @@ def digest_text(items, day, reasons=None, top=None):
     for sec, lab in SECTIONS:
         xs = [x for x in items if x["sec"] == sec and not (sec == "prog" and x["code"] in up_codes)]
         seen = set(); uniq = []
-        for x in sorted(xs, key=lambda x: (-(x.get("score") or 0), -x["mc"])):
+        def mon_key(x):
+            m = re.search(r"기존점\s*([+-]?\d+(?:\.\d+)?)%", reasons.get(idx[id(x)]) or "")
+            return float(m.group(1)) if m else -999
+        key = (lambda x: (-mon_key(x), -x["mc"])) if sec == "mon" else (lambda x: (-(x.get("score") or 0), -x["mc"]))
+        for x in sorted(xs, key=key):
             if (x["code"], x["txt"]) in seen: continue
             seen.add((x["code"], x["txt"])); uniq.append(x)
         if not uniq: continue
@@ -663,9 +746,9 @@ def digest_text(items, day, reasons=None, top=None):
         for x in uniq[:20]:
             out.append(f"• <a href=\"{x['pdf']}\">{esc(x['name'])}</a>" + (f"({x['mct']})" if x["mct"] else "") + f" {x['code']}\n   {x['txt']}")
             rs = reasons.get(idx[id(x)])
-            if rs: out.append(f"   └ 이유: {esc(rs)}")
+            if rs: out.append(f"   └ {'수치' if sec == 'mon' else '내용' if sec == 'evt' else '이유'}: {esc(rs)}")
         if len(uniq) > 20: out.append(f"   …외 {len(uniq) - 20}건")
-    out += ["", f"<i>기준: 컨센 상회 = 분기 EPS +{BEAT_EPS}%↑ 또는 매출 +{BEAT_REV}%↑ / 하회 = EPS {MISS_EPS}%↓(또는 적자) 또는 매출 {MISS_REV}%↓ (Yahoo Finance 애널리스트 평균, 발표 전 저장) · 가이던스 상·하향 = 회사 실적예상 수정 공시의 영업익(없으면 경상익) 기준 · 상향 후보 = 누적 영업익 진척률이 과거 같은 분기 평균보다 +{PROG_GAP}%p↑ (가부탄 분기표) · PER = 직전 주가 ÷ 회사 가이던스 EPS · 이유 = 공시 원문의 설명 부분을 "
+    out += ["", f"<i>기준: 컨센 상회 = 분기 EPS +{BEAT_EPS}%↑ 또는 매출 +{BEAT_REV}%↑ / 하회 = EPS {MISS_EPS}%↓(또는 적자) 또는 매출 {MISS_REV}%↓ (Yahoo Finance 애널리스트 평균, 발표 전 저장) · 가이던스 상·하향 = 회사 실적예상 수정 공시의 영업익(없으면 경상익) 기준 · 상향 후보 = 누적 영업익 진척률이 과거 같은 분기 평균보다 +{PROG_GAP}%p↑ (가부탄 분기표) · PER = 직전 주가 ÷ 회사 가이던스 EPS · 대량보유 = EDINET 5% 보고 중 행동주의·주요 투자자 및 대형 운용사·증권사 재고를 뺀 신규 5%·+2%p 이상 · 이유 = 공시 원문의 설명 부분을 "
             + ("AI(Gemini)가 요약" if os.environ.get("GEMINI_API_KEY") else "기계 번역") + ", 원문 확인 권장</i>"]
     return "\n".join(out)
 
@@ -677,7 +760,7 @@ def maybe_followup(st):
     items = [x for x in st.get("hl", []) if x.get("sent") and x.get("dd") and x["dd"] < today and not x.get("fu")]
     st["fu_date"] = today
     if not items: return
-    qs = yf_quotes([x["code"] for x in items])
+    qs = yf_quotes([x["code"] for x in items] + [BENCH])
     rows = []
     for x in items:
         qd = qs.get(x["code"]) or {}
@@ -700,7 +783,188 @@ def maybe_followup(st):
     for part in split_msg("\n".join(out)):
         tg_send(part); time.sleep(SEND_GAP)
     for c, x in rows: x["fu"] = True
+    try: perf_add(st, rows, qs, today)
+    except Exception: traceback.print_exc()
     log("followup sent", len(rows))
+
+# ───────────────────────── 실적 발표 전날 예고 ─────────────────────────
+PREVIEW_HM = (20, 30)   # 발표 전날 예고 발송 시각(JST)
+def next_bday(d):
+    d += dt.timedelta(days=1)
+    while d.weekday() >= 5: d += dt.timedelta(days=1)
+    return d
+def preview_target():
+    t = now()
+    if t.weekday() in (4, 5): return None  # 금·토는 쉬고 일요일에 월요일분 예고
+    return next_bday(t.date()).isoformat()
+def preview_work(st, limit=15):
+    """다음 영업일 발표 예정 종목의 가부탄 진척률을 조금씩 미리 계산(12시 이후, 대기열이 빌 때)"""
+    tgt = preview_target()
+    if not tgt or now().hour < 12: return
+    pv = st.setdefault("pv", {})
+    if pv.get("tgt") != tgt: pv.clear(); pv.update(tgt=tgt, data={}, sent=False)
+    if pv["sent"]: return
+    codes = [c for c, (d, _) in (st.get("sched") or {}).items() if d == tgt]
+    for c in [c for c in codes if c not in pv["data"]][:limit]:
+        rec = {}
+        try:
+            h = kabutan_html(c); kq = kabutan_quarters(c, h); fc = kabutan_fc(h)
+            if fc and fc.get("op"):
+                end = fc["end"]; start = dt.date(end.year - (0 if end.month == 12 else 1), end.month % 12 + 1, 1)
+                qs = [k for k in kq if k[0] >= start and k[1] <= end]
+                rec = {"fc_op": fc["op"], "fc_eps": fc.get("eps")}
+                if 1 <= len(qs) <= 3 and all(k[3] is not None for k in qs) and fc["op"] > 0:
+                    hp = hist_progress(kq, start, len(qs), 3)
+                    rec.update(q=len(qs), prog=sum(k[3] for k in qs) / fc["op"] * 100,
+                               hist=sum(hp) / len(hp) if hp else None, n=len(hp),
+                               yoy=chg_txt(qs[-1][3], next((k[3] for k in kq if k[0] == dt.date(qs[-1][0].year - 1, qs[-1][0].month, 1)), None)))
+        except Exception as e:
+            log("preview error", c, e)
+        pv["data"][c] = rec
+        time.sleep(0.3)
+
+def maybe_preview(st, names):
+    pv = st.get("pv") or {}
+    tgt = preview_target(); t = now()
+    if not tgt or pv.get("tgt") != tgt or pv.get("sent") or (t.hour, t.minute) < PREVIEW_HM: return
+    codes = [c for c, (d, _) in (st.get("sched") or {}).items() if d == tgt]
+    if any(c not in pv["data"] for c in codes) and t.hour < 22: return  # 계산이 덜 끝났으면 22시까지 기다림
+    pv["sent"] = True
+    if not codes: return
+    qs = yf_quotes(codes); data = pv["data"]; cons = st.get("cons", {})
+    def nm(c):
+        n = names.get(c) or {}; q = qs.get(c) or {}
+        return f"<b>{esc(n.get('ko') or c)}</b>" + (f"({mcap_txt(q)})" if mcap_txt(q) else "") + f" {c}"
+    def pe(c):
+        q = qs.get(c) or {}; e = (data.get(c) or {}).get("fc_eps"); px = q.get("regularMarketPrice")
+        return f" · 예상 PER {px / e:.1f}배" if px and e and e > 0 else ""
+    d = dt.date.fromisoformat(tgt); wd = "월화수목금토일"[d.weekday()]
+    out = [f"🗓 <b>{d.month}/{d.day}({wd}) 실적 발표 예정 {len(codes)}개사 미리보기</b>",
+           "<i>JPX 발표 예정일 기준 · 진척률 = 직전 분기까지 누적 영업익 ÷ 회사 연간 예상(가부탄) · 컨센서스 = Yahoo Finance</i>"]
+    ahead = []
+    for c in codes:
+        r = data.get(c) or {}
+        if r.get("prog") is not None and r.get("hist") is not None and 5 <= r["hist"] <= 100 and r["prog"] - r["hist"] >= PROG_GAP:
+            ahead.append((r["prog"] - r["hist"], c, r))
+    ahead.sort(reverse=True)
+    if ahead:
+        out += ["", f"<b>🔎 진척률이 과거보다 빠른 종목 ({len(ahead)}개) — 발표 때 상향·서프라이즈 후보</b>"]
+        for g, c, r in ahead[:20]:
+            out.append(f"• {nm(c)}\n   {r['q']}Q 누적 진척률 {r['prog']:.0f}% (과거 {r['n']}년 평균 {r['hist']:.0f}%, +{g:.0f}%p)"
+                       + (f" · 직전 분기 영업익 YoY {r['yoy']}" if r.get("yoy") else "") + pe(c))
+        if len(ahead) > 20: out.append(f"   …외 {len(ahead) - 20}개")
+    cs = [c for c in codes if (cons.get(c) or {}).get("eps") or (cons.get(c) or {}).get("rev")]
+    cs.sort(key=lambda c: -((qs.get(c) or {}).get("marketCap") or 0))
+    if cs:
+        out += ["", f"<b>📋 컨센서스 있는 종목 ({len(cs)}개, 시총순)</b>"]
+        for c in cs[:20]:
+            k = cons[c]; r = data.get(c) or {}; parts = []
+            if k.get("eps") is not None: parts.append(f"분기 EPS 예상 {k['eps']:,.1f}엔(애널 {k.get('eps_n', 0)}명)")
+            if k.get("rev"): parts.append(f"매출 예상 {oku(k['rev'])}엔")
+            if r.get("prog") is not None: parts.append(f"진척률 {r['prog']:.0f}%")
+            out.append(f"• {nm(c)}\n   " + " · ".join(parts) + pe(c))
+        if len(cs) > 20: out.append(f"   …외 {len(cs) - 20}개")
+    if not ahead and not cs: out += ["", "눈에 띄는 종목이 없습니다."]
+    for part in split_msg("\n".join(out)):
+        tg_send(part); time.sleep(SEND_GAP)
+    log("preview sent", tgt, len(codes))
+
+# ───────────────────────── 대량보유(5%) 알림 ─────────────────────────
+# holdings 워크플로가 30분마다 EDINET에서 모아 data 브랜치에 저장한 holdings.json을 읽음
+HOLD_URL = f"https://raw.githubusercontent.com/{os.environ.get('GITHUB_REPOSITORY', 'ssamgij-bit/jpall')}/data/holdings.json"
+KNOWN = re.compile(r"オアシス|Oasis|ダルトン|Dalton|ニッポン・?アクティブ|Nippon Active|NAVF|ストラテジック|Strategic Capital|シティインデックス|エスグラント|南青山不動産|村上|野村絢|レノ|エフィッシモ|Effissimo|エリオット|Elliott|バリューアクト|ValueAct|パリサー|Palliser|3D Investment|スリーディー|ひびき|Hibiki|カナメ|Kaname|シルチェスター|Silchester|光通信|インダス|Indus|タイヨウ|Taiyo|アセット・?バリュー|Asset Value|ファラロン|Farallon|ケイマン|Cayman|フランクリン|Franklin|サード・?ポイント|Third Point|キング・?ストリート|King Street|アルジェ|Argyle|イチゴ|Ichigo|シンプレクス|Simplex", re.I)
+BIG = re.compile(r"ブラックロック|BlackRock|野村アセット|Nomura Asset|日興アセット|アモーヴァ|三井住友トラスト|三井住友DS|三菱UFJ|大和アセット|アセットマネジメントOne|みずほ|Vanguard|バンガード|ステート・?ストリート|State Street|ノルウェー|Norges|モルガン|Morgan|ゴールドマン|Goldman|JPモルガン|J\.?P\.? ?Morgan|UBS|シティグループ|Citigroup|バークレイズ|Barclays|BNP|ソシエテ|Soci[ée]t[ée]|野村證券|野村証券|SBI|楽天|大和証券|SMBC|日本証券金融|マネックス|Fidelity|フィデリティ|キャピタル・リサーチ|Capital Research|ウエリントン|Wellington|ノムラ|インベスコ|Invesco|アバディーン|abrdn|ニッセイ|りそな|東京海上", re.I)
+def hold_work(st, names):
+    if time.time() - st.get("hold_ts", 0) < 600: return
+    st["hold_ts"] = time.time()
+    recs = json.loads(http(HOLD_URL, timeout=30)).get("recent") or []
+    if "hold_seen" not in st:
+        st["hold_seen"] = [r["id"] for r in recs]; log("holdings: 기존 보고 기록만 함", len(recs)); return
+    seen = set(st["hold_seen"]); new = [r for r in reversed(recs) if r["id"] not in seen]
+    if not new: return
+    picks = []
+    for r in new:
+        st["hold_seen"].append(r["id"])
+        if r.get("kind") == "fix" or not r.get("code"): continue
+        p = r.get("purpose") or ""; who = f"{r.get('holder', '')} {r.get('holder_ko', '')}"
+        act = "행동주의" in p; known = bool(KNOWN.search(who)) and not BIG.search(who)
+        fund = ("순투자" in p or "운용" in p) and "증권사 재고" not in p and not BIG.search(who)
+        moved = r.get("kind") == "new" or abs(r.get("delta") or 0) >= 0.5
+        # 행동주의 표시는 지분 20% 미만(모회사·전략적 보유 제외)이거나 알려진 투자자일 때만
+        if (known or (act and (r.get("cur") or 0) < 20)) and moved: picks.append((r, True))
+        elif fund and (r.get("kind") == "new" or (r.get("delta") or 0) >= 2): picks.append((r, False))
+    st["hold_seen"] = st["hold_seen"][-3000:]
+    if not picks: return
+    qs = yf_quotes([r["code"] for r, _ in picks]); hl = st.setdefault("hl", [])
+    for r, alert in picks:
+        q = qs.get(r["code"]); n = names.get(r["code"]) or {}
+        nm = n.get("ko") or r.get("issuer_ko") or r["code"]
+        ch = "신규 5%" if r.get("kind") == "new" else (f"{r['delta']:+.2f}%p" if r.get("delta") is not None else "변경")
+        ratio = f"{r['prev']:.2f}% → {r['cur']:.2f}%" if r.get("prev") is not None and r.get("cur") is not None else (f"{r['cur']:.2f}%" if r.get("cur") is not None else "—")
+        tag = "🦈 " if alert else ""
+        hl.append({"id": r["id"], "sec": "hold", "code": r["code"], "name": nm, "mc": (q or {}).get("marketCap") or 0, "mct": mcap_txt(q),
+                   "txt": f"{tag}{esc(r.get('holder_ko') or '')} {ratio} ({ch}) · 목적: {r.get('purpose') or '—'}", "pdf": r["url"], "ts": time.time(),
+                   "sent": False, "src": "", "score": 100 if alert else (r.get("delta") or 5), "noai": True})
+        if alert:
+            msg = (f"🦈 <b>대량보유 보고 · {'행동주의(경영 제안 목적)' if '행동주의' in (r.get('purpose') or '') else '주요 투자자'}</b>\n"
+                   f"{r['d']}\n기업명: {esc(nm)}" + (f"(시가총액: {mcap_txt(q)})" if mcap_txt(q) else "") + f" {r['code']}" + (f" [{n['mkt']}]" if n.get("mkt") else "") +
+                   f"\n보유자: {esc(r.get('holder_ko') or '')}" + (f" 외 공동보유 {r['joint'] - 1}" if (r.get("joint") or 1) > 1 else "") +
+                   f"\n보유 비율: {ratio} ({ch})\n보유 목적: {r.get('purpose') or '—'}\n\n공시링크: {r['url']}\n회사정보: https://kabutan.jp/stock/?code={r['code']}")
+            tg_send(msg); time.sleep(SEND_GAP)
+    log("holdings picks", len(picks))
+
+# ───────────────────────── 신호 적중률 추적 ─────────────────────────
+BENCH = "1306"  # TOPIX 연동 ETF(1306)를 시장 기준으로 사용
+def perf_add(st, rows, qs, today):
+    """다음 거래일 반응을 보낼 때: 기준가(공시 전 종가)와 TOPIX ETF 기준가를 기록"""
+    b = qs.get(BENCH) or {}
+    perf = st.setdefault("perf", []); have = {(r["code"], r["sec"], r["d0"]) for r in perf}
+    for c, x in rows:
+        q = qs.get(x["code"]) or {}
+        if (x["code"], x["sec"], today) in have or not q.get("regularMarketPreviousClose"): continue
+        perf.append({"code": x["code"], "sec": x["sec"], "d0": today, "base": q["regularMarketPreviousClose"], "p1": q.get("regularMarketPrice"),
+                     "bb": b.get("regularMarketPreviousClose"), "b1": b.get("regularMarketPrice")})
+def perf_update(st):
+    """매 거래일 장 마감 후: 5거래일(약 7일)·20거래일(약 28일) 지난 신호의 종가를 기록"""
+    t = now(); today = t.strftime("%Y%m%d")
+    if t.weekday() >= 5 or (t.hour, t.minute) < (15, 45) or st.get("pu_date") == today: return
+    perf = st.get("perf") or []
+    def age(r): return (t.date() - dt.datetime.strptime(r["d0"], "%Y%m%d").date()).days
+    need = [r for r in perf if (age(r) >= 7 and r.get("p5") is None) or (age(r) >= 28 and r.get("p20") is None)]
+    st["pu_date"] = today
+    if need:
+        qs = yf_quotes(list({r["code"] for r in need}) + [BENCH]); b = qs.get(BENCH) or {}
+        if not b.get("regularMarketTime") or dt.datetime.fromtimestamp(b["regularMarketTime"], JST).strftime("%Y%m%d") != today: return  # 휴장
+        for r in need:
+            px = (qs.get(r["code"]) or {}).get("regularMarketPrice")
+            if not px: continue
+            if age(r) >= 7 and r.get("p5") is None: r["p5"], r["b5"] = px, b.get("regularMarketPrice")
+            if age(r) >= 28 and r.get("p20") is None: r["p20"], r["b20"] = px, b.get("regularMarketPrice")
+    st["perf"] = [r for r in perf if age(r) <= 70]
+def maybe_weekly(st):
+    """토요일 10시: 섹션별 신호 성과(TOPIX 대비 초과수익·적중률) 주간 보고"""
+    t = now(); today = t.strftime("%Y%m%d")
+    if t.weekday() != 5 or t.hour < 10 or st.get("wk_date") == today: return
+    st["wk_date"] = today
+    perf = st.get("perf") or []
+    def ex(r, k, bk):
+        try: return ((r[k] / r["base"]) - (r[bk] / r["bb"])) * 100
+        except Exception: return None
+    out = [f"📐 <b>{t.month}/{t.day} 주간 신호 성과 점검</b>", "<i>하이라이트 신호의 공시 전 종가 대비 수익률 − 같은 기간 TOPIX(1306) 수익률 · 최근 10주 · 적중률 = 초과수익 > 0 비율</i>", ""]
+    rows = 0
+    for sec, lab in SECTIONS:
+        rs = [r for r in perf if r["sec"] == sec]
+        if not rs: continue
+        line = [f"<b>{lab}</b>"]
+        for k, bk, nm in (("p1", "b1", "다음날"), ("p5", "b5", "5일"), ("p20", "b20", "20일")):
+            v = [e for e in (ex(r, k, bk) for r in rs) if e is not None]
+            if v: line.append(f"   {nm}: 평균 {sum(v) / len(v):+.1f}%p · 적중 {sum(1 for e in v if e > 0) / len(v) * 100:.0f}% (n={len(v)})")
+        if len(line) > 1: out += line; rows += 1
+    if not rows: return
+    out += ["", "<i>표본이 작을 때(n<20)는 우연일 수 있음 · 시세: Yahoo Finance</i>"]
+    for part in split_msg("\n".join(out)):
+        tg_send(part); time.sleep(SEND_GAP)
+    log("weekly perf sent")
 
 def split_msg(text, limit=3900):
     parts, cur = [], ""
@@ -789,6 +1053,8 @@ def main():
     names = load_names(st)
     added = collect(st)
     log("new", added, "queue", len(st.get("queue", [])))
+    try: jpx_schedule(st)
+    except Exception as e: log("jpx error", e)
     try:
         consensus_scan(st, names); consensus_work(st)
     except Exception as e:
@@ -799,14 +1065,20 @@ def main():
     while time.time() - t0 < RUN_SECONDS:
         try: maybe_digest(st)
         except Exception: traceback.print_exc()
-        try: maybe_followup(st)
-        except Exception: traceback.print_exc()
+        for fn in (lambda: maybe_followup(st), lambda: hold_work(st, names), lambda: maybe_preview(st, names),
+                   lambda: perf_update(st), lambda: maybe_weekly(st)):
+            try: fn()
+            except Exception as e: log("extra error", e)
         q = st.get("queue", [])
         if not q:
             if time.time() - last_scan > 60 and time.time() - t0 < RUN_SECONDS - 30:
                 collect(st); last_scan = time.time(); save("state.json", st); continue
+            try: jpx_schedule(st)
+            except Exception as e: log("jpx error", e)
             try: consensus_scan(st, names); consensus_work(st, 20)
             except Exception as e: log("consensus error", e)
+            try: preview_work(st)
+            except Exception as e: log("preview error", e)
             time.sleep(5)
             if time.time() - last_scan > 60: collect(st); last_scan = time.time(); save("state.json", st)
             continue
