@@ -469,7 +469,7 @@ def build(row, st, names, quotes, trmap):
     mk = n["mkt"] if n else PLACE.get(row.get("place", ""), row.get("place", ""))
     mc = mcap_txt(quotes.get(code))
     d = row["d"]
-    head = [f"{d[:4]}.{d[4:6]}.{d[6:]} {row['t']}",
+    head = (["⭐ 관심 종목"] if code in st.get("watch", {}) else []) + [f"{d[:4]}.{d[4:6]}.{d[6:]} {row['t']}",
             f"기업명: {name_ko}" + (f"(시가총액: {mc})" if mc else "") + f" {code}" + (f" [{mk}]" if mk else ""),
             f"보고서명: {trmap.get(row['title']) or row['title']}"]
     body = None
@@ -507,7 +507,7 @@ HIGROWTH_MCAP = 3e10  # …이면서 시가총액 300억엔 이상
 BB_RATIO = 1.0     # 자사주 취득 한도가 발행주식의 1% 이상
 MISS_EPS = -10     # 분기 EPS가 컨센서스 대비 -10% 이하(또는 예상 흑자인데 적자)
 MISS_REV = -5      # 분기 매출이 컨센서스 대비 -5% 이하
-SECTIONS = [("beat", "① 컨센서스 상회 실적"), ("up", "② 실적 가이던스 상향"), ("prog", "③ 상향 후보 (진척률이 과거 평균보다 빠름)"),
+SECTIONS = [("watch", "⭐ 관심 종목 공시"), ("beat", "① 컨센서스 상회 실적"), ("up", "② 실적 가이던스 상향"), ("prog", "③ 상향 후보 (진척률이 과거 평균보다 빠름)"),
             ("newfc", "④ 결산 + 새 회계연도 가이던스 (고성장·컨센 상회)"), ("grow", "⑤ 고성장 실적 (컨센서스 없음, 시총 300억엔↑)"),
             ("hold", "⑥ 대량보유 (행동주의·주요 투자자·신규 5%)"), ("evt", "⑦ 정책·구조 변화 (중기계획·PBR 대응·배당정책·완전자회사화 등)"),
             ("ret", "⑧ 증배 · 자사주 · 공개매수"), ("mon", "⑨ 월차 매출"), ("miss", "⑩ 컨센서스 하회 실적"), ("down", "⑪ 실적 가이던스 하향")]
@@ -608,6 +608,8 @@ def record_hl(row, st, name_ko, q, title_ko):
             items.append(("ret", f"자사주 취득 : 발행주식의 {h['ratio']:g}%" + (f" / {oku(h['yen'])}엔" if h.get("yen") else ""), 0))
     elif h.get("kind") == "tob":
         items.append(("ret", f"공개매수 : 주당 {h['price']}엔" + (f"(프리미엄 {h['prem']}%)" if h.get("prem") else "") + f" — {title_ko[:40]}", 0))
+    if row["code"] in st.get("watch", {}) and not any(s0 == "watch" for s0, _, _ in items):
+        items.insert(0, ("watch", title_ko, 0))
     if not items: return
     src = ""
     try: src = reason_src(row, h.get("kind"))
@@ -618,7 +620,8 @@ def record_hl(row, st, name_ko, q, title_ko):
     for sec, txt, sc in items:
         if (row["id"], sec) in have: continue
         hl.append({"id": row["id"], "sec": sec, "code": row["code"], "name": name_ko, "mc": mc, "mct": mcap_txt(q),
-                   "txt": txt, "pdf": row["pdf"], "ts": time.time(), "sent": False, "src": src, "score": sc or 0})
+                   "txt": txt, "pdf": row["pdf"], "ts": time.time(), "sent": False, "src": src, "score": sc or 0,
+                   "noai": sec == "watch" and not src})
 
 # 공시 PDF에서 '이유'가 적힌 부분(일본어 원문)을 잘라 둠 → 19시 요약 때 AI가 한 줄로 정리
 REASON_HEAD = {
@@ -746,7 +749,7 @@ def digest_text(items, day, reasons=None, top=None):
         for x in uniq[:20]:
             out.append(f"• <a href=\"{x['pdf']}\">{esc(x['name'])}</a>" + (f"({x['mct']})" if x["mct"] else "") + f" {x['code']}\n   {x['txt']}")
             rs = reasons.get(idx[id(x)])
-            if rs: out.append(f"   └ {'수치' if sec == 'mon' else '내용' if sec == 'evt' else '이유'}: {esc(rs)}")
+            if rs and sec != "watch": out.append(f"   └ {'수치' if sec == 'mon' else '내용' if sec == 'evt' else '이유'}: {esc(rs)}")
         if len(uniq) > 20: out.append(f"   …외 {len(uniq) - 20}건")
     out += ["", f"<i>기준: 컨센 상회 = 분기 EPS +{BEAT_EPS}%↑ 또는 매출 +{BEAT_REV}%↑ / 하회 = EPS {MISS_EPS}%↓(또는 적자) 또는 매출 {MISS_REV}%↓ (Yahoo Finance 애널리스트 평균, 발표 전 저장) · 가이던스 상·하향 = 회사 실적예상 수정 공시의 영업익(없으면 경상익) 기준 · 상향 후보 = 누적 영업익 진척률이 과거 같은 분기 평균보다 +{PROG_GAP}%p↑ (가부탄 분기표) · PER = 직전 주가 ÷ 회사 가이던스 EPS · 대량보유 = EDINET 5% 보고 중 행동주의·주요 투자자 및 대형 운용사·증권사 재고를 뺀 신규 5%·+2%p 이상 · 이유 = 공시 원문의 설명 부분을 "
             + ("AI(Gemini)가 요약" if os.environ.get("GEMINI_API_KEY") else "기계 번역") + ", 원문 확인 권장</i>"]
@@ -841,6 +844,14 @@ def maybe_preview(st, names):
     d = dt.date.fromisoformat(tgt); wd = "월화수목금토일"[d.weekday()]
     out = [f"🗓 <b>{d.month}/{d.day}({wd}) 실적 발표 예정 {len(codes)}개사 미리보기</b>",
            "<i>JPX 발표 예정일 기준 · 진척률 = 직전 분기까지 누적 영업익 ÷ 회사 연간 예상(가부탄) · 컨센서스 = Yahoo Finance</i>"]
+    w = [c for c in codes if c in st.get("watch", {})]
+    if w:
+        out += ["", f"<b>⭐ 관심 종목 ({len(w)}개)</b>"]
+        for c in w:
+            r = data.get(c) or {}; k = cons.get(c) or {}; parts = []
+            if r.get("prog") is not None: parts.append(f"{r['q']}Q 누적 진척률 {r['prog']:.0f}%" + (f"(과거 평균 {r['hist']:.0f}%)" if r.get("hist") is not None else ""))
+            if k.get("eps") is not None: parts.append(f"분기 EPS 예상 {k['eps']:,.1f}엔(애널 {k.get('eps_n', 0)}명)")
+            out.append(f"• {nm(c)}" + ("\n   " + " · ".join(parts) if parts else "") + pe(c))
     ahead = []
     for c in codes:
         r = data.get(c) or {}
@@ -999,6 +1010,62 @@ def maybe_digest(st, force=False):
     st["digest_date"] = today
     st["hl"] = [x for x in hl if time.time() - x["ts"] < 86400 * 6]
 
+# ───────────────────────── 관심 종목: 봇 개인 대화 명령 ─────────────────────────
+HELP = ("관심 종목 명령\n/add 7203 6758 — 추가(여러 개 가능)\n/del 7203 — 삭제\n/list — 목록\n\n"
+        "등록한 종목은 공시가 나오면 채널 메시지 맨 위에 ⭐ 표시가 붙고, 19시 요약 맨 위 '⭐ 관심 종목 공시'와 발표 전날 예고에 따로 나옵니다.")
+# japan stock 봇(@JP_stock_yh_bot, Cloudflare Worker)의 구독 목록을 관심 종목으로 그대로 사용
+WATCH_URL = os.environ.get("WATCH_URL", "https://jp-disclosure-bot.ssamgij.workers.dev/watchlist")
+WATCH_KEY = os.environ.get("WATCH_KEY", "")
+def watch_sync(st):
+    today = now().strftime("%Y%m%d")
+    if not (WATCH_URL and WATCH_KEY) or st.get("watch_date") == today: return  # 하루 한 번만 읽음(키가 없으면 /add 목록 사용)
+    st["watch_date"] = today
+    j = json.loads(http(WATCH_URL, timeout=20, headers={"x-watch-key": WATCH_KEY, **UA}))
+    codes = [nfkc(str(c)).upper()[:4] for c in (j.get("codes") or [])]
+    old = st.get("watch", {})
+    st["watch"] = {c: old.get(c, time.time()) for c in codes}
+    if set(old) != set(codes): log("watchlist synced", len(codes))
+def tg_reply(chat, text):
+    if DRY: print(f"[reply to {chat}] {text}"); return
+    try:
+        http(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data=json.dumps({"chat_id": chat, "text": text[:4000]}).encode(),
+             headers={"content-type": "application/json"})
+    except Exception as e:
+        log("reply error", e)
+def tg_commands(st, names):
+    """봇에게 온 개인 메시지(/add /del /list)를 20초마다 확인. 처음 명령을 보낸 사람만 주인으로 인정"""
+    if DRY or not TOKEN or time.time() - st.get("cmd_ts", 0) < 20: return
+    st["cmd_ts"] = time.time()
+    q = urllib.parse.urlencode({"offset": st.get("tg_off", 0), "timeout": 0, "allowed_updates": json.dumps(["message"])})
+    res = json.loads(http(f"https://api.telegram.org/bot{TOKEN}/getUpdates?{q}", timeout=20)).get("result") or []
+    for u in res:
+        st["tg_off"] = u["update_id"] + 1
+        m = u.get("message") or {}
+        chat = (m.get("chat") or {}); text = (m.get("text") or "").strip()
+        if chat.get("type") != "private" or not text.startswith("/"): continue
+        if st.get("owner") is None: st["owner"] = chat["id"]; log("owner set", chat["id"])
+        if chat["id"] != st["owner"]: tg_reply(chat["id"], "이 봇은 개인용입니다."); continue
+        cmd, *args = text.split()
+        cmd = cmd.split("@")[0].lower()
+        codes = [nfkc(a).upper()[:4] for a in args if re.fullmatch(r"[0-9A-Za-z]{4}", nfkc(a))]
+        watch = st.setdefault("watch", {})
+        def label(c): return f"{(names.get(c) or {}).get('ko') or '?'}({c})"
+        if WATCH_URL and WATCH_KEY and cmd in ("/add", "/추가", "/del", "/삭제", "/remove"):
+            tg_reply(chat["id"], "관심 종목은 japan stock 봇(@JP_stock_yh_bot)의 구독 목록을 그대로 씁니다. 그쪽에서 구독/구독해지 해주세요. (하루 한 번 반영)"); continue
+        if cmd in ("/add", "/추가"):
+            ok = [c for c in codes if c in names]; bad = [c for c in codes if c not in names]
+            for c in ok: watch[c] = time.time()
+            msg = (f"추가: {', '.join(label(c) for c in ok)}" if ok else "추가할 종목 코드가 없습니다. 예) /add 7203")
+            if bad: msg += f"\n상장 종목 목록에 없는 코드: {', '.join(bad)}"
+            tg_reply(chat["id"], msg + f"\n(현재 {len(watch)}개)")
+        elif cmd in ("/del", "/삭제", "/remove"):
+            gone = [c for c in codes if watch.pop(c, None)]
+            tg_reply(chat["id"], (f"삭제: {', '.join(label(c) for c in gone)}" if gone else "목록에 없는 코드입니다.") + f"\n(현재 {len(watch)}개)")
+        elif cmd in ("/list", "/목록"):
+            tg_reply(chat["id"], f"관심 종목 {len(watch)}개\n" + ("\n".join(label(c) for c in sorted(watch)) if watch else "(없음) /add 7203 처럼 추가하세요."))
+        else:
+            tg_reply(chat["id"], HELP)
+
 # ───────────────────────── 텔레그램 ─────────────────────────
 def tg_send(text):
     if DRY:
@@ -1065,7 +1132,7 @@ def main():
     while time.time() - t0 < RUN_SECONDS:
         try: maybe_digest(st)
         except Exception: traceback.print_exc()
-        for fn in (lambda: maybe_followup(st), lambda: hold_work(st, names), lambda: maybe_preview(st, names),
+        for fn in (lambda: watch_sync(st), lambda: tg_commands(st, names), lambda: maybe_followup(st), lambda: hold_work(st, names), lambda: maybe_preview(st, names),
                    lambda: perf_update(st), lambda: maybe_weekly(st)):
             try: fn()
             except Exception as e: log("extra error", e)
