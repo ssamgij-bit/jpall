@@ -1,0 +1,26 @@
+name: 월차 추출 점검
+
+on:
+  workflow_dispatch:
+    inputs:
+      ids:
+        description: "TDnet 공시 PDF 번호(쉼표로 구분, 예: 140120261006546411)"
+        required: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: which pdftotext || (sudo apt-get update -qq && sudo apt-get install -y -qq poppler-utils)
+      - env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          MON_TEST: ${{ inputs.ids }}
+          DRY_RUN: "1"
+        run: python jpall.py

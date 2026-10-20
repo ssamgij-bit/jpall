@@ -26,6 +26,9 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      - name: 월차 표 읽기 도구(pdftotext)
+        run: which pdftotext || (sudo apt-get update -qq && sudo apt-get install -y -qq poppler-utils)
+
       - name: 이전 상태 불러오기(state 브랜치)
         run: |
           git clone --depth 1 -b state "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" state \
