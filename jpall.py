@@ -478,6 +478,184 @@ def pdf_layout(url, pages=3):
     from pdfminer.high_level import extract_text
     return nfkc(extract_text(io.BytesIO(data), maxpages=pages))
 
+# ── 월차 표 규칙 파서(pdftotext -layout 텍스트) — AI가 없을 때·교차 확인용 ──
+MP_NUM = re.compile(r"(?<![\d.])([-+±▲△]?\s?\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s?%?(?![\d,]*\.?\d*\s?(?:年|日|店|円|人|名|坪|席|台|社|件))")
+MP_MON = re.compile(r"(?:(\d{2,4})\s?[/.年]\s?)?(\d{1,2})\s?月")
+MP_STOP = re.compile(r"^\s*(?:[0-9０-９]{1,2}\s*[\.．、]\s*\S|[■◆●□【]|[（(]\s*(?:ご参考|参考|注))")
+MP_GRP = [("ex", r"既存"), ("all", r"全店|全社|合計|全体|連結|総計|全館|全事業")]
+
+def _tok(line):
+    """2칸 이상 공백으로 나뉜 덩어리 → [(시작, 끝, 글자)]"""
+    return [(m.start(), m.end(), m.group(0).strip()) for m in re.finditer(r"\S+(?:\s\S+)*", line)]
+
+def _nums(line, start=0):
+    out = []
+    for m in MP_NUM.finditer(line, start):
+        s = m.group(1).replace(" ", "").replace(",", "")
+        neg = s[:1] in "-▲△"
+        s = s.lstrip("-+±▲△")
+        try: v = float(s)
+        except ValueError: continue
+        out.append(((m.start(1) + m.end(1)) / 2, m.start(1), m.end(1), -v if neg else v))
+    return out
+
+def _ym(m, y, ref):
+    """월 → 'YYYY-MM' (연도 없으면 기준월 이전의 가장 가까운 해)"""
+    if y:
+        y = int(y); y = y + 2000 if y < 100 else y
+    else:
+        y = ref.year if m <= ref.month else ref.year - 1
+    return f"{y}-{m:02d}"
+
+def _grp(label):
+    l = re.sub(r"\s", "", label)
+    for g, p in MP_GRP:
+        if re.search(p, l): return g
+    return None
+
+def _metric(label):
+    l = re.sub(r"\s", "", label)
+    if re.search(r"客単価|単価", l): return "price"
+    if re.search(r"客数|来店|人数", l): return "cust"
+    return "sales"
+
+def _finish(cells, ref):
+    """cells: {(ym, grp, metric): [값]} → months dict. 비율(100 기준)이면 증감률로 변환"""
+    vals = [v for vs in cells.values() for v in vs]
+    if not vals: return None
+    if all(50 <= v <= 250 for v in vals): ratio = True
+    elif all(-60 < v < 60 for v in vals): ratio = False
+    else: return None  # 비율·증감률이 섞였거나 금액 → 신뢰 불가
+    months = {}
+    for (ym, g, met), vs in cells.items():
+        v = vs[0]
+        if ratio: v = round(v - 100, 1)
+        if not -100 < v < 500: continue
+        key = {"sales": "ex" if g == "ex" else "all", "cust": "cust", "price": "price"}[met]
+        if met in ("cust", "price") and g == "all":
+            key = key + "_all"
+        months.setdefault(ym, {})
+        months[ym].setdefault(key, v)
+    out = {}
+    for ym, d in months.items():
+        r = {"all": d.get("all"), "ex": d.get("ex"),
+             "cust": d.get("cust", d.get("cust_all") if d.get("ex") is None else None),
+             "price": d.get("price", d.get("price_all") if d.get("ex") is None else None)}
+        if r["all"] is not None or r["ex"] is not None: out[ym] = r
+    k = lambda ym: (ref.year - int(ym[:4])) * 12 + ref.month - int(ym[5:])
+    out = {ym: v for ym, v in out.items() if 0 <= k(ym) <= 14}
+    return out or None
+
+def parse_cols(lines, ref):
+    """월이 가로(열)로 놓인 표"""
+    cells = {}; started = False; i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if started and MP_STOP.match(ln): break
+        bare = re.search(r"[（(]\s*月\s*[)）]", ln)
+        mons = [(m.start(), m.end(), int(m.group(2)), m.group(1)) for m in MP_MON.finditer(ln) if 1 <= int(m.group(2)) <= 12]
+        if bare and len(mons) < 3:
+            mons = [(m.start(), m.end(), int(m.group(0)), None) for m in re.finditer(r"(?<![\d.])\d{1,2}(?![\d.])", ln[bare.end():]) if 1 <= int(m.group(0)) <= 12]
+            mons = [(a + bare.end(), b + bare.end(), mm, y) for a, b, mm, y in mons]
+        if len(mons) < 3:
+            i += 1; continue
+        # 이 헤더 아래의 데이터 줄
+        rows = []; j = i + 1; ctx = None
+        while j < len(lines) and j < i + 30:
+            l2 = lines[j]
+            if MP_STOP.match(l2) or (len([1 for m in MP_MON.finditer(l2)]) >= 3): break
+            ns = _nums(l2)
+            first = ns[0][1] if ns else len(l2)
+            label = l2[:first].strip()
+            if label and not ns and _grp(label): ctx = _grp(label)
+            if ns and not re.search(r"前年(?!.{0,3}比)|金額|人数|店舗数|出店|退店|天候|気温|日数|曜日|平年|^\s*\d", re.sub(r"\s", "", label) or "x"):
+                rows.append([label, ns, _grp(label), j])
+            elif ns and not label:
+                rows.append(["", ns, None, j])
+            j += 1
+        # 그룹이 없는 줄은 가까운 줄(±2, 위쪽 우선)의 그룹을 따름
+        for r in rows:
+            if r[2]: continue
+            best = None
+            for d in (1, 2):
+                for r2 in rows:
+                    if r2[2] and abs(r2[3] - r[3]) == d and r2[3] < r[3] and best is None: best = r2[2]
+                for r2 in rows:
+                    if r2[2] and abs(r2[3] - r[3]) == d and best is None: best = r2[2]
+            r[2] = best or ctx
+        for label, ns, g, _ in rows:
+            met = _metric(label)
+            for c, a, b, v in ns:
+                hit = [mm for mm in mons if mm[0] - 2 <= c <= mm[1] + 2 or (a <= mm[1] and b >= mm[0])]
+                if len(hit) != 1: continue
+                _, _, mo, y = hit[0]
+                cells.setdefault((_ym(mo, y, ref), g, met), []).append(v)
+        started = started or bool(cells)
+        i = j
+    return _finish(cells, ref)
+
+def parse_rows(lines, ref):
+    """월이 세로(행 머리)로 놓인 표"""
+    cells = {}; hdr = None; started = False
+    rowre = re.compile(r"^\s*(?:(\d{2,4})\s?[/.年]\s?)?(\d{1,2})\s?月(?:度|分)?\s")
+    for i, ln in enumerate(lines):
+        if started and MP_STOP.match(ln): break
+        m = rowre.match(ln)
+        if not m:
+            if started and hdr is not None and not ln.strip(): continue
+            continue
+        ns = _nums(ln, m.end())
+        if not ns: continue
+        mo = int(m.group(2))
+        if not 1 <= mo <= 12: continue
+        if hdr is None:
+            hdr = []
+            for l in reversed(lines[max(0, i - 6):i]):
+                if not l.strip(): continue
+                if _nums(l) or re.search(r"[、。]|について|お知らせ|単位", l): break
+                hdr.insert(0, _tok(l))
+            hdr = [h for h in hdr if h][-4:]
+            if not hdr: return None
+            ncol = len(ns)
+        for c, a, b, v in ns:
+            lab = []
+            for toks in hdr:
+                t = [t for t in toks if t[0] - 2 <= c <= t[1] + 2]
+                if t: lab.append(t[0][2])
+                elif len(toks) <= ncol / 2:  # 여러 열을 묶는 머리글: 가장 가까운 것
+                    lab.append(min(toks, key=lambda t: abs((t[0] + t[1]) / 2 - c))[2])
+            L = " ".join(lab)
+            if re.search(r"前年(?!.{0,3}比)|金額|人数|店舗|出店|退店|月末|期末", re.sub(r"\s", "", L)): continue
+            g = _grp(L)
+            if g is None and re.search(r"既存", " ".join(t[2] for h in hdr for t in h)) and not re.search(r"全", L): continue
+            cells.setdefault((_ym(mo, m.group(1), ref), g, _metric(L)), []).append(v)
+        started = True
+    return _finish(cells, ref)
+
+def mon_parse(text, title, d):
+    """d: 공시일 'YYYYMMDD'. 반환 {ym: {all, ex, cust, price}} 또는 None"""
+    t = nfkc(text).replace("　", " ")
+    t = re.sub(r"[ ]?([▲△])\s?", r" -", t)
+    lines = t.split("\n")
+    ref = dt.date(int(d[:4]), int(d[4:6]), 1)
+    m = re.search(r"(\d{4})\s*年\s*(\d{1,2})\s*月", nfkc(title)) or re.search(r"(\d{4})\s*年\s*(\d{1,2})\s*月度?", t[:3000])
+    if m and 1 <= int(m.group(2)) <= 12:
+        r2 = dt.date(int(m.group(1)), int(m.group(2)), 1)
+        if 0 <= (ref.year - r2.year) * 12 + ref.month - r2.month <= 3: ref = r2
+    if re.search(r"単位\s*[:：]?\s*(?:百万|千|億)?円", t[:6000]) and not re.search(r"前年比|前年同月比|対前年|増減率|伸び率|YoY", t[:6000]): return None
+    best = None
+    for f in (parse_cols, parse_rows):
+        try: r = f(lines, ref)
+        except Exception: r = None
+        if r and (best is None or len(r) > len(best)): best = r
+    if not best: return None
+    tm = re.search(r"(\d{1,2})\s*月", re.sub(r"\d{4}\s*年\s*\d{1,2}\s*月期", "", nfkc(title)))
+    last = max(best)
+    if tm and int(tm.group(1)) != int(last[5:]): return None  # 제목의 달과 표의 최신 달이 다르면 버림
+    gap = (int(d[:4]) * 12 + int(d[4:6])) - (int(last[:4]) * 12 + int(last[5:]))  # 공시월 - 최신 데이터월
+    if gap < 0 or gap > 2 or (gap == 0 and int(d[6:]) < 15): return None
+    return best
+
 MON_PROMPT = """너는 일본 소매·외식 기업 월차 공시를 읽는 애널리스트다. 아래는 월차(월별 실적) 공시 원문(표 모양 유지 텍스트)이다. 공시일: {date}
 
 할 일: 이번 회계연도 표에서 월별 "전년 동월 대비 증감률(%)"을 뽑아라.
@@ -502,14 +680,27 @@ def _f(v):
         return None
 def _w(s): return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
 def _pad(s, n): return " " * max(n - _w(s), 0) + s
-def mon_extract(row):
-    if not os.environ.get("GEMINI_API_KEY"): return None
-    t = pdf_layout(row["pdf"])
-    t = re.sub(r"[ 　]{3,}", "   ", t); t = re.sub(r"\n\s*\n+", "\n", t)
-    if len(re.findall(r"\d", t)) < 10: return None  # 이미지 PDF 등
+MON_AI_CAP = int(os.environ.get("MON_AI_CAP", "80"))  # 하루 AI 호출 상한(다른 봇과 키 공유 대비)
+def mon_extract(row, st=None):
+    raw = pdf_layout(row["pdf"])
+    if len(re.findall(r"\d", raw)) < 10: return None  # 이미지 PDF 등
     d = row["d"]
-    j = gemini_json(MON_PROMPT.format(date=f"{d[:4]}-{d[4:6]}-{d[6:]}", text=t[:6000]), timeout=60)
-    if not j or not j.get("ok"): return None
+    try: det = mon_parse(raw, row.get("title", ""), d)
+    except Exception as e: det = None; log("mon parse error", e)
+    t = re.sub(r"[ \u3000]{3,}", "   ", raw); t = re.sub(r"\n\s*\n+", "\n", t)
+    j = None
+    st = st if st is not None else {}
+    cap = st.setdefault("mon_ai", {"d": d, "n": 0})
+    if cap.get("d") != d: cap.update(d=d, n=0)
+    if os.environ.get("GEMINI_API_KEY") and cap["n"] < MON_AI_CAP:
+        cap["n"] += 1
+        j = gemini_json(MON_PROMPT.format(date=f"{d[:4]}-{d[4:6]}-{d[6:]}", text=t[:6000]), timeout=90, models=MON_MODELS)
+    if not (j and j.get("ok")):
+        if j and not j.get("ok"): return None  # AI가 월차 매출이 아니라고 판단
+        if not det: return None
+        # AI 없이 규칙 파서만: 매출(전체·기존점)만 사용
+        det = {k: {"all": v.get("all"), "ex": v.get("ex"), "cust": None, "price": None} for k, v in det.items()}
+        return {"metric": "매출", "scope": "", "months": det, "cum": None, "src": "rule"}
     ref = dt.date(int(d[:4]), int(d[4:6]), 1)
     months = {}
     for m in j.get("months") or []:
@@ -521,10 +712,15 @@ def mon_extract(row):
         if any(x is not None for x in v.values()): months[ym] = v
     if not months: return None
     cum = j.get("cum") if isinstance(j.get("cum"), dict) else None
-    return {"metric": str(j.get("metric") or "매출")[:8], "scope": str(j.get("scope") or "")[:30], "months": months, "cum": cum}
+    src = "ai"
+    if det:  # 규칙 파서와 최신 달 값 교차 확인
+        last = max(months); a, b = months[last], det.get(last) or {}
+        diff = [c for c in ("all", "ex") if a.get(c) is not None and b.get(c) is not None and abs(a[c] - b[c]) > 0.15]
+        src = "mismatch" if diff else ("ai+rule" if any(b.get(c) is not None for c in ("all", "ex")) else "ai")
+    return {"metric": str(j.get("metric") or "매출")[:8], "scope": str(j.get("scope") or "")[:30], "months": months, "cum": cum, "src": src}
 
 def body_monthly(row, st):
-    r = mon_extract(row)
+    r = mon_extract(row, st)
     if not r: return None
     code = row["code"]
     h = st.setdefault("monh", {}).setdefault(code, {})
@@ -556,7 +752,9 @@ def body_monthly(row, st):
         tc = "ex" if any(hist[k].get("ex") is not None for k in ks) else "all"
         vals = [f"{hist[k][tc]:+.1f}" for k in ks if hist[k].get(tc) is not None]
         if len(vals) >= 2: trend = f" | {'기존점' if tc == 'ex' else '전체'} 추이 {int(ks[0][5:])}~{mm}월 " + "→".join(vals)
-    HL.update(kind="mon", mon=line + trend)
+    note = {"rule": "※ AI 미사용 — 표 자동 인식값(매출만), 원문 확인 권장", "mismatch": "⚠ AI와 표 자동 인식값이 달라 원문 확인 필요"}.get(r.get("src"))
+    if note: s += f"\n<i>{note}</i>"
+    HL.update(kind="mon", mon=line + trend + (" ⚠원문 확인" if r.get("src") == "mismatch" else ""))
     return s
 
 def build(row, st, names, quotes, trmap):
@@ -760,19 +958,24 @@ def reason_src(row, kind):
     return out
 
 GEMINI_MODELS = [m.strip() for m in os.environ.get("GEMINI_MODELS", "gemini-3.8-flash,gemini-3.7-flash,gemini-3.5-flash,gemini-3.1-flash-lite").split(",") if m.strip()]
-def gemini_json(prompt, timeout=150):
+MON_MODELS = [m.strip() for m in os.environ.get("MON_MODELS", "gemini-3.1-flash-lite,gemini-3.5-flash,gemini-3.7-flash").split(",") if m.strip()]
+def gemini_json(prompt, timeout=150, models=None):
     key = os.environ.get("GEMINI_API_KEY")
     if not key: return None
-    for model in GEMINI_MODELS[:2] if timeout < 150 else GEMINI_MODELS:
+    for model in models or GEMINI_MODELS:
+        t0 = time.time()
         try:
             body = json.dumps({"contents": [{"parts": [{"text": prompt}]}],
                                "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8000, "responseMimeType": "application/json"}}).encode()
             r = json.loads(http(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}",
                                 timeout=timeout, data=body, headers={"content-type": "application/json"}))
             txt = "".join(p.get("text", "") for p in r["candidates"][0]["content"]["parts"])
-            return json.loads(re.sub(r"^```(json)?|```$", "", txt.strip()))
+            out = json.loads(re.sub(r"^```(json)?|```$", "", txt.strip()))
+            if models: log("gemini ok", model, f"{time.time() - t0:.0f}s")
+            return out
         except Exception as e:
             log("gemini error", model, str(e)[:150])
+            if "429" in str(e): time.sleep(3)
     return None
 
 AI_PROMPT = """너는 일본 주식 애널리스트다. 아래는 오늘 도쿄증시 적시공시 중 하이라이트로 뽑힌 항목들이다.
@@ -1221,7 +1424,9 @@ def mon_test(ids):
     for i in ids.split(","):
         i = i.strip().replace(".pdf", "")
         if not i: continue
-        row = {"pdf": TDNET + i + ".pdf", "d": i[4:12], "code": "TEST"}
+        row = {"pdf": TDNET + i + ".pdf", "d": i[4:12], "code": "TEST", "title": ""}
+        try: print("규칙 파서:", mon_parse(pdf_layout(row["pdf"]), "", row["d"]), flush=True)
+        except Exception as e: print("규칙 파서 오류", e)
         try: print("=" * 60, "\n" + i, "\n" + str(body_monthly(row, st)), "\n요약:", HL.get("mon"), flush=True)
         except Exception: traceback.print_exc()
         st.pop("monh", None); HL.clear()
