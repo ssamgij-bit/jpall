@@ -463,6 +463,102 @@ def body_tob(row):
     if per: s += f"\n기간 : {per.group(1)}.{int(per.group(2)):02d}.{int(per.group(3)):02d}~{per.group(4)}.{int(per.group(5)):02d}.{int(per.group(6)):02d}"
     return s
 
+# ───────────────────────── 월차(월별 매출) → 전년비 추출 ─────────────────────────
+def pdf_layout(url, pages=3):
+    """표 모양을 유지한 텍스트(pdftotext -layout). 없으면 pdfminer 텍스트"""
+    import subprocess, tempfile
+    data = http(url, timeout=40)
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as f:
+            f.write(data); f.flush()
+            out = subprocess.run(["pdftotext", "-layout", "-l", str(pages), f.name, "-"], capture_output=True, timeout=30).stdout.decode("utf-8", "ignore")
+        if out.strip(): return nfkc(out)
+    except Exception as e:
+        log("pdftotext error", e)
+    from pdfminer.high_level import extract_text
+    return nfkc(extract_text(io.BytesIO(data), maxpages=pages))
+
+MON_PROMPT = """너는 일본 소매·외식 기업 월차 공시를 읽는 애널리스트다. 아래는 월차(월별 실적) 공시 원문(표 모양 유지 텍스트)이다. 공시일: {date}
+
+할 일: 이번 회계연도 표에서 월별 "전년 동월 대비 증감률(%)"을 뽑아라.
+- all: 전사·전체(全店·全社·合計) 매출 증감률 / ex: 기존점(既存店) 매출 / cust: 기존점 객수(客数) / price: 기존점 객단가(客単価). 기존점 객수·객단가가 없고 전점 것만 있으면 그것을 쓴다.
+- 102.3(%)처럼 전년=100 비율이면 +2.3으로, 이미 증감률(12.2%増, -0.9)이면 그대로. 금액만 있고 전년 금액도 있으면 계산, 아니면 null.
+- '前年' 열(작년의 전년비)·전전년 비교·참고용 지난 회계연도 표는 쓰지 마라. 아직 안 나온 미래 달은 넣지 마라.
+- 사업이 여럿이면 회사 전체 합계, 합계가 없으면 가장 큰 주력 사업(국내 직영 등). metric은 지표 이름(보통 "매출", 발전량·수주 등이면 그 이름).
+- ym은 "YYYY-MM". 연도는 제목·공시일로 판단(예: 2026년 9월 공시의 4~9월 = 2026-04~2026-09, 회계연도가 해를 넘기면 주의).
+- cum: 회계연도 누계(累計·上期 등)가 있으면 {{"label":"상반기 누계" 같은 한국어, "all":.., "ex":..}}, 없으면 null.
+- 월차 매출 성격이 아니면(암호자산 보유 현황, 수치 없는 안내 등) ok=false.
+출력 JSON만: {{"ok": true, "metric": "매출", "scope": "국내 직영점 등 대상 한국어 짧게(없으면 빈 문자열)", "months": [{{"ym": "2026-09", "all": 11.8, "ex": 8.3, "cust": 6.0, "price": 2.2}}], "cum": null}}
+
+원문:
+{text}
+"""
+MON_COLS = [("all", "전체"), ("ex", "기존점"), ("cust", "객수"), ("price", "객단가")]
+def _f(v):
+    try:
+        v = float(v)
+        return v if -100 < v < 1000 else None
+    except (TypeError, ValueError):
+        return None
+def _w(s): return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+def _pad(s, n): return " " * max(n - _w(s), 0) + s
+def mon_extract(row):
+    if not os.environ.get("GEMINI_API_KEY"): return None
+    t = pdf_layout(row["pdf"])
+    t = re.sub(r"[ 　]{3,}", "   ", t); t = re.sub(r"\n\s*\n+", "\n", t)
+    if len(re.findall(r"\d", t)) < 10: return None  # 이미지 PDF 등
+    d = row["d"]
+    j = gemini_json(MON_PROMPT.format(date=f"{d[:4]}-{d[4:6]}-{d[6:]}", text=t[:6000]), timeout=60)
+    if not j or not j.get("ok"): return None
+    ref = dt.date(int(d[:4]), int(d[4:6]), 1)
+    months = {}
+    for m in j.get("months") or []:
+        ym = str(m.get("ym") or "")
+        if not re.fullmatch(r"\d{4}-\d{2}", ym): continue
+        k = (ref.year - int(ym[:4])) * 12 + ref.month - int(ym[5:])
+        if not 0 <= k <= 14: continue  # 공시일 기준 미래·너무 오래된 달 제외
+        v = {c: _f(m.get(c)) for c, _ in MON_COLS}
+        if any(x is not None for x in v.values()): months[ym] = v
+    if not months: return None
+    cum = j.get("cum") if isinstance(j.get("cum"), dict) else None
+    return {"metric": str(j.get("metric") or "매출")[:8], "scope": str(j.get("scope") or "")[:30], "months": months, "cum": cum}
+
+def body_monthly(row, st):
+    r = mon_extract(row)
+    if not r: return None
+    code = row["code"]
+    h = st.setdefault("monh", {}).setdefault(code, {})
+    h.update(r["months"]); h["_t"] = time.time()
+    for k in sorted(k for k in h if k[:1].isdigit())[:-13]: h.pop(k)  # 최근 13개월만 보관
+    if len(st["monh"]) > 1500:
+        for c in sorted(st["monh"], key=lambda c: st["monh"][c].get("_t", 0))[:200]: st["monh"].pop(c)
+    hist = {k: v for k, v in h.items() if k[:1].isdigit()}
+    last = max(r["months"]); lv = r["months"][last]
+    met = r["metric"]; mm = int(last[5:])
+    fx = lambda v: f"{v:+.1f}%"
+    main = []
+    if lv.get("all") is not None: main.append(f"전체 {met} {fx(lv['all'])}")
+    if lv.get("ex") is not None: main.append(f"기존점 {fx(lv['ex'])}")
+    sub = [f"{l} {fx(lv[c])}" for c, l in MON_COLS[2:] if lv.get(c) is not None]
+    line = f"{mm}월 " + " · ".join(main) + (f" ({' · '.join(sub)})" if sub else "")
+    s = f"<b>[월차 · 전년 동월 대비]</b>" + (f" {esc(r['scope'])}" if r["scope"] else "") + f"\n<b>{line}</b>"
+    cum = r.get("cum") or {}
+    cs = [f"{l} {fx(_f(cum.get(c)))}" for c, l in MON_COLS[:2] if _f(cum.get(c)) is not None]
+    if cs: s += f"\n{esc(str(cum.get('label') or '누계'))[:12]} : " + " · ".join(cs)
+    ks = sorted(hist)[-6:]
+    cols = [(c, l) for c, l in MON_COLS if any(hist[k].get(c) is not None for k in ks)]
+    trend = ""
+    if len(ks) >= 2 and cols:
+        rows = ["월   " + "".join(_pad(l, 7) for _, l in cols)]
+        for k in ks:
+            rows.append(f"{k[2:4]}/{k[5:]}" + "".join(_pad("-" if hist[k].get(c) is None else f"{hist[k][c]:+.1f}", 7) for c, _ in cols))
+        s += "\n최근 추이(전년 동월 대비 %)\n<pre>" + esc("\n".join(rows)) + "</pre>"
+        tc = "ex" if any(hist[k].get("ex") is not None for k in ks) else "all"
+        vals = [f"{hist[k][tc]:+.1f}" for k in ks if hist[k].get(tc) is not None]
+        if len(vals) >= 2: trend = f" | {'기존점' if tc == 'ex' else '전체'} 추이 {int(ks[0][5:])}~{mm}월 " + "→".join(vals)
+    HL.update(kind="mon", mon=line + trend)
+    return s
+
 def build(row, st, names, quotes, trmap):
     code = row["code"]; n = names.get(code)
     name_ko = n["ko"] if n else jp2ko(row["name"])
@@ -484,6 +580,8 @@ def build(row, st, names, quotes, trmap):
             body = body_buyback(row)
         elif re.search(r"公開買付けの開始|公開買付けに関する意見表明|MBO", title) and not re.match(r"[(（](訂正|変更|経過開示)", title):
             body = body_tob(row)
+        elif re.search(MON_RE, title) and "訂正" not in title:
+            body = body_monthly(row, st)
     except Exception as e:
         log("body error", code, title[:30], e)
     try:
@@ -512,7 +610,7 @@ SECTIONS = [("watch", "⭐ 관심 종목 공시"), ("beat", "① 컨센서스 �
             ("hold", "⑥ 대량보유 (행동주의·주요 투자자·신규 5%)"), ("evt", "⑦ 정책·구조 변화 (중기계획·PBR 대응·배당정책·완전자회사화 등)"),
             ("ret", "⑧ 증배 · 자사주 · 공개매수"), ("mon", "⑨ 월차 매출"), ("miss", "⑩ 컨센서스 하회 실적"), ("down", "⑪ 실적 가이던스 하향")]
 
-MON_RE = r"月次|既存店|売上速報|営業概況|月間売上|売上高前年|月度売上|月次報告"
+MON_RE = r"月次|既存店|売上高?速報|営業速報|営業概況|月間売上|売上高前年|月度売上|月次報告|売上高?推移"
 EVT_RULES = [(r"中期経営計画|中期経営方針|長期ビジョン", "중기 경영계획"),
              (r"資本コストや株価を意識|資本コスト.{0,12}株価", "PBR 개선 계획"),
              (r"配当方針|株主還元方針|累進配当|DOE|資本政策の基本方針", "배당·환원 정책"),
@@ -528,7 +626,9 @@ def record_hl(row, st, name_ko, q, title_ko):
     """방금 처리한 공시가 하이라이트 기준에 맞으면 st['hl']에 저장. 항목: (섹션, 문구, 점수)"""
     h = dict(HL); items = []
     t0 = row["title"]
-    if not h.get("kind") and "訂正" not in t0:
+    if h.get("kind") == "mon":  # 월차 수치를 뽑은 경우: 제목 + 전년비 요약
+        items.append(("mon", title_ko, 0))
+    elif not h.get("kind") and "訂正" not in t0:
         if re.search(MON_RE, t0):
             h["kind"] = "mon"; items.append(("mon", title_ko, 0))
         else:
@@ -612,7 +712,7 @@ def record_hl(row, st, name_ko, q, title_ko):
         items.insert(0, ("watch", title_ko, 0))
     if not items: return
     src = ""
-    try: src = reason_src(row, h.get("kind"))
+    try: src = h["mon"] if h.get("mon") else reason_src(row, h.get("kind"))
     except Exception as e: log("reason src error", row["code"], e)
     hl = st.setdefault("hl", [])
     have = {(x["id"], x["sec"]) for x in hl}
@@ -621,7 +721,7 @@ def record_hl(row, st, name_ko, q, title_ko):
         if (row["id"], sec) in have: continue
         hl.append({"id": row["id"], "sec": sec, "code": row["code"], "name": name_ko, "mc": mc, "mct": mcap_txt(q),
                    "txt": txt, "pdf": row["pdf"], "ts": time.time(), "sent": False, "src": src, "score": sc or 0,
-                   "noai": sec == "watch" and not src})
+                   "noai": sec == "watch" and not src, "mon": h.get("mon") if sec == "mon" else None})
 
 # 공시 PDF에서 '이유'가 적힌 부분(일본어 원문)을 잘라 둠 → 19시 요약 때 AI가 한 줄로 정리
 REASON_HEAD = {
@@ -660,15 +760,15 @@ def reason_src(row, kind):
     return out
 
 GEMINI_MODELS = [m.strip() for m in os.environ.get("GEMINI_MODELS", "gemini-3.8-flash,gemini-3.7-flash,gemini-3.5-flash,gemini-3.1-flash-lite").split(",") if m.strip()]
-def gemini_json(prompt):
+def gemini_json(prompt, timeout=150):
     key = os.environ.get("GEMINI_API_KEY")
     if not key: return None
-    for model in GEMINI_MODELS:
+    for model in GEMINI_MODELS[:2] if timeout < 150 else GEMINI_MODELS:
         try:
             body = json.dumps({"contents": [{"parts": [{"text": prompt}]}],
                                "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8000, "responseMimeType": "application/json"}}).encode()
             r = json.loads(http(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}",
-                                timeout=150, data=body, headers={"content-type": "application/json"}))
+                                timeout=timeout, data=body, headers={"content-type": "application/json"}))
             txt = "".join(p.get("text", "") for p in r["candidates"][0]["content"]["parts"])
             return json.loads(re.sub(r"^```(json)?|```$", "", txt.strip()))
         except Exception as e:
@@ -738,7 +838,8 @@ def digest_text(items, day, reasons=None, top=None):
         xs = [x for x in items if x["sec"] == sec and not (sec == "prog" and x["code"] in up_codes)]
         seen = set(); uniq = []
         def mon_key(x):
-            m = re.search(r"기존점\s*([+-]?\d+(?:\.\d+)?)%", reasons.get(idx[id(x)]) or "")
+            s = (x.get("mon") or reasons.get(idx[id(x)]) or "").split("|")[0]
+            m = re.search(r"기존점\s*([+-]?\d+(?:\.\d+)?)%", s) or re.search(r"전체[^+\-\d]*([+-]?\d+(?:\.\d+)?)%", s)
             return float(m.group(1)) if m else -999
         key = (lambda x: (-mon_key(x), -x["mc"])) if sec == "mon" else (lambda x: (-(x.get("score") or 0), -x["mc"]))
         for x in sorted(xs, key=key):
@@ -748,7 +849,7 @@ def digest_text(items, day, reasons=None, top=None):
         out += ["", f"<b>{lab} ({len(uniq)}건)</b>"]
         for x in uniq[:20]:
             out.append(f"• <a href=\"{x['pdf']}\">{esc(x['name'])}</a>" + (f"({x['mct']})" if x["mct"] else "") + f" {x['code']}\n   {x['txt']}")
-            rs = reasons.get(idx[id(x)])
+            rs = (x.get("mon") if sec == "mon" else None) or reasons.get(idx[id(x)])
             if rs and sec != "watch": out.append(f"   └ {'수치' if sec == 'mon' else '내용' if sec == 'evt' else '이유'}: {esc(rs)}")
         if len(uniq) > 20: out.append(f"   …외 {len(uniq) - 20}건")
     out += ["", f"<i>기준: 컨센 상회 = 분기 EPS +{BEAT_EPS}%↑ 또는 매출 +{BEAT_REV}%↑ / 하회 = EPS {MISS_EPS}%↓(또는 적자) 또는 매출 {MISS_REV}%↓ (Yahoo Finance 애널리스트 평균, 발표 전 저장) · 가이던스 상·하향 = 회사 실적예상 수정 공시의 영업익(없으면 경상익) 기준 · 상향 후보 = 누적 영업익 진척률이 과거 같은 분기 평균보다 +{PROG_GAP}%p↑ (가부탄 분기표) · PER = 직전 주가 ÷ 회사 가이던스 EPS · 대량보유 = EDINET 5% 보고 중 행동주의·주요 투자자 및 대형 운용사·증권사 재고를 뺀 신규 5%·+2%p 이상 · 이유 = 공시 원문의 설명 부분을 "
@@ -1114,7 +1215,19 @@ def collect(st):
         st["init"] = True; log("first run: existing disclosures recorded without posting")
     return added
 
+def mon_test(ids):
+    """수동 점검용: MON_TEST=공시PDF id(쉼표 구분)의 월차 추출 결과만 출력"""
+    st = {}
+    for i in ids.split(","):
+        i = i.strip().replace(".pdf", "")
+        if not i: continue
+        row = {"pdf": TDNET + i + ".pdf", "d": i[4:12], "code": "TEST"}
+        try: print("=" * 60, "\n" + i, "\n" + str(body_monthly(row, st)), "\n요약:", HL.get("mon"), flush=True)
+        except Exception: traceback.print_exc()
+        st.pop("monh", None); HL.clear()
+
 def main():
+    if os.environ.get("MON_TEST"): return mon_test(os.environ["MON_TEST"])
     t0 = time.time()
     st = load("state.json", {})
     names = load_names(st)
