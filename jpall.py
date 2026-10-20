@@ -717,6 +717,9 @@ def mon_extract(row, st=None):
         last = max(months); a, b = months[last], det.get(last) or {}
         diff = [c for c in ("all", "ex") if a.get(c) is not None and b.get(c) is not None and abs(a[c] - b[c]) > 0.15]
         src = "mismatch" if diff else ("ai+rule" if any(b.get(c) is not None for c in ("all", "ex")) else "ai")
+        if diff:  # 값이 다르면 표 자동 인식값(매출)을 쓰고 객수·객단가·누계는 뺌 — 점검 결과 매출은 규칙 인식이 더 정확했음
+            months = {k: {"all": v.get("all"), "ex": v.get("ex"), "cust": None, "price": None} for k, v in det.items()}
+            cum = None
     return {"metric": str(j.get("metric") or "매출")[:8], "scope": str(j.get("scope") or "")[:30], "months": months, "cum": cum, "src": src}
 
 def body_monthly(row, st):
@@ -752,7 +755,7 @@ def body_monthly(row, st):
         tc = "ex" if any(hist[k].get("ex") is not None for k in ks) else "all"
         vals = [f"{hist[k][tc]:+.1f}" for k in ks if hist[k].get(tc) is not None]
         if len(vals) >= 2: trend = f" | {'기존점' if tc == 'ex' else '전체'} 추이 {int(ks[0][5:])}~{mm}월 " + "→".join(vals)
-    note = {"rule": "※ AI 미사용 — 표 자동 인식값(매출만), 원문 확인 권장", "mismatch": "⚠ AI와 표 자동 인식값이 달라 원문 확인 필요"}.get(r.get("src"))
+    note = {"rule": "※ AI 미사용 — 표 자동 인식값(매출만), 원문 확인 권장", "mismatch": "⚠ AI 판독값과 표 자동 인식값이 달라 표 인식값(매출)만 표시 — 원문 확인 권장"}.get(r.get("src"))
     if note: s += f"\n<i>{note}</i>"
     HL.update(kind="mon", mon=line + trend + (" ⚠원문 확인" if r.get("src") == "mismatch" else ""))
     return s
