@@ -1,0 +1,33 @@
+name: 펀드 서한 미러(지역 차단 우회)
+
+on:
+  schedule:
+    - cron: "23 */12 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 내려받기
+        run: |
+          mkdir m && cd m
+          get() { curl -sfL -A "Mozilla/5.0" -o "$1" "$2" && head -c 4 "$1" | grep -q "%PDF" || rm -f "$1"; }
+          get fid-japan-qa.pdf "https://institutional.fidelity.com/app/proxy/content?literatureURL=%2FRD_QAA_350.PDF"
+          get fid-japan-small-qa.pdf "https://institutional.fidelity.com/app/proxy/content?literatureURL=%2FRD_QAA_360.PDF"
+          get fidca-japan-semi.pdf "https://www.fidelity.ca/content/dam/fidelity/en/documents/mrfp-semi/FICL_JG_CS_MRFPS.pdf"
+          get fidca-japan-annual.pdf "https://fidelity.ca/content/dam/fidelity/en/documents/mrfp-annual/FICL_JG_MRFPA.PDF"
+          ls -la
+      - name: mirror 브랜치에 저장
+        run: |
+          cd m
+          git init -q -b mirror
+          git config user.name "mirror-bot"
+          git config user.email "mirror-bot@users.noreply.github.com"
+          git add -A
+          git commit -qm "mirror $(date -u +%FT%TZ)" || exit 0
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" mirror
