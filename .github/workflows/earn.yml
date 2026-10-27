@@ -9,6 +9,10 @@ on:
         description: "YYYYMMDD — 그날 결산단신을 다시 판별해 채널에 게시(테스트용, 비우면 평소 실행)"
         required: false
         default: ""
+      test_report:
+        description: "종목 코드(쉼표로 여러 개) — 요청 분석 카드와 리포트·IR 요약을 바로 만들어 채널에 게시(테스트용)"
+        required: false
+        default: ""
 
 concurrency:
   group: earn
@@ -45,6 +49,7 @@ jobs:
           EARN_CHANNEL: ${{ secrets.EARN_CHANNEL }}
           GEMINI_API_KEY: ${{ secrets.EARN_GEMINI_KEY || secrets.GEMINI_API_KEY }}   # 전용 키가 있으면 그것을 먼저 사용
           TEST_DAY: ${{ github.event.inputs.test_day }}
+          TEST_REPORT: ${{ github.event.inputs.test_report }}
           RUN_SECONDS: "1680"
         run: python earn.py
 
