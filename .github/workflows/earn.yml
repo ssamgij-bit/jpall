@@ -43,7 +43,7 @@ jobs:
         env:
           EARN_TOKEN: ${{ secrets.EARN_TOKEN }}
           EARN_CHANNEL: ${{ secrets.EARN_CHANNEL }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.EARN_GEMINI_KEY || secrets.GEMINI_API_KEY }}   # 전용 키가 있으면 그것을 먼저 사용
           TEST_DAY: ${{ github.event.inputs.test_day }}
           RUN_SECONDS: "1680"
         run: python earn.py
