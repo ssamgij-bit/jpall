@@ -29,10 +29,10 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - run: pip install -r requirements.txt matplotlib
+      - run: pip install -r requirements.txt matplotlib koreanize-matplotlib   # 한글 글꼴(나눔고딕)은 koreanize-matplotlib에 포함
 
-      - name: 한글 글꼴·PDF 도구
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk poppler-utils
+      - name: PDF 도구(pdftotext)
+        run: which pdftotext || (sudo apt-get update -qq && sudo apt-get install -y -qq poppler-utils)
 
       - name: 이전 상태 불러오기(earn-state 브랜치)
         run: |
