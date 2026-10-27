@@ -113,6 +113,36 @@ def kb_profile(code):
     o = re.search(r"概要\s*</div>\s*<div[^>]*>(.*?)</div>", s, re.S)
     return cap, (nfkc(text_of(o.group(1))) if o else "")
 
+# ───────────────────────── 영문 회사명(JPX 상장 종목 목록, 하루 1회) ─────────────────────────
+_EN = None
+def en_name(code):
+    """AI 한도 초과 등으로 한국어 표기가 없을 때 쓰는 영문명(일본어 그대로 내보내지 않기 위해)"""
+    global _EN
+    if _EN is None:
+        _EN = {}
+        path = os.path.join(STATE_DIR, "names_en.json")
+        try:
+            c = json.load(open(path))
+            if c.get("d") == now().strftime("%Y-%m-%d"): _EN = c["n"]
+        except Exception: pass
+        if not _EN:
+            try:
+                import pandas as pd
+                page = http("https://www.jpx.co.jp/english/markets/statistics-equities/misc/01.html").decode("utf-8", "ignore")
+                m = re.search(r'href="([^"]*data_e\.xlsx?)"', page)
+                df = pd.read_excel(io.BytesIO(http("https://www.jpx.co.jp" + m.group(1), timeout=60)), dtype=str)
+                for c, n in zip(df["Local Code"], df["Name (English)"]):
+                    n = re.sub(r"[\s,.]*(co\.?,?\s*ltd\.?|inc\.?|corporation|corp\.?|limited|k\.k\.)$", "", str(n).strip(), flags=re.I)
+                    _EN[str(c)[:4]] = n.replace("・", " ").strip()
+                os.makedirs(STATE_DIR, exist_ok=True)
+                json.dump({"d": now().strftime("%Y-%m-%d"), "n": _EN}, open(path, "w"), ensure_ascii=False)
+            except Exception as e:
+                log("english names error", e)
+    return _EN.get(code)
+
+def name_of(code, jp, ai=None):
+    return (ai or {}).get("name_ko") or en_name(code) or jp2ko(jp)
+
 # ───────────────────────── 네이버 일봉 ─────────────────────────
 def naver_daily(sym, days=400, index=False):
     end = now() + dt.timedelta(days=1); start = end - dt.timedelta(days=days)
@@ -194,6 +224,9 @@ def read_tanshin(row):
     r = X.summarize_results(kind, facts, ctx)
     if not r: return None, ""
     r["kind"] = kind
+    sh = [v for n, cid, v in facts if n.startswith("NumberOfIssuedAndOutstandingShares") and cid.startswith("Current")]
+    tr = [v for n, cid, v in facts if n.startswith("NumberOfTreasuryStock") and cid.startswith("Current")]
+    r["shares"] = (max(sh) - (max(tr) if tr else 0)) if sh else None
     # 본문(경영성적 개황 등) — 첨부의 qualitative.htm
     qual = ""
     try:
@@ -402,7 +435,16 @@ def analyze(row, rows, st):
         return res
     if not ok: return res
     cap, profile = kb_profile(code)
+    if cap is None and r.get("shares"):  # 가부탄에 시총이 비어 있으면 발행주식수(XBRL) × 최근 종가(네이버)
+        try:
+            bars = naver_daily(f"{code}.T", days=10)
+            if bars: cap = r["shares"] * bars[-1]["c"] / 1e8
+        except Exception as e:
+            log("cap fallback error", code, e)
     res["cap"] = cap
+    if cap is None:
+        res["pass"] = False; res["why"] = "X5 시총 확인 불가"
+        return res
     if cap is not None and cap < RULES["X5_min_cap_oku"]:
         res["pass"] = False; res["why"] = f"X5 시총 {cap:,.0f}억 엔"
         return res
@@ -426,7 +468,7 @@ def card_text(a, ai, row):
     q = series[-1]
     m = metrics(series, len(series) - 1)
     py = m["py"] or {}
-    name = (ai or {}).get("name_ko") or jp2ko(a["name"])
+    name = name_of(a["code"], a["name"], ai)
     t = row["t"]; d = row["d"]
     L = [f"📌 <b>{esc(name)} ({a['code']})</b> · {int(d[4:6])}/{int(d[6:])} {t}"]
     fc = r.get("fc") or {}
@@ -738,12 +780,12 @@ def process_day(st, day, test=False):
         ai = ai_card({"name": a["name"], "code": a["code"], "sector": a["sector"], "profile": a.get("profile", ""), "nums": nums, "qual": a.get("qual", "")})
         cap = card_text(a, ai, row)
         buf = io.BytesIO()
-        chart_name = ((ai or {}).get("name_ko") or jp2ko(a["name"])) + f"({a['code']})"
+        chart_name = name_of(a["code"], a["name"], ai) + f"({a['code']})"
         card_chart(chart_name, a["series"], fem, buf)
         msg = post_card(st, cid, cap, buf.getvalue())
         if msg is None and not DRY: continue
         st.setdefault("cards", {})[cid] = {
-            "code": a["code"], "name": a["name"], "name_ko": (ai or {}).get("name_ko"), "d": row["d"], "t": row["t"], "msg": msg,
+            "code": a["code"], "name": a["name"], "name_ko": name_of(a["code"], a["name"], ai), "d": row["d"], "t": row["t"], "msg": msg,
             "caption": cap, "ts": time.time(), "sector": a["sector"], "cap": a.get("cap"), "pdf": row["pdf"],
             "mat": (a.get("mat") or {}).get("pdf"), "fem": fem, "series": a["series"][-8:], "hit": a["hit"],
             "r": {k: a["r"].get(k) for k in ("q", "start", "end", "fc", "fc_end", "rev", "op", "ni", "scope")},
