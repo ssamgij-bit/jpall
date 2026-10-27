@@ -369,7 +369,7 @@ def build(card):
     except Exception as e:
         E.log("holders error", e)
     # 3) 설명 자료·기록 모으기(TDnet → 회사 IR 홈페이지 → 로그미)
-    mat_pdf, mat_url, mat_src = None, card.get("mat"), "TDnet"
+    mat_pdf, mat_url, mat_src = None, card.get("mat"), card.get("mat_src") or "TDnet"
     if not mat_url:
         try:
             for t, u, d in earn_ir.ir_site_docs(code, card["d"], limit=4, pat=earn_ir.MAT_LINK):

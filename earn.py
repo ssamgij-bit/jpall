@@ -405,9 +405,11 @@ def card_chart(name, series, fy_end_month, path):
     fig.savefig(path, facecolor="white"); plt.close(fig)
 
 # ───────────────────────── Gemini: 비즈니스 모델·왜 좋았나 ─────────────────────────
-CARD_PROMPT = """너는 일본 중소형주를 보는 한국 애널리스트다. 아래 회사의 결산단신 본문(일본어)과 수치를 읽고 한국어로 JSON을 써라.
+CARD_PROMPT = """너는 일본 중소형주를 보는 한국 애널리스트다. 첨부 PDF(결산 설명 자료=IR 발표 자료, 있으면)와 아래 결산단신 본문(일본어)·수치를 읽고 한국어로 JSON을 써라.
 규칙
-- 본문에 적힌 내용만 쓴다. 추측 금지. 원인이 본문에 없으면 그 항목은 "원문 설명 없음".
+- 자료에 적힌 내용만 쓴다. 추측 금지. 원인이 자료 어디에도 없으면 그 항목은 "원문 설명 없음".
+- 원인은 IR 발표 자료를 먼저 본다: 영업이익 증감 요인(가격·물량·원가·환율 브리지), 사업부·제품·용도·지역별 매출, 수주·KPI 슬라이드의 숫자를 우선 인용.
+  발표 자료에 없을 때 결산단신 본문으로 보완. 숫자가 있으면 꼭 숫자로(예: "AI 서버용 매출 +80%, 판가 인상 효과 +8억 엔").
 - 일본어를 그대로 쓰지 말고 전부 한국어로. 회사명·제품명은 한글 발음이나 통용 영문명으로.
 - 짧게: bm 45자, summary 60자, P/Q/C/etc 각 70자 이내. 숫자는 본문 그대로(억 엔 환산은 1억 엔=100백만 엔).
 - P=가격·환율·제품 믹스, Q=물량·수주·고객 수·점포 수, C=원가·판관비·감가상각, etc=일회성·영업외·특별손익 등 그 밖의 요인.
@@ -421,10 +423,33 @@ CARD_PROMPT = """너는 일본 중소형주를 보는 한국 애널리스트다.
 {qual}
 """
 
-def ai_card(info):
+def find_mat_pdf(a, row):
+    """카드 '왜 좋았나'용 IR 발표 자료: TDnet 설명 자료 → 회사 IR 홈페이지. → (bytes, url, 출처) 또는 (None, None, None)"""
+    url = (a.get("mat") or {}).get("pdf")
+    if url:
+        try: return http(url, timeout=60), url, "TDnet"
+        except Exception as e: log("material download error", e)
+    try:
+        import earn_ir
+        for t, u, d in earn_ir.ir_site_docs(a["code"], row["d"], limit=4, pat=earn_ir.MAT_LINK):
+            if earn_ir.QA_LINK.search(t): continue
+            kind, body = earn_ir.fetch_doc(u)
+            if kind == "pdf" and len(body) < 18_000_000: return body, u, "회사 IR 홈페이지"
+    except Exception as e:
+        log("ir site material error", a["code"], e)
+    return None, None, None
+
+def ai_card(info, pdf=None):
     p = CARD_PROMPT.format(name=info["name"], code=info["code"], sector=info["sector"], profile=info["profile"][:400],
                            nums=info["nums"], qual=info["qual"][:6000])
-    out = gemini_json(p, timeout=120)
+    out = None
+    if pdf:
+        try:
+            import earn_report
+            out = earn_report.gemini_pdf(p, [pdf], max_tokens=4000)
+        except Exception as e:
+            log("card pdf ai error", e)
+    if not out: out = gemini_json(p, timeout=120)
     if isinstance(out, list): out = out[0] if out and isinstance(out[0], dict) else None
     return out if isinstance(out, dict) else None
 
@@ -526,7 +551,8 @@ def card_text(a, ai, row):
         L.append(g_line + (f" · 진척률 {prog[0]:.0f}%" + (f"(작년 {prog[1]:.0f}%)" if prog[1] is not None else "") if prog else ""))
     L.append("")
     if ai:
-        L.append("▶️ <b>왜 좋았나</b>" if not a.get("ondemand") or a.get("pass") else "▶️ <b>실적 요인</b>")
+        L.append(("▶️ <b>왜 좋았나</b>" if not a.get("ondemand") or a.get("pass") else "▶️ <b>실적 요인</b>")
+                 + (" <i>(IR 발표 자료 기준)</i>" if ai.get("_src") else ""))
         if ai.get("summary"): L.append(esc(ai["summary"]))
         for k in ("P", "Q", "C", "etc"):
             v = (ai.get(k) or "").strip()
@@ -965,7 +991,9 @@ def make_card(st, cid, a, row):
         m = metrics(a["series"], len(a["series"]) - 1)
         nums = (f"이번 분기 매출 {oku(m['q'].get('rev'))}엔({yoy_txt(m['rev_yoy'], m['rev_st'])}), 영업이익 {oku(m['q'].get('op'))}엔"
                 f"({yoy_txt(m['op_yoy'], m['op_st'])}), 순이익 {oku(m['q'].get('ni'))}엔({yoy_txt(m['ni_yoy'], m['ni_st'])})")
-        ai = ai_card({"name": a["name"], "code": a["code"], "sector": a["sector"], "profile": a.get("profile", ""), "nums": nums, "qual": a.get("qual", "")})
+        mat_pdf, mat_url, mat_src = find_mat_pdf(a, row)
+        ai = ai_card({"name": a["name"], "code": a["code"], "sector": a["sector"], "profile": a.get("profile", ""), "nums": nums, "qual": a.get("qual", "")}, mat_pdf)
+        if ai is not None and mat_pdf: ai["_src"] = mat_src
         cap = card_text(a, ai, row)
         buf = io.BytesIO()
         chart_name = name_of(a["code"], a["name"], ai) + f"({a['code']})"
@@ -975,7 +1003,7 @@ def make_card(st, cid, a, row):
         st.setdefault("cards", {})[cid] = {
             "code": a["code"], "name": a["name"], "name_ko": name_of(a["code"], a["name"], ai), "d": row["d"], "t": row.get("t") or "15:30", "msg": msg,
             "caption": cap, "ts": time.time(), "sector": a["sector"], "cap": a.get("cap"), "pdf": row.get("pdf"), "xbrl": row.get("xbrl"),
-            "mat": (a.get("mat") or {}).get("pdf"), "fem": fem, "series": a["series"][-8:], "hit": a["hit"],
+            "mat": mat_url, "mat_src": mat_src, "fem": fem, "series": a["series"][-8:], "hit": a["hit"],
             "r": {k: a["r"].get(k) for k in ("q", "start", "end", "fc", "fc_end", "rev", "op", "ni", "scope")},
             "ai": ai, "profile": a.get("profile", "")[:600], "qual": a.get("qual", "")[:8000]}
         return msg
