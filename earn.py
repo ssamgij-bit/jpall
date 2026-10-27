@@ -479,13 +479,16 @@ def card_text(a, ai, row):
     py = m["py"] or {}
     name = name_of(a["code"], a["name"], ai)
     t = row["t"]; d = row["d"]
-    L = [f"📌 <b>{esc(name)} ({a['code']})</b> · {int(d[4:6])}/{int(d[6:])} {t}"]
+    L = [f"{'🔎' if a.get('ondemand') else '📌'} <b>{esc(name)} ({a['code']})</b> · {int(d[4:6])}/{int(d[6:])}" + (f" {t}" if t else "")]
     fc = r.get("fc") or {}
     per = ""
     if a.get("cap") and fc.get("ni") and fc["ni"] > 0:
         per = f" · PER <b>{a['cap'] * 1e8 / fc['ni']:.1f}배</b> ({fy_label_end(r.get('fc_end'))} 순이익 예상 기준)"
     L.append(f"시총 <b>{a['cap']:,.0f}억 엔</b>{per}" if a.get("cap") else "시총 —")
-    L.append("✅ " + " · ".join(a["hit"]) + (" · <b>2개 분기 연속 충족</b>" if a.get("prev_ok") else ""))
+    if a.get("ondemand"):
+        L.append("요청 분석 · 스크리닝 " + (("통과: " + " · ".join(a["hit"])) if a.get("pass") else ("미통과" + (f"({a['why']})" if a.get("why") else ""))))
+    else:
+        L.append("✅ " + " · ".join(a["hit"]) + (" · <b>2개 분기 연속 충족</b>" if a.get("prev_ok") else ""))
     L.append("")
     L.append(f"▶️ <b>섹터</b> {esc(SECTOR_KO.get(a['sector'], a['sector']))}")
     if ai and ai.get("bm"): L.append(f"▶️ <b>비즈니스 모델</b> {esc(ai['bm'])}")
@@ -503,6 +506,9 @@ def card_text(a, ai, row):
             tags.append("가이던스 상향" if o1 > o0 else "가이던스 하향" if o1 < o0 else "가이던스 유지")
             g_line = f"{fy_label_end(r.get('fc_end'))} 영업이익 예상 {oku(o0)} → <b>{oku(o1)}</b>({(o1 / o0 - 1) * 100:+.0f}%)"
     lab, months = qlabel(q, fem)
+    base_tag = (("증수" if (m["rev_yoy"] or 0) >= 0 else "감수") + "·" +
+                ({"turn": "흑자전환", "loss": "적자"}.get(m["op_st"]) or ("증익" if (m["op_yoy"] or 0) >= 0 else "감익")))
+    tags = [base_tag] + tags if (a.get("ondemand") or not tags) else tags
     L.append("▶️ <b>실적 유형</b> " + " · ".join(dict.fromkeys(tags)))
     L.append(f"{lab}({months}) 매출/영익/순익")
     L.append(f" {oku(q.get('rev'))}/{oku(q.get('op'))}/{oku(q.get('ni'))} "
@@ -519,7 +525,7 @@ def card_text(a, ai, row):
         L.append(g_line + (f" · 진척률 {prog[0]:.0f}%" + (f"(작년 {prog[1]:.0f}%)" if prog[1] is not None else "") if prog else ""))
     L.append("")
     if ai:
-        L.append("▶️ <b>왜 좋았나</b>")
+        L.append("▶️ <b>왜 좋았나</b>" if not a.get("ondemand") or a.get("pass") else "▶️ <b>실적 요인</b>")
         if ai.get("summary"): L.append(esc(ai["summary"]))
         for k in ("P", "Q", "C", "etc"):
             v = (ai.get(k) or "").strip()
@@ -620,7 +626,8 @@ def shrink(c):
 def reaction(card):
     """{'day', 'open', 'close', 'mkt', 'vol'} 또는 None(아직 이름)"""
     d = f"{card['d'][:4]}-{card['d'][4:6]}-{card['d'][6:]}"
-    bars = naver_daily(f"{card['code']}.T", days=60)
+    bars = naver_daily(f"{card['code']}.T", days=200)
+    if not bars or bars[0]["d"] > d: return None
     intraday = card["t"] < "15:30"
     pick = [b for b in bars if (b["d"] >= d if intraday else b["d"] > d)]
     if not pick: return None
@@ -662,10 +669,13 @@ def update_reactions(st):
 # ───────────────────────── 버튼 처리 ─────────────────────────
 def poll_buttons(st, wait=0):
     if DRY or not TOKEN: time.sleep(wait); return
-    res = tg("getUpdates", {"offset": st.get("off", 0), "timeout": wait, "allowed_updates": ["callback_query", "my_chat_member", "channel_post"]},
+    res = tg("getUpdates", {"offset": st.get("off", 0), "timeout": wait, "allowed_updates": ["callback_query", "my_chat_member", "channel_post", "message"]},
              timeout=wait + 20).get("result") or []
     for u in res:
         st["off"] = u["update_id"] + 1
+        m = u.get("channel_post") or u.get("message")
+        if m and m.get("text") and not (m.get("from") or {}).get("is_bot"):
+            handle_text(st, m.get("chat") or {}, m["text"]); continue
         cq = u.get("callback_query")
         if not cq: continue
         data = cq.get("data") or ""
@@ -731,6 +741,7 @@ def qa_followup(st, day, rows):
             traceback.print_exc()
 
 def do_reports(st):
+    do_asks(st)
     do_ir(st)
     q = st.get("rep_q") or []
     while q:
@@ -748,6 +759,157 @@ def do_reports(st):
         except Exception:
             traceback.print_exc()
             tg("sendMessage", {"chat_id": CHANNEL, "text": f"리포트 생성 실패({card['code']}). 잠시 뒤 다시 눌러 주세요.", "reply_to_message_id": card["msg"]})
+
+# ───────────────────────── 요청 분석: 종목명·코드를 보내면 최근 분기 실적 카드 ─────────────────────────
+_IDX = None
+def name_index():
+    """[(코드, 일본어명, 영문명, 한글 읽기)] — JPX 상장 종목 목록(하루 1회)"""
+    global _IDX
+    if _IDX is None:
+        import jpall
+        names = jpall.load_names({})
+        en_name("0000")
+        _IDX = [(c, v.get("jp", ""), (_EN or {}).get(c, ""), v.get("ko", "")) for c, v in names.items() if v.get("mkt") in ("프라임", "스탠다드", "그로스")]
+    return _IDX
+
+def _norm(x):
+    x = nfkc(x or "").lower()
+    x = re.sub(r"(株式会社|\(株\)|ホールディングス|holdings?|hd|co\.?,?\s*ltd\.?|inc\.?|corporation|corp\.?|group|グループ|홀딩스|그룹)", "", x)
+    return re.sub(r"[\s・.,'&\-()（）]", "", x)
+
+def resolve(q):
+    """→ (코드 또는 None, 후보 목록)"""
+    q = nfkc(q).strip()
+    nested = q.startswith("_")
+    if nested: q = q[1:]
+    m = re.fullmatch(r"(?:/?\w*\s+)?([0-9][0-9A-Za-z]{3})", q)
+    idx = name_index()
+    codes = {c for c, *_ in idx}
+    if m and m.group(1).upper() in codes: return m.group(1).upper(), []
+    nq = _norm(re.sub(r"^/?(분석|실적|a)\s+", "", q))
+    if len(nq) < 2: return None, []
+    exact = [c for c, jp, en, ko in idx if nq in (_norm(jp), _norm(en), _norm(ko))]
+    if len(exact) == 1: return exact[0], []
+    part = [c for c, jp, en, ko in idx if any(nq in _norm(x) for x in (jp, en, ko) if x)]
+    cands = exact or part
+    if not cands and re.search(r"[가-힣]", q) and not nested:
+        # 한글 이름(예: 토요타) → 일본어·영어로 옮겨 다시 찾기
+        alts = []
+        for tl in ("ja", "en"):
+            try:
+                url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=ko&tl={tl}&dt=t&q=" + urllib.parse.quote(q)
+                alts.append("".join(x[0] for x in json.loads(http(url, timeout=15))[0]))
+            except Exception as e:
+                log("name translate error", e)
+        g = gemini_json('한국어로 쓴 일본 상장사 이름을 일본어 정식 회사명·영문명·4자리 종목코드로 바꿔라. 모르면 빈 문자열. '
+                        'JSON {"jp": "", "en": "", "code": ""}. 이름: ' + q, timeout=40) or {}
+        if isinstance(g, list): g = g[0] if g and isinstance(g[0], dict) else {}
+        if g.get("code") and str(g["code"]).upper() in codes: return str(g["code"]).upper(), []
+        alts += [g.get("jp") or "", g.get("en") or ""]
+        for alt in [x for x in alts if x]:
+            c, cs = resolve("_" + alt)
+            if c: return c, []
+            if cs: return None, cs
+    return None, cands[:8]
+
+def label_of(code):
+    for c, jp, en, ko in name_index():
+        if c == code: return f"{en or ko or jp}({c})"
+    return code
+
+def analyze_code(code):
+    """스크리닝과 상관없이 최근 분기 실적 분석 재료(analyze와 같은 모양) + 게시용 row"""
+    kb = kb_finance(code)
+    if not kb["q"]: raise RuntimeError("가부탄 분기 실적이 없습니다")
+    last = kb["q"][-1]
+    ann = (last.get("ann") or "").replace("-", "")
+    row, rows, r, qual = None, [], None, ""
+    if ann and (now().date() - dt.date(int(ann[:4]), int(ann[4:6]), int(ann[6:]))).days <= 30:
+        try:
+            rows = scan_tdnet(ann)
+            row = next((x for x in rows if x["code"] == code and is_tanshin(x)), None)
+            if row: r, qual = read_tanshin(row)
+        except Exception as e:
+            log("tdnet lookup error", code, e)
+    if not r:  # TDnet 보관 기간(약 1개월)이 지났으면 가부탄 표로 누적·가이던스 구성
+        fy = [y for y in kb["y"] if not y["fc"]]
+        fem = int((fy[-1] if fy else kb["y"][-1])["end"][5:7]) if kb["y"] else int(last["end"][5:7])
+        end = last["end"]; k = (int(end[5:7]) - fem - 1) % 12 // 3 + 1
+        start = ym_add(end, -3 * k + 1)
+        cur = [q for q in kb["q"] if start <= q["start"] and q["end"] <= end]
+        fcy = next((y for y in kb["y"] if y["fc"]), None)
+        r = {"q": k, "start": start + "-01", "end": end + "-28", "scope": "",
+             "fc_end": (fcy["end"] + "-28") if fcy else None,
+             "fc": {m: (fcy[m] * 1e6 if fcy and fcy.get(m) is not None else None) for m in ("rev", "op", "ni")} if fcy else None,
+             "eps": None}
+        for m in ("rev", "op", "ni"):
+            r[m] = sum(q[m] for q in cur) * 1e6 if cur and all(q.get(m) is not None for q in cur) else None
+        if r["fc"] and fcy and fcy.get("eps"): r["fc"]["eps"] = fcy["eps"]
+        row = {"code": code, "d": ann or now().strftime("%Y%m%d"), "t": "", "pdf": None, "xbrl": None}
+    series = build_series(kb["q"], r)
+    i = len(series) - 1
+    ok, hit, why = judge(series, i)
+    sector = kb["sector"]
+    if sector in EXCL_SECTORS: ok, why = False, f"X4 제외 업종({SECTOR_KO.get(sector, sector)})"
+    if not ok and not why: why = "R1~R4 미충족"
+    cap, profile = kb_profile(code)
+    if cap is None and r.get("shares"):
+        try: cap = r["shares"] * naver_daily(f"{code}.T", days=10)[-1]["c"] / 1e8
+        except Exception: pass
+    if ok and cap is not None and cap < RULES["X5_min_cap_oku"]: ok, why = False, f"X5 시총 {cap:,.0f}억 엔"
+    jp = next((x[1] for x in name_index() if x[0] == code), code)
+    a = {"code": code, "name": jp, "sector": sector, "pass": ok, "hit": hit, "why": why if not ok else "", "series": series, "r": r,
+         "cap": cap, "profile": profile, "qual": qual, "ondemand": True, "prev_ok": judge(series, i - 1)[0] if i >= 2 else False}
+    if rows:
+        rv = find_revision(rows, code)
+        if rv:
+            rv = {"rev": (rv["rows"]["rev"][0] / 1e6 if rv["rows"]["rev"][0] else None, rv["rows"]["rev"][1] / 1e6 if rv["rows"]["rev"][1] else None),
+                  "op": (rv["rows"]["op"][0] / 1e6 if rv["rows"]["op"][0] is not None else None, rv["rows"]["op"][1] / 1e6 if rv["rows"]["op"][1] is not None else None)}
+        else:
+            rv = find_revision_pdf(rows, code)
+        a.update(rev=rv, mat=find_material(rows, code))
+    if "name" not in row: row["name"] = jp
+    return a, row
+
+def handle_text(st, chat, text):
+    """채널 글·봇 개인 메시지로 온 종목명/코드 → 요청 분석 대기열"""
+    text = (text or "").strip()
+    if not text or len(text) > 30 or "\n" in text: return
+    if chat.get("type") == "channel" and str(chat.get("id")) != str(CHANNEL): return
+    if chat.get("type") == "private":
+        if st.get("owner") is None: st["owner"] = chat["id"]
+        if chat["id"] != st["owner"]: return
+    if text.startswith("/start") or text.startswith("/help"):
+        tg("sendMessage", {"chat_id": chat["id"], "text": "종목 코드(예: 6999)나 종목명(예: KOA, 화낙, ファナック)을 보내면 최근 분기 실적 카드를 채널에 올립니다."}); return
+    try:
+        code, cands = resolve(text)
+    except Exception as e:
+        log("resolve error", e); return
+    if code:
+        st.setdefault("ask_q", []).append({"code": code, "chat": chat["id"], "ts": time.time()})
+        tg("sendMessage", {"chat_id": chat["id"], "text": f"{label_of(code)} 최근 분기 실적을 분석하고 있습니다(1~2분)."})
+    elif cands:
+        tg("sendMessage", {"chat_id": chat["id"], "text": "여러 종목이 맞습니다. 코드로 보내 주세요:\n" + "\n".join(label_of(c) for c in cands)})
+    elif re.search(r"[0-9A-Za-z가-힣ぁ-んァ-ン一-龥]", text) and (chat.get("type") == "private" or re.fullmatch(r"[0-9][0-9A-Za-z]{3}", text)):
+        tg("sendMessage", {"chat_id": chat["id"], "text": f"'{text}'에 맞는 상장 종목을 찾지 못했습니다. 종목 코드로 보내 주세요."})
+
+def do_asks(st):
+    q = st.get("ask_q") or []
+    while q:
+        job = q.pop(0)
+        code = job["code"]
+        try:
+            a, row = analyze_code(code)
+            cid = f"q{code}{int(time.time()) % 100000000}"
+            msg = make_card(st, cid, a, row)
+            if msg is None:
+                tg("sendMessage", {"chat_id": job["chat"], "text": f"{label_of(code)} 카드 게시에 실패했습니다."})
+            elif str(job["chat"]) != str(CHANNEL):
+                tg("sendMessage", {"chat_id": job["chat"], "text": f"{label_of(code)} 카드를 채널에 올렸습니다."})
+            log("요청 분석", code, "통과" if a["pass"] else a["why"])
+        except Exception as e:
+            traceback.print_exc()
+            tg("sendMessage", {"chat_id": job["chat"], "text": f"{label_of(code)} 분석 실패: {str(e)[:120]}"})
 
 # ───────────────────────── 메인 처리 ─────────────────────────
 def is_tanshin(r):
@@ -782,6 +944,13 @@ def process_day(st, day, test=False):
             log("탈락", row["code"], row["name"], a["why"] or "기준 미달"); continue
         passed += 1
         log("통과", row["code"], row["name"], a["hit"])
+        if make_card(st, cid, a, row) is None and not DRY: continue
+        time.sleep(3.5)
+    return passed
+
+def make_card(st, cid, a, row):
+    """분석 결과 → Gemini 요약 → 카드(차트+글) 게시 → 상태에 저장. 게시 실패면 None"""
+    if True:
         fem = fy_end_month_of(a["r"])
         m = metrics(a["series"], len(a["series"]) - 1)
         nums = (f"이번 분기 매출 {oku(m['q'].get('rev'))}엔({yoy_txt(m['rev_yoy'], m['rev_st'])}), 영업이익 {oku(m['q'].get('op'))}엔"
@@ -792,15 +961,14 @@ def process_day(st, day, test=False):
         chart_name = name_of(a["code"], a["name"], ai) + f"({a['code']})"
         card_chart(chart_name, a["series"], fem, buf)
         msg = post_card(st, cid, cap, buf.getvalue())
-        if msg is None and not DRY: continue
+        if msg is None and not DRY: return None
         st.setdefault("cards", {})[cid] = {
-            "code": a["code"], "name": a["name"], "name_ko": name_of(a["code"], a["name"], ai), "d": row["d"], "t": row["t"], "msg": msg,
-            "caption": cap, "ts": time.time(), "sector": a["sector"], "cap": a.get("cap"), "pdf": row["pdf"],
+            "code": a["code"], "name": a["name"], "name_ko": name_of(a["code"], a["name"], ai), "d": row["d"], "t": row.get("t") or "15:30", "msg": msg,
+            "caption": cap, "ts": time.time(), "sector": a["sector"], "cap": a.get("cap"), "pdf": row.get("pdf"), "xbrl": row.get("xbrl"),
             "mat": (a.get("mat") or {}).get("pdf"), "fem": fem, "series": a["series"][-8:], "hit": a["hit"],
             "r": {k: a["r"].get(k) for k in ("q", "start", "end", "fc", "fc_end", "rev", "op", "ni", "scope")},
             "ai": ai, "profile": a.get("profile", "")[:600], "qual": a.get("qual", "")[:8000]}
-        time.sleep(3.5)
-    return passed
+        return msg
 
 def cleanup(st):
     cut = (now() - dt.timedelta(days=5)).strftime("%Y%m%d")
