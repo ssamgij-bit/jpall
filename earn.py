@@ -329,18 +329,23 @@ def _plt():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib import font_manager as fm
-    try:
-        import koreanize_matplotlib  # noqa: F401  나눔고딕 등록
-    except Exception:
-        pass
+    try:  # koreanize-matplotlib 패키지에 든 나눔고딕 파일만 직접 등록(패키지 import는 파이썬 3.12에서 실패함)
+        import importlib.util, glob
+        sp = importlib.util.find_spec("koreanize_matplotlib")
+        for d in (sp.submodule_search_locations or []) if sp else []:
+            for f in glob.glob(os.path.join(d, "fonts", "*.ttf")): fm.fontManager.addfont(f)
+    except Exception as e:
+        log("font error", e)
     for f in fm.findSystemFonts():
         if "NotoSansCJK" in f or "NanumGothic" in f:
             try: fm.fontManager.addfont(f)
             except Exception: pass
     names = {f.name for f in fm.fontManager.ttflist}
-    for nm in ("Noto Sans CJK KR", "Noto Sans CJK JP", "NanumGothic"):
+    for nm in ("NanumGothic", "Noto Sans CJK KR", "Noto Sans CJK JP"):
         if nm in names:
             plt.rcParams["font.family"] = nm; break
+    else:
+        log("한글 글꼴을 찾지 못했습니다")
     plt.rcParams["axes.unicode_minus"] = False
     return plt
 
