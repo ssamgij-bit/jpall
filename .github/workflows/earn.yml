@@ -20,6 +20,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write   # 끝날 때 다음 실행을 직접 이어 붙이기 위해
 
 jobs:
   run:
@@ -64,3 +65,13 @@ jobs:
           git add -A
           git commit -qm "state $(date -u +%FT%TZ)" || exit 0
           git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" earn-state
+
+      - name: 다음 실행 이어 붙이기(예약 실행이 늦거나 안 돌 때 대비)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 이미 대기 중이거나 실행 중인 다른 실적 스크리닝 실행이 있으면 건너뜀(중복 방지)
+          n=$(gh run list -R "${{ github.repository }}" --workflow earn.yml --limit 20 --json status,databaseId \
+               -q '[.[] | select((.status=="queued" or .status=="in_progress" or .status=="pending" or .status=="waiting") and .databaseId != ${{ github.run_id }})] | length')
+          if [ "${n:-0}" = "0" ]; then gh workflow run earn.yml -R "${{ github.repository }}" --ref main && echo "다음 실행 요청"; else echo "다른 실행 $n개 있음 → 건너뜀"; fi
