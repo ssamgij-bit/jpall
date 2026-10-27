@@ -22,6 +22,7 @@ DRY = os.environ.get("DRY_RUN") == "1"
 TOKEN = os.environ.get("EARN_TOKEN", "")
 CHANNEL = os.environ.get("EARN_CHANNEL", "")
 TEST_DAY = os.environ.get("TEST_DAY", "")
+TEST_REPORT = os.environ.get("TEST_REPORT", "")  # 종목 코드: 요청 분석 카드 + 리포트를 바로 만들어 봄(테스트용)
 OUT_DIR = os.environ.get("OUT_DIR", "earn_out")  # DRY_RUN일 때 카드 이미지·리포트 저장 위치
 MUA = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148"}
 
@@ -902,6 +903,9 @@ def do_asks(st):
             a, row = analyze_code(code)
             cid = f"q{code}{int(time.time()) % 100000000}"
             msg = make_card(st, cid, a, row)
+            if msg is not None and job.get("report"):
+                st.setdefault("rep_q", []).append(cid)
+                if job.get("ir"): st.setdefault("ir_q", []).append(cid)
             if msg is None:
                 tg("sendMessage", {"chat_id": job["chat"], "text": f"{label_of(code)} 카드 게시에 실패했습니다."})
             elif str(job["chat"]) != str(CHANNEL):
@@ -984,6 +988,9 @@ def main():
         log("EARN_TOKEN이 없습니다. 저장소 Settings → Secrets에 봇 토큰을 등록해 주세요."); return
     if not DRY and not find_channel(st):
         log("채널을 아직 못 찾았습니다. 채널에 봇을 관리자로 추가하고 글을 하나 올려 주세요."); save(st); return
+    if TEST_REPORT:
+        for c in re.split(r"[,\s]+", TEST_REPORT.strip()):
+            if c: st.setdefault("ask_q", []).append({"code": c.upper(), "chat": CHANNEL, "ts": time.time(), "report": True, "ir": True})
     if TEST_DAY:
         n = process_day(st, TEST_DAY, test=True)
         log("test done, 통과", n); save(st)

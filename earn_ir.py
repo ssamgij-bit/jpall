@@ -1,7 +1,10 @@
 """[🗣 IR·Q&A] 버튼 → 결산 설명 자료·질의응답(Q&A) 중심 요약(텔레그램 글)
 
-자료: TDnet에 올라온 결산단신 PDF, 결산 설명 자료 PDF, 질의응답 요지 PDF(발표 후 며칠 뒤 올라오는 경우가 많음).
-질의응답 자료가 아직 없으면 그렇게 표시하고, 14일 안에 TDnet에 올라오면 Q&A 부분만 따로 다시 보냄.
+자료(찾는 순서)
+ 1. TDnet: 결산단신 PDF, 결산 설명 자료 PDF, 질의응답 요지 PDF
+ 2. 회사 IR 홈페이지: IR 첫 화면·IR 자료실·IR 뉴스에서 '질의응답·Q&A·書き起こし(기록)·Transcript·説明会 要旨' 링크(PDF 또는 웹페이지)
+ 3. 로그미 파이낸스(finance.logmi.jp): 결산 설명회 기록 기사(질의응답 포함인 경우가 많음)
+질의응답 자료가 아직 없으면 그렇게 표시하고, 14일 동안 위 세 곳을 다시 확인해 올라오면 Q&A를 추가로 보냄.
 """
 import os, re, json, time, base64, html, datetime as dt
 
@@ -59,6 +62,120 @@ def find_qa(code, since_day, days=14):
             E.log("qa scan error", e)
     return out
 
+# ───────────────────────── 회사 IR 홈페이지·로그미 ─────────────────────────
+import urllib.parse
+SKIP_HOST = ("kabutan", "minkabu", "japannext", "apple.com", "hrmos", "google", "sbisec", "twitter", "x.com", "facebook", "youtube", "line.me")
+QA_LINK = re.compile(r"質疑応答|質疑|Q&A|Q＆A|QA|主な質問|書き起こし|書起こし|文字起こし|Transcript|説明会[^<]{0,12}(要旨|内容|概要|記録|動画)|スモールミーティング", re.I)
+
+def company_site(code):
+    s = E.mget(f"https://s.kabutan.jp/stocks/{code}/")
+    for u in re.findall(r'href="(https?://[^"]+)"', s):
+        host = urllib.parse.urlparse(u).netloc.lower()
+        if host and not any(k in host for k in SKIP_HOST): return u
+    return None
+
+def _get(url, timeout=25):
+    return http(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 Safari/605.1.15",
+                                                 "Accept-Language": "ja,en;q=0.8"})
+
+def _links(base, page):
+    out = []
+    for m in re.finditer(r'<a\b[^>]*href="([^"#]+)"[^>]*>(.*?)</a>', page, re.S | re.I):
+        u = urllib.parse.urljoin(base, html.unescape(m.group(1)))
+        t = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", m.group(2)))).strip()
+        # 링크 앞뒤 날짜(YYYY年M月D日 / YYYY.MM.DD / YYYY/MM/DD)
+        ctx = page[max(0, m.start() - 200):m.start()] + t + u
+        d = None
+        for y, mo, da in re.findall(r"(20\d\d)[年./-](\d{1,2})[月./-](\d{1,2})", ctx)[-1:]:
+            d = f"{y}{int(mo):02d}{int(da):02d}"
+        out.append((u, t, d))
+    return out
+
+MAT_LINK = re.compile(r"決算説明|説明会資料|説明資料|プレゼンテーション|Presentation|決算補足|補足資料|ファクトブック|Fact ?Book|データブック|Data ?Book|決算資料", re.I)
+
+def ir_site_docs(code, since_day, limit=2, pat=None):
+    """회사 IR 홈페이지에서 이번 결산 이후의 질의응답·설명회 기록(pat 지정 시 그 자료) 링크 → [(이름, url, 날짜)]"""
+    pat = pat or QA_LINK
+    home = company_site(code)
+    if not home: return []
+    seen, pages, hits = set(), [home], []
+    host = urllib.parse.urlparse(home).netloc
+    for depth in range(2):
+        nxt = []
+        for p in pages[:8]:
+            if p in seen: continue
+            seen.add(p)
+            try: body = E.nfkc(_get(p).decode("utf-8", "ignore"))
+            except Exception: continue
+            for u, t, d in _links(p, body):
+                h = urllib.parse.urlparse(u).netloc
+                if pat.search(t) or pat.search(urllib.parse.unquote(u)):
+                    if d and d < since_day: continue
+                    hits.append((t[:60] or "질의응답 자료", u, d))
+                elif depth == 0 and h == host and re.search(r"/ir|investor|kabunushi|stock|library|news", u, re.I) and \
+                        re.search(r"IR|投資家|株主|ライブラリ|資料|ニュース|news|library", t + u, re.I):
+                    nxt.append(u)
+        pages = list(dict.fromkeys(nxt))
+    out, urls = [], set()
+    for t, u, d in sorted(hits, key=lambda x: x[2] or "0", reverse=True):
+        if u in urls: continue
+        urls.add(u); out.append((t, u, d))
+    return out[:limit]
+
+def logmi_docs(code, since_day, limit=1):
+    """로그미 파이낸스의 같은 종목 결산 설명회 기록 기사"""
+    try:
+        s = E.nfkc(re.sub(r"<!--.*?-->", "", _get(f"https://finance.logmi.jp/search?q={code}").decode("utf-8", "ignore"), flags=re.S))
+    except Exception as e:
+        E.log("logmi error", e); return []
+    out = []
+    for m in re.finditer(r'<a[^>]+href="(/articles/\d+)"[^>]*>(.*?)</a>', s, re.S):
+        t = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", m.group(2)))).strip()
+        if f"({code})" not in t: continue
+        d = re.search(r"開催日\s*(20\d\d)/(\d{1,2})/(\d{1,2})", t)
+        d = f"{d.group(1)}{int(d.group(2)):02d}{int(d.group(3)):02d}" if d else None
+        if d and d < since_day: continue
+        out.append(("로그미 파이낸스 설명회 기록" + (" (질의응답 포함)" if "質疑応答" in t else ""), "https://finance.logmi.jp" + m.group(1), d))
+    return out[:limit]
+
+def fetch_doc(url, depth=0):
+    """→ ('pdf', bytes) 또는 ('text', 본문 문자열). 안내 글만 있는 페이지면 그 안의 PDF를 따라감"""
+    b = _get(url, timeout=60)
+    if b[:4] == b"%PDF" or url.lower().endswith(".pdf"): return "pdf", b
+    raw = b.decode("utf-8", "ignore")
+    if depth == 0:
+        pdfs = [(u, t) for u, t, d in _links(url, E.nfkc(raw)) if re.search(r"\.pdf($|\?)", u, re.I)]
+        pick = [p for p in pdfs if QA_LINK.search(p[1]) or QA_LINK.search(urllib.parse.unquote(p[0]))] or pdfs
+        body = re.sub(r"<[^>]+>", " ", re.sub(r"<(script|style|nav|footer|header)\b.*?</\1>", " ", raw, flags=re.S | re.I))
+        if pick and len(re.sub(r"\s+", " ", body)) < 6000:
+            try: return fetch_doc(pick[0][0], depth=1)
+            except Exception as e: E.log("pdf follow error", e)
+    t = raw
+    t = re.sub(r"<(script|style|nav|footer|header)\b.*?</\1>", " ", t, flags=re.S | re.I)
+    t = E.nfkc(re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", t)))).strip()
+    return "text", t[:30000]
+
+def other_qa(card):
+    """TDnet 밖(회사 IR 홈페이지, 로그미)의 질의응답·설명회 기록 → [(이름, 종류, 내용, url)]"""
+    since = card["d"]
+    found = []
+    for fn in (ir_site_docs, logmi_docs):
+        try: found += fn(card["code"], since)
+        except Exception as e: E.log("qa source error", fn.__name__, e)
+    out, sigs = [], set()
+    for name, url, d in found:
+        if url in card.get("qa_urls", []): continue
+        try:
+            kind, body = fetch_doc(url)
+            if kind == "text" and len(body) < 500: continue
+            sig = (kind, len(body))
+            if sig in sigs: continue  # 같은 PDF로 이어지는 링크 중복
+            sigs.add(sig)
+            out.append((name, kind, body, url))
+        except Exception as e:
+            E.log("qa fetch error", url, e)
+    return out
+
 def build(card, qa_rows=None):
     """→ (텔레그램 글 목록, Q&A 포함 여부)"""
     name = card.get("name_ko") or card["name"]
@@ -67,17 +184,34 @@ def build(card, qa_rows=None):
         if url:
             try: docs.append(http(url, timeout=60)); names.append(lab)
             except Exception as e: E.log("ir pdf error", e)
+    if not card.get("mat"):  # TDnet에 설명 자료가 없으면 회사 IR 홈페이지에서
+        try:
+            for t, u, d in ir_site_docs(card["code"], card["d"], limit=4, pat=MAT_LINK):
+                if QA_LINK.search(t): continue
+                kind, body = fetch_doc(u)
+                if kind == "pdf": docs.insert(0, body); names.insert(0, "결산 설명 자료(회사 IR 홈페이지)"); break
+        except Exception as e:
+            E.log("ir site material error", e)
     qa_rows = qa_rows if qa_rows is not None else find_qa(card["code"], card["d"])
     for r in qa_rows[:2]:
-        try: docs.append(http(r["pdf"], timeout=60)); names.append("질의응답")
+        try: docs.append(http(r["pdf"], timeout=60)); names.append("질의응답(TDnet)")
         except Exception as e: E.log("qa pdf error", e)
-    out = gemini_pdfs(IR_PROMPT.format(name=name, code=card["code"]), docs)
+    texts, links = [], []
+    if not qa_rows:  # TDnet에 없으면 회사 IR 홈페이지·로그미에서 찾음
+        for nm, kind, body, url in other_qa(card)[:2]:
+            if kind == "pdf": docs.append(body)
+            else: texts.append(f"[{nm}] {body}")
+            names.append(nm); links.append(url)
+            card.setdefault("qa_urls", []).append(url)
+    prompt = IR_PROMPT.format(name=name, code=card["code"])
+    if texts: prompt += "\n\n아래는 회사 IR 홈페이지·설명회 기록 웹페이지 본문(질의응답이 있으면 qa에 반영):\n" + "\n\n".join(texts)
+    out = gemini_pdfs(prompt, docs)
     if not out: return None, False
-    return render(card, out, bool(qa_rows), names), bool(out.get("qa"))
+    return render(card, out, bool(qa_rows) or bool(links), names, links), bool(out.get("qa"))
 
 def _e(s): return html.escape(str(s or ""), quote=False)
 
-def render(card, o, has_qa, names):
+def render(card, o, has_qa, names, links=None):
     name = card.get("name_ko") or card["name"]
     fem = card.get("fem") or 3
     lab = ""
@@ -104,8 +238,9 @@ def render(card, o, has_qa, names):
             who = "·".join(_e(v) for v in (x.get("asker"), x.get("answerer")) if v)
             L += [f"<b>Q{i}</b>" + (f": {who}" if who else ""), f"- 질문: {_e(x['q'])}", f"- 답변: {_e(x['a'])}", ""]
     else:
-        L += ["📞 <b>Q&amp;A</b> 아직 TDnet에 질의응답 자료가 없습니다. 14일 안에 올라오면 Q&amp;A만 따로 보내드립니다.", ""]
-    L.append(f"<i>자료: {', '.join(names)} (TDnet). 투자 자문이 아닌 정보 정리입니다.</i>")
+        L += ["📞 <b>Q&amp;A</b> 아직 질의응답 자료를 찾지 못했습니다(TDnet·회사 IR 홈페이지·로그미 확인). 14일 동안 다시 확인해 올라오면 따로 보내드립니다.", ""]
+    L.append(f"<i>자료: {', '.join(names)}. 투자 자문이 아닌 정보 정리입니다.</i>")
+    for u in links or []: L.append(f'<a href="{_e(u)}">원문 링크</a>')
     return split("\n".join(L))
 
 def split(text, n=3900):
