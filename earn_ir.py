@@ -35,7 +35,7 @@ def gemini_pdfs(prompt, pdfs):
     parts = [{"inline_data": {"mime_type": "application/pdf", "data": base64.b64encode(b).decode()}} for b in pdfs] + [{"text": prompt}]
     body = json.dumps({"contents": [{"parts": parts}],
                        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 12000, "responseMimeType": "application/json"}}).encode()
-    for model in GEMINI_MODELS:
+    for model in GEMINI_MODELS + GEMINI_MODELS:  # 구글 서버가 붐비면(503) 한 바퀴 더
         try:
             r = json.loads(http(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}",
                                 timeout=240, data=body, headers={"content-type": "application/json"}))
@@ -45,7 +45,7 @@ def gemini_pdfs(prompt, pdfs):
             return out
         except Exception as e:
             E.log("gemini ir error", model, str(e)[:150])
-            if "429" in str(e): time.sleep(5)
+            if "429" in str(e) or "503" in str(e) or "timed out" in str(e): time.sleep(8)
     return None
 
 def find_qa(code, since_day, days=14):

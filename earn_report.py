@@ -36,7 +36,7 @@ def gemini_pdf(prompt, pdfs, max_tokens=12000):
     parts = [{"inline_data": {"mime_type": "application/pdf", "data": base64.b64encode(p).decode()}} for p in pdfs] + [{"text": prompt}]
     body = json.dumps({"contents": [{"parts": parts}],
                        "generationConfig": {"temperature": 0.2, "maxOutputTokens": max_tokens, "responseMimeType": "application/json"}}).encode()
-    for model in GEMINI_MODELS:
+    for model in GEMINI_MODELS + GEMINI_MODELS:  # 구글 서버가 붐비면(503) 한 바퀴 더
         try:
             r = json.loads(http(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}",
                                 timeout=240, data=body, headers={"content-type": "application/json"}))
@@ -46,7 +46,7 @@ def gemini_pdf(prompt, pdfs, max_tokens=12000):
             return out
         except Exception as e:
             E.log("gemini pdf error", model, str(e)[:150])
-            if "429" in str(e) or "503" in str(e): time.sleep(4)
+            if "429" in str(e) or "503" in str(e) or "timed out" in str(e): time.sleep(8)
     return None
 
 def tr_google(texts):
@@ -408,6 +408,7 @@ def build(card):
                               nums=nums, segs=seg_txt or "없음", words=json.dumps(words, ensure_ascii=False), qual=card.get("qual", "")[:5000],
                               extra=("설명회 기록(웹):\n" + "\n\n".join(rec_texts)) if rec_texts else "")
     ai = (gemini_pdf(prompt, pdfs, max_tokens=16000) if pdfs else gemini_json(prompt, timeout=180)) or {}
+    card["_ai_ok"] = bool(ai)
     if isinstance(ai, list): ai = ai[0] if ai and isinstance(ai[0], dict) else {}
     trm = {w: KO_COMMON[w] for w in words if w in KO_COMMON}
     trm.update({k: v for k, v in (ai.get("tr") or {}).items() if v})

@@ -752,9 +752,12 @@ def do_reports(st):
         try:
             import earn_report
             fn, blob = earn_report.build(card)
-            res = tg("sendDocument", {"chat_id": CHANNEL, "caption": f"📄 {card.get('name_ko') or card['name']}({card['code']}) 리포트 — 파일을 열어 보세요",
+            ok_ai = card.pop("_ai_ok", True)
+            cap = f"📄 {card.get('name_ko') or card['name']}({card['code']}) 리포트 — 파일을 열어 보세요"
+            if not ok_ai: cap += "\n⚠️ AI 분석(결론·사업부·IR 핵심 데이터·Q&A)은 구글 서버 혼잡으로 빠졌습니다. 잠시 뒤 📄 리포트를 다시 누르면 새로 만듭니다."
+            res = tg("sendDocument", {"chat_id": CHANNEL, "caption": cap,
                                       "reply_to_message_id": card["msg"]}, files={"document": (fn, blob, "text/html")}, timeout=90)
-            if res.get("ok"):
+            if res.get("ok") and ok_ai:
                 card["report_sent"] = True
                 tg("editMessageReplyMarkup", {"chat_id": CHANNEL, "message_id": card["msg"], "reply_markup": keyboard(cid, card)})
         except Exception:
@@ -887,6 +890,9 @@ def handle_text(st, chat, text):
     except Exception as e:
         log("resolve error", e); return
     if code:
+        recent = st.setdefault("ask_recent", {})
+        if time.time() - recent.get(code, 0) < 180 or any(j["code"] == code for j in st.get("ask_q", [])): return  # 같은 요청 중복
+        recent[code] = time.time()
         st.setdefault("ask_q", []).append({"code": code, "chat": chat["id"], "ts": time.time()})
         tg("sendMessage", {"chat_id": chat["id"], "text": f"{label_of(code)} 최근 분기 실적을 분석하고 있습니다(1~2분)."})
     elif cands:
