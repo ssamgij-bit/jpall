@@ -88,6 +88,9 @@ def _links(base, page):
         d = None
         for y, mo, da in re.findall(r"(20\d\d)[年./-](\d{1,2})[月./-](\d{1,2})", ctx)[-1:]:
             d = f"{y}{int(mo):02d}{int(da):02d}"
+        if not d:
+            m8 = re.findall(r"(?<!\d)(20\d\d)(0[1-9]|1[0-2])([0-2]\d|3[01])(?!\d)", urllib.parse.unquote(u))
+            if m8: d = "".join(m8[-1])
         out.append((u, t, d))
     return out
 
@@ -117,7 +120,8 @@ def ir_site_docs(code, since_day, limit=2, pat=None):
                     nxt.append(u)
         pages = list(dict.fromkeys(nxt))
     out, urls = [], set()
-    for t, u, d in sorted(hits, key=lambda x: x[2] or "0", reverse=True):
+    # 날짜가 있는 것(최신 순) → PDF 직링크 → 나머지(목록 페이지 등)
+    for t, u, d in sorted(hits, key=lambda x: (x[2] or "0", bool(re.search(r"\.pdf($|\?)", x[1], re.I))), reverse=True):
         if u in urls: continue
         urls.add(u); out.append((t, u, d))
     return out[:limit]
@@ -138,17 +142,20 @@ def logmi_docs(code, since_day, limit=1):
         out.append(("로그미 파이낸스 설명회 기록" + (" (질의응답 포함)" if "質疑応答" in t else ""), "https://finance.logmi.jp" + m.group(1), d))
     return out[:limit]
 
-def fetch_doc(url, depth=0):
+def fetch_doc(url, depth=0, pat=None):
     """→ ('pdf', bytes) 또는 ('text', 본문 문자열). 안내 글만 있는 페이지면 그 안의 PDF를 따라감"""
     b = _get(url, timeout=60)
     if b[:4] == b"%PDF" or url.lower().endswith(".pdf"): return "pdf", b
     raw = b.decode("utf-8", "ignore")
     if depth == 0:
         pdfs = [(u, t) for u, t, d in _links(url, E.nfkc(raw)) if re.search(r"\.pdf($|\?)", u, re.I)]
-        pick = [p for p in pdfs if QA_LINK.search(p[1]) or QA_LINK.search(urllib.parse.unquote(p[0]))] or pdfs
+        pat = pat or QA_LINK
+        pick = [p for p in pdfs if pat.search(p[1]) or pat.search(urllib.parse.unquote(p[0]))]
+        if not pick: pdfs = []  # 목록 페이지의 엉뚱한 PDF(중기계획 등)를 따라가지 않음
+        pick = pick or pdfs
         body = re.sub(r"<[^>]+>", " ", re.sub(r"<(script|style|nav|footer|header)\b.*?</\1>", " ", raw, flags=re.S | re.I))
         if pick and len(re.sub(r"\s+", " ", body)) < 6000:
-            try: return fetch_doc(pick[0][0], depth=1)
+            try: return fetch_doc(pick[0][0], depth=1, pat=pat)
             except Exception as e: E.log("pdf follow error", e)
     t = raw
     t = re.sub(r"<(script|style|nav|footer|header)\b.*?</\1>", " ", t, flags=re.S | re.I)
@@ -188,8 +195,8 @@ def build(card, qa_rows=None):
         try:
             for t, u, d in ir_site_docs(card["code"], card["d"], limit=4, pat=MAT_LINK):
                 if QA_LINK.search(t): continue
-                kind, body = fetch_doc(u)
-                if kind == "pdf": docs.insert(0, body); names.insert(0, "결산 설명 자료(회사 IR 홈페이지)"); break
+                kind, body = fetch_doc(u, pat=MAT_LINK)
+                if kind == "pdf" and len(body) < 12_000_000: docs.insert(0, body); names.insert(0, "결산 설명 자료(회사 IR 홈페이지)"); break
         except Exception as e:
             E.log("ir site material error", e)
     qa_rows = qa_rows if qa_rows is not None else find_qa(card["code"], card["d"])

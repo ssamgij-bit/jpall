@@ -433,8 +433,8 @@ def find_mat_pdf(a, row):
         import earn_ir
         for t, u, d in earn_ir.ir_site_docs(a["code"], row["d"], limit=4, pat=earn_ir.MAT_LINK):
             if earn_ir.QA_LINK.search(t): continue
-            kind, body = earn_ir.fetch_doc(u)
-            if kind == "pdf" and len(body) < 18_000_000: return body, u, "회사 IR 홈페이지"
+            kind, body = earn_ir.fetch_doc(u, pat=earn_ir.MAT_LINK)
+            if kind == "pdf" and len(body) < 12_000_000: return body, u, "회사 IR 홈페이지"
     except Exception as e:
         log("ir site material error", a["code"], e)
     return None, None, None
