@@ -397,7 +397,10 @@ def build(card):
                 rec_links.append((nm, url))
     except Exception as e:
         E.log("record error", e)
-    pdfs = [p for p in [mat_pdf or tan_pdf] + ([tan_pdf] if mat_pdf and tan_pdf else []) + rec_pdfs[:1] if p]
+    pdfs, total = [], 0
+    for p_ in [mat_pdf, rec_pdfs[0] if rec_pdfs else None, tan_pdf if not mat_pdf else None, tan_pdf if mat_pdf else None]:
+        if p_ and p_ not in pdfs and total + len(p_) <= 12_000_000:  # Gemini 요청 한도(약 20MB, base64 포함) 안으로
+            pdfs.append(p_); total += len(p_)
     # 4) Gemini 분석(설명 자료 + 결산단신 + 기록)
     q = s[-1]; py = full.get(E.ym_add(q["end"], -12)) or {}
     nums = (f"이번 분기 매출 {E.oku(q.get('rev'))}(전년 {E.oku(py.get('rev'))}), 영업이익 {E.oku(q.get('op'))}(전년 {E.oku(py.get('op'))}), "

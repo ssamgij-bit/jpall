@@ -203,6 +203,10 @@ def build(card, qa_rows=None):
             else: texts.append(f"[{nm}] {body}")
             names.append(nm); links.append(url)
             card.setdefault("qa_urls", []).append(url)
+    keep, total = [], 0  # Gemini 요청 한도(약 20MB, base64 포함) 안으로: 질의응답·설명 자료 우선
+    for d in docs:
+        if total + len(d) <= 12_000_000: keep.append(d); total += len(d)
+    docs = keep
     prompt = IR_PROMPT.format(name=name, code=card["code"])
     if texts: prompt += "\n\n아래는 회사 IR 홈페이지·설명회 기록 웹페이지 본문(질의응답이 있으면 qa에 반영):\n" + "\n\n".join(texts)
     out = gemini_pdfs(prompt, docs)
