@@ -329,6 +329,10 @@ def _plt():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib import font_manager as fm
+    try:
+        import koreanize_matplotlib  # noqa: F401  나눔고딕 등록
+    except Exception:
+        pass
     for f in fm.findSystemFonts():
         if "NotoSansCJK" in f or "NanumGothic" in f:
             try: fm.fontManager.addfont(f)
