@@ -28,17 +28,17 @@ UA = {"User-Agent": "Mozilla/5.0 (JP_ALL disclosure bot)"}
 SKIP = ["日々の開示事項", "基準価額と市場価格"]  # ETF·ETN 일일 공시(수십 건/일, 내용 없음)
 DIGEST_HOUR = int(os.environ.get("DIGEST_HOUR", "19"))  # 하이라이트 요약 발송 시각(JST=KST)
 HL = {}  # 공시 1건 처리 중 본문 함수가 남기는 핵심 수치(하이라이트 판정용)
-MIN_CAP = float(os.environ.get("MIN_CAP_OKU", "200")) * 1e8  # 이보다 작은 시가총액(엔) 종목 공시는 채널에 올리지 않음(관심 종목은 예외)
+MIN_CAP = float(os.environ.get("MIN_CAP_OKU", "300")) * 1e8  # 이보다 작은 시가총액(엔) 종목 공시는 채널에 올리지 않음(관심 종목은 예외)
 
 def muted(r, names, quotes, st):
-    """채널에 올리지 않을 공시: 리츠·ETF·인프라펀드, 시총 200억 엔 미만(관심 종목은 항상 게시)"""
+    """채널에 올리지 않을 공시: 리츠·ETF·인프라펀드, 시총 300억 엔 미만, 일상 공시(관심 종목은 항상 게시)"""
     code = r["code"]
     if code in (st.get("watch") or {}): return None
     mk = (names.get(code) or {}).get("mkt", "")
     if mk in ("리츠", "ETF") or "投資法人" in r["name"] or re.search(r"ETF|ETN|REIT|ファンド", r["name"] + r["title"]):
         return "리츠·ETF"
     mc = (quotes.get(code) or {}).get("marketCap")
-    if mc and mc < MIN_CAP: return "시총 200억 엔 미만"
+    if mc and mc < MIN_CAP: return f"시총 {MIN_CAP / 1e8:,.0f}억 엔 미만"
     t = nfkc(r["title"])
     if MAT_RE.search(t) and "決算短信" not in t:  # 설명·보충 자료 → 같은 날 결산단신 메시지에 링크로
         st.setdefault("matlinks", {})[code] = [r["d"], r["pdf"]]
