@@ -39,7 +39,31 @@ def muted(r, names, quotes, st):
         return "리츠·ETF"
     mc = (quotes.get(code) or {}).get("marketCap")
     if mc and mc < MIN_CAP: return "시총 200억 엔 미만"
-    return None  # 시총을 못 구하면 올림(놓치지 않도록)
+    t = nfkc(r["title"])
+    if MAT_RE.search(t) and "決算短信" not in t:  # 설명·보충 자료 → 같은 날 결산단신 메시지에 링크로
+        st.setdefault("matlinks", {})[code] = [r["d"], r["pdf"]]
+        return "설명 자료(결산단신에 링크)"
+    if re.search(KEEP_ALWAYS, t): return None
+    for pat, keep, why in ROUTINE:
+        if re.search(pat, t) and not (keep and re.search(keep, t)): return why
+    return None
+
+MAT_RE = re.compile(r"決算説明|説明会資料|説明資料|補足資料|補足説明資料|プレゼンテーション資料|ファクトブック|データブック")
+# 아래 일상 공시 규칙에 걸려도 항상 게시하는 제목(중요 이벤트가 함께 들어간 공시)
+KEEP_ALWAYS = r"自己株式(の)?取得|自己株式取得|株式分割|公開買付|業績予想|決算短信|合併|子会社化|株式交換|株式移転|完全子会社|資本業務提携|上場廃止|特別損失|減損"
+# (빼는 제목, 그래도 남길 예외, 사유) — 통상·일상 공시
+ROUTINE = [
+    (r"譲渡制限付株式|株式報酬|ストック・?オプション|新株予約権|払込完了|従業員持株会|株式給付信託|業績連動型株式",
+     r"第三者割当|行使価額修正|大量行使|MSCB|転換社債", "주식보상·신주예약권"),
+    (r"役員|人事|執行役員|組織変更|機構改革|担当(の)?変更|取締役候補|監査役候補",
+     r"代表取締役|社長|CEO|訴訟|損害賠償|不正|辞任.*代表", "임원·인사(대표이사 교체 외)"),
+    (r"剰余金の配当|配当金の支払|期末配当|中間配当",
+     r"増配|減配|無配|復配|初配|記念配当|特別配当|予想の修正|配当方針|累進", "정기 배당(변화 없음)"),
+    (r"定款の一部変更|株主総会.{0,10}(開催|招集|基準日)|基準日(の)?設定|定時株主総会",
+     r"株式併合|臨時株主総会|スクイーズ|非公開|上場廃止|買収防衛", "정관·주총 일정"),
+    (r"資金の借入|借入(れ)?の実行|シンジケートローン|コミットメントライン|所在不明株主|本店(所在地)?(の)?移転|事務所(の)?移転|支店(の)?(開設|移転)",
+     None, "일상 공시(차입·소재불명 주주·사무소 이전)"),
+]
 
 def now(): return dt.datetime.now(JST)
 def nfkc(s): return unicodedata.normalize("NFKC", s or "")
@@ -803,7 +827,13 @@ def build(row, st, names, quotes, trmap):
         log("highlight error", code, e)
     msg = "\n".join(head)
     if body: msg += "\n\n" + body
-    msg += f"\n\n공시링크: {row['pdf']}\n회사정보: https://kabutan.jp/stock/?code={code}"
+    msg += f"\n\n공시링크: {row['pdf']}"
+    if "決算短信" in title:  # 같은 날 올라온 결산 설명·보충 자료 링크(따로 보내지 않음)
+        mat = next((x["pdf"] for x in st.get("queue", []) if x["code"] == code and x["d"] == d and MAT_RE.search(nfkc(x["title"])) and "決算短信" not in x["title"]), None)
+        ml = (st.get("matlinks") or {}).get(code)
+        if not mat and ml and ml[0] == d: mat = ml[1]
+        if mat: msg += f"\n설명 자료: {mat}"
+    msg += f"\n회사정보: https://kabutan.jp/stock/?code={code}"
     return msg
 
 # ───────────────────────── 하이라이트(매일 19시 요약) ─────────────────────────
