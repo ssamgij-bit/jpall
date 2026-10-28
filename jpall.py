@@ -28,6 +28,18 @@ UA = {"User-Agent": "Mozilla/5.0 (JP_ALL disclosure bot)"}
 SKIP = ["日々の開示事項", "基準価額と市場価格"]  # ETF·ETN 일일 공시(수십 건/일, 내용 없음)
 DIGEST_HOUR = int(os.environ.get("DIGEST_HOUR", "19"))  # 하이라이트 요약 발송 시각(JST=KST)
 HL = {}  # 공시 1건 처리 중 본문 함수가 남기는 핵심 수치(하이라이트 판정용)
+MIN_CAP = float(os.environ.get("MIN_CAP_OKU", "200")) * 1e8  # 이보다 작은 시가총액(엔) 종목 공시는 채널에 올리지 않음(관심 종목은 예외)
+
+def muted(r, names, quotes, st):
+    """채널에 올리지 않을 공시: 리츠·ETF·인프라펀드, 시총 200억 엔 미만(관심 종목은 항상 게시)"""
+    code = r["code"]
+    if code in (st.get("watch") or {}): return None
+    mk = (names.get(code) or {}).get("mkt", "")
+    if mk in ("리츠", "ETF") or "投資法人" in r["name"] or re.search(r"ETF|ETN|REIT|ファンド", r["name"] + r["title"]):
+        return "리츠·ETF"
+    mc = (quotes.get(code) or {}).get("marketCap")
+    if mc and mc < MIN_CAP: return "시총 200억 엔 미만"
+    return None  # 시총을 못 구하면 올림(놓치지 않도록)
 
 def now(): return dt.datetime.now(JST)
 def nfkc(s): return unicodedata.normalize("NFKC", s or "")
@@ -1537,6 +1549,13 @@ def main():
         trmap = {k: esc(v) if v else None for k, v in trmap.items()}
         for r in batch:
             if time.time() - t0 > RUN_SECONDS: break
+            why = muted(r, names, quotes, st)
+            if why:
+                st["queue"].remove(r)
+                m = st.setdefault("muted", {}); d = now().strftime("%Y-%m-%d")
+                if m.get("d") != d: m.clear(); m["d"] = d
+                m[why] = m.get(why, 0) + 1
+                continue
             r2 = dict(r); r2["title"] = r["title"]
             try:
                 msg = build(r2, st, names, quotes, {r["title"]: trmap.get(r["title"]) or esc(r["title"])})
