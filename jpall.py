@@ -8,7 +8,7 @@
 - 제목 번역: Google 번역(키 없는 공개 주소) + 용어 보정
 환경 변수: TELEGRAM_TOKEN, CHANNEL_ID(@채널아이디 또는 -100...), RUN_SECONDS(기본 1680), DRY_RUN(1이면 게시 안 하고 출력)
 """
-import os, sys, re, io, json, time, datetime as dt, unicodedata, urllib.request, urllib.parse, traceback
+import os, sys, re, io, json, time, html, datetime as dt, unicodedata, urllib.request, urllib.parse, traceback
 
 import pandas as pd
 
@@ -1284,6 +1284,62 @@ def maybe_weekly(st):
         tg_send(part); time.sleep(SEND_GAP)
     log("weekly perf sent")
 
+IDEAS_HM = (14, 0)   # 토요일 14시(KST): 지난 7일 하이라이트 공시 중 투자 아이디어 정리
+IDEAS_PROMPT = """너는 일본 주식을 커버하는 한국 자산운용사 애널리스트의 리서치 보조다.
+아래는 지난 7일 동안 일본 공시 채널에서 하이라이트로 뽑힌 공시 {n}건이다(번호, 분류, 기업, 시총, 핵심 수치, 이유).
+이 중에서 '일본 투자 아이디어'로 괜찮아 보이는 것을 골라 한국어로 정리하라. 종목·섹터·테마 모두 가능(예: 여러 기업이 같은 이유로 상향하면 섹터 아이디어).
+""" + """선정 기준: 구체적 근거(실적 서프라이즈·가이던스·밸류에이션·촉매·수급·주주환원·업황 변화)가 있고, 투자 판단에 쓸 만한 것. 같은 종목·테마는 하나로 묶고 출처 번호를 모두 표시.
+규칙: 입력에 없는 사실·수치를 지어내지 말 것(촉매·리스크는 입력 근거에서 도출하고, 일반론이면 짧게). 일본 종목은 한국어 이름(4자리 코드), 미국은 이름(티커). 일본어 원문 표기 금지. 단정적 매수 권유 대신 '검토할 만함' 수준.
+출력 JSON: {{"overview": "이번 주 한 줄 총평", "ideas": [{{"title": "아이디어 이름", "target": "종목명(코드) 또는 섹터/테마", "logic": "왜 괜찮아 보이는지 2~3문장, 수치 포함", "catalyst": "촉매·확인할 것 1문장", "risk": "리스크·반론 1문장", "refs": [번호]}}], "others": [{{"target": "종목명(코드)", "line": "한 줄", "refs": [번호]}}]}}
+ideas는 5~10개(입력이 적으면 그보다 적게), others는 3~5개.""" + """
+
+{items}"""
+def fmt_ideas(out, title, links):
+    """주간 아이디어 JSON → 텔레그램 HTML. links: {번호: (url, 라벨)}"""
+    e = lambda s: html.escape(str(s or ""), quote=False)
+    def refs(rs):
+        rs = [int(r) for r in (rs or []) if str(r).isdigit() and int(r) in links]
+        return " ".join(f'<a href="{e(links[r][0])}">[{r}]</a>' for r in rs)
+    lines = [title, "", e(out.get("overview"))]
+    for x in out.get("ideas") or []:
+        lines += ["", f"▸ <b>{e(x.get('title'))}</b> — {e(x.get('target'))}",
+                  f"• 논리: {e(x.get('logic'))}", f"• 촉매·확인: {e(x.get('catalyst'))}",
+                  f"• 리스크·반론: {e(x.get('risk'))}", f"• 출처: {refs(x.get('refs'))}"]
+    if out.get("others"):
+        lines += ["", "<b>그 밖에 눈여겨볼 언급</b>"]
+        for x in out["others"]:
+            lines.append(f"• {e(x.get('target'))} — {e(x.get('line'))} {refs(x.get('refs'))}")
+    lines += ["", "<i>AI(Gemini)가 지난 7일 게시물에서 고른 것 · 투자 판단 전 원문 확인 권장</i>"]
+    return "\n".join(lines)
+
+def maybe_ideas(st):
+    t = now(); today = t.strftime("%Y%m%d")
+    if t.weekday() != 5 or (t.hour, t.minute) < IDEAS_HM or st.get("ideas_date") == today: return
+    xs = [x for x in st.get("hl", []) if time.time() - x["ts"] < 86400 * 7 and x["sec"] != "watch"]
+    if not xs:
+        st["ideas_date"] = today; return
+    seen, uniq = set(), []
+    for x in sorted(xs, key=lambda x: (-(x.get("score") or 0), -x["mc"])):
+        if (x["code"], x["txt"]) in seen: continue
+        seen.add((x["code"], x["txt"])); uniq.append(x)
+    uniq = uniq[:250]
+    lines, links = [], {}
+    for i, x in enumerate(uniq, 1):
+        why = x.get("why") or x.get("mon") or ""
+        lines.append(f"[{i}] [{dict(SECTIONS).get(x['sec'], x['sec'])}] {x['name']} {x['code']} (시총 {x['mct'] or '?'}) : {x['txt']}"
+                     + (f" | 이유: {why}" if why else "") + (f" | 당일 핵심 선정: {x['top']}" if x.get("top") else ""))
+        links[i] = (x["pdf"], x["name"])
+    out = gemini_json(IDEAS_PROMPT.format(n=len(uniq), items="\n".join(lines)), timeout=240)
+    if not out or not out.get("ideas"):
+        log("ideas: AI 실패 → 다음 실행에 재시도"); return
+    t0 = t - dt.timedelta(days=7)
+    msg = fmt_ideas(out, f"💡 <b>주간 일본 투자 아이디어 — 공시편</b> ({t0.month}/{t0.day}~{t.month}/{t.day}, 하이라이트 {len(uniq)}건 중 선별)", links)
+    ok = True
+    for part in split_msg(msg):
+        ok = tg_send(part) and ok; time.sleep(SEND_GAP)
+    if ok:
+        st["ideas_date"] = today; log("weekly ideas sent")
+
 def split_msg(text, limit=3900):
     parts, cur = [], ""
     for blk in text.split("\n"):
@@ -1312,10 +1368,14 @@ def maybe_digest(st, force=False):
         for part in split_msg(digest_text(items, t.date(), reasons, top)):
             ok = tg_send(part) and ok; time.sleep(SEND_GAP)
         if not ok: log("digest send failed"); return
-        for x in items: x["sent"] = True; x["dd"] = today
+        for i, x in enumerate(items):
+            x["sent"] = True; x["dd"] = today
+            if reasons.get(i): x["why"] = reasons[i]
+        for i, why in top:
+            if 0 <= i < len(items): items[i]["top"] = why
         log("digest sent", len(items))
     st["digest_date"] = today
-    st["hl"] = [x for x in hl if time.time() - x["ts"] < 86400 * 6]
+    st["hl"] = [x for x in hl if time.time() - x["ts"] < 86400 * 9]   # 주간 아이디어(토 14시)용으로 9일 보관
 
 # ───────────────────────── 관심 종목: 봇 개인 대화 명령 ─────────────────────────
 HELP = ("관심 종목 명령\n/add 7203 6758 — 추가(여러 개 가능)\n/del 7203 — 삭제\n/list — 목록\n\n"
@@ -1454,7 +1514,7 @@ def main():
         try: maybe_digest(st)
         except Exception: traceback.print_exc()
         for fn in (lambda: watch_sync(st), lambda: tg_commands(st, names), lambda: maybe_followup(st), lambda: hold_work(st, names), lambda: maybe_preview(st, names),
-                   lambda: perf_update(st), lambda: maybe_weekly(st)):
+                   lambda: perf_update(st), lambda: maybe_weekly(st), lambda: maybe_ideas(st)):
             try: fn()
             except Exception as e: log("extra error", e)
         q = st.get("queue", [])
