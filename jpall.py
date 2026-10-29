@@ -1216,18 +1216,81 @@ FACTS_PROMPT = """너는 일본 주식 애널리스트다. 아래는 도쿄증�
 
 원문:
 {src}"""
-def facts_line(st, row):
-    """수치 파서가 없는 공시 → ([핵심 1~3줄], 사유)"""
+def facts_src(row):
     t = re.sub(r"[ \t\u3000]+", "", pdf_text(row["pdf"])); t = re.sub(r"\n+", "\n", t)
     k = t.find("記")
-    src = (t[:600] + "\n" + t[k:k + 3400]) if k > 600 else t[:4000]
-    out = gemini_json(FACTS_PROMPT.format(title=row["title"], src=src), timeout=60, models=MON_MODELS) or {}
-    jp = lambda x: re.search(r"[\u3040-\u30ff]", x)
-    facts = [str(x).strip().lstrip("•·- ") for x in (out.get("facts") or []) if str(x).strip() and not jp(str(x))][:3]
-    why = str(out.get("why") or "").strip()
-    return facts, ("" if jp(why) else why)
+    return (t[:600] + "\n" + t[k:k + 2900]) if k > 600 else t[:3500]
 
-def build(row, st, names, quotes, trmap):
+BATCH_PROMPT = """너는 일본 주식 애널리스트다. 아래는 도쿄증시 적시공시 여러 건의 원문(일본어, 일부)이다. 항목마다 mode에 따라 정리하라.
+
+mode "why" (수치는 이미 메시지에 있음 → 이유만):
+- why: 투자자가 "왜 이렇게 됐나"를 바로 알 수 있게 1~2문장(합계 120자 이내). 무엇이 얼마나 좋아/나빠졌는지(사업·제품·지역·수요 요인),
+  일회성 요인(특별손익·환율·세금)이 있으면 그것도. 배당·자사주 변경이 함께 있으면 그 이유도 짧게. facts는 빈 배열.
+
+mode "facts" (메시지에 수치가 없음 → 핵심 사실 + 이유):
+- facts: 핵심 사실 1~3줄(각 70자 이내). 숫자를 반드시 넣는다: 금액(억 엔 단위로 환산), 비율, 주식 수, 일정(YYYY.MM.DD), 대상 회사.
+  · 배당: 중간·기말·연간 주당배당을 "이전 → 수정(전기 실적)" 형식으로, 증배·감배·특별배당 여부.
+  · 특별손익·비용 계상: 금액, 반영 기간, 실적 전망 반영 여부(원문에 있으면).
+  · 설비투자·자산 취득·매각: 금액, 대상, 일정, 목적 사업.
+  · M&A·경영통합·완전자회사화·주식교환: 상대방, 방식, 통합(교환) 비율, 취득 지분율·가격, 일정.
+  · 대표이사 교체: 누가 누구로, 날짜, 새 대표의 이전 직책.
+  · 주식분할·병합: 비율, 기준일·효력일.
+  · 그 밖: 가장 중요한 숫자와 일정. 숫자가 전혀 없는 공시면 내용 요약 1줄.
+- why: 원문에 적힌 이유·목적 1문장(80자 이내).
+
+공통: 원문에 적힌 내용만 쓴다(추측·일반론 금지). 원문에 이유가 없으면 why는 빈 문자열. 일본어 문자는 쓰지 말고 고유명사는 한글로.
+다른 항목의 내용을 섞지 마라. 모든 항목의 id를 빠짐없이 출력.
+출력 JSON만: {{"items": [{{"id": "a1", "facts": ["..."], "why": "..."}}]}}
+
+항목:
+{items}"""
+AI_MARK = "\x00AI:{}\x00"
+AI_BATCH = 8
+def _nojp(x): return not re.search(r"[\u3040-\u30ff]", x or "")
+def _fallback_why(st, src):
+    """AI 실패: 원문에서 사유가 담긴 첫 문장을 무료 번역"""
+    sents = re.findall(r"[^。]{15,200}。", (src or "").split(" [今後の見通し] ")[0])
+    pick = [z for z in sents if re.search(r"増収|減収|増益|減益|上回|下回|増加|減少|伸長|好調|低調|不振|寄与|影響|ため|により", z) and "経済" not in z]
+    z = (pick or sents or [""])[0]
+    return (translate(st, [z]).get(z) or "") if z else ""
+def ai_batch(st, tasks):
+    """사유·핵심 수치 AI를 최대 AI_BATCH건씩 묶어 호출. 결과는 공시 id별로 저장해 재처리·19시 요약에서 재사용 → {id: {"facts", "why"}}"""
+    cache = st.setdefault("aic", {})
+    out = {t["id"]: cache[t["id"]] for t in tasks if t["id"] in cache}
+    todo = [t for t in tasks if t["id"] not in cache]
+    for i0 in range(0, len(todo), AI_BATCH):
+        part = todo[i0:i0 + AI_BATCH]
+        lines = [json.dumps({"id": f"a{k + 1}", "mode": t["mode"], "kind": t["kind"], "title": t["title"], "src": t["src"]}, ensure_ascii=False)
+                 for k, t in enumerate(part)]
+        res = gemini_json(BATCH_PROMPT.format(items="\n".join(lines)), timeout=150, models=MON_MODELS) or {}
+        by = {str(x.get("id")): x for x in (res.get("items") or []) if isinstance(x, dict)}
+        log("ai batch", len(part), "ok" if by else "fail")
+        for k, t in enumerate(part):
+            x = by.get(f"a{k + 1}")
+            if x:
+                facts = [str(f).strip().lstrip("•·- ") for f in (x.get("facts") or []) if str(f).strip() and _nojp(str(f))][:3] if t["mode"] == "facts" else []
+                why = str(x.get("why") or "").strip()
+                r = {"facts": facts, "why": why if _nojp(why) else "", "ts": time.time()}
+            else:  # AI 실패: 사유만 번역으로(저장하지 않아 다음에 다시 시도하지는 않음 — 게시는 한 번뿐)
+                r = {"facts": [], "why": _fallback_why(st, t["src"]) if t["mode"] == "why" else "", "ts": time.time(), "fb": True}
+            out[t["id"]] = r
+            if not r.get("fb"): cache[t["id"]] = r
+    if len(cache) > 800:
+        for k in sorted(cache, key=lambda k: cache[k].get("ts", 0))[:300]: cache.pop(k, None)
+    for x in st.get("hl", []):  # 19시 요약에서 같은 사유를 다시 만들지 않도록
+        r = out.get(x["id"])
+        if r and r.get("why") and not r.get("fb"): x["why0"] = r["why"]
+    return out
+def ai_block(r):
+    if not r: return ""
+    s = ""
+    if r.get("facts"): s += "\n\n<b>[핵심]</b>\n" + "\n".join(esc(x) for x in r["facts"])
+    if r.get("why"): s += ("\n" if r.get("facts") else "\n\n") + f"<b>사유</b> : {esc(r['why'])}"
+    return s
+def ai_fill(msg, res):
+    return re.sub(r"\x00AI:(.*?)\x00", lambda m: ai_block(res.get(m.group(1))), msg)
+
+def build(row, st, names, quotes, trmap, tasks=None):
     code = row["code"]; n = names.get(code)
     name_ko = n["ko"] if n else jp2ko(row["name"])
     mk = n["mkt"] if n else PLACE.get(row.get("place", ""), row.get("place", ""))
@@ -1264,17 +1327,17 @@ def build(row, st, names, quotes, trmap):
     try: biz = biz_line(st, code)
     except Exception as e: log("biz error", code, e)
     kind = HL.get("kind") or (None if body else next(("evt" for pat, _ in EVT_RULES if re.search(pat, title)), None))
-    facts = ""
+    task = None  # AI 작업(사유·핵심 수치): 같은 배치의 공시를 모아 한 번에 호출(ai_batch)
     if body and kind in WHY_KIND and not re.match(r"[(（](訂正|変更)", title):
         try:
             HL["src"] = reason_src(row, kind)
-            why = why_line(st, row, kind, HL["src"])
+            if HL["src"]: task = {"id": row["id"], "mode": "why", "kind": WHY_KIND[kind], "title": title, "src": HL["src"][:2500]}
         except Exception as e:
             log("why error", code, e)
     elif not body and not re.match(r"[(（]訂正", title):  # 수치 파서가 없는 공시: AI가 원문에서 핵심 수치·사유를 뽑음
         try:
             if kind == "evt": HL["src"] = reason_src(row, "evt")
-            facts, why = facts_line(st, row)
+            task = {"id": row["id"], "mode": "facts", "kind": "", "title": title, "src": facts_src(row)}
         except Exception as e:
             log("facts error", code, e)
     try:
@@ -1284,8 +1347,12 @@ def build(row, st, names, quotes, trmap):
     if biz: head.insert(len(head) - 1, f"사업: {esc(biz)}")
     msg = "\n".join(head)
     if body: msg += "\n\n" + body
-    if facts: msg += "\n\n<b>[핵심]</b>\n" + "\n".join(esc(x) for x in facts)
-    if why: msg += ("\n" if facts else "\n\n") + f"<b>사유</b> : {esc(why)}"
+    if task:
+        if tasks is None:  # 단건 호출(테스트 등): 바로 AI
+            res = ai_batch(st, [task])
+            msg += ai_block(res.get(task["id"]))
+        else:
+            tasks.append(task); msg += AI_MARK.format(task["id"])
     msg += f"\n\n공시링크: {row['pdf']}"
     if "決算短信" in title and not is_mat(nfkc(title)):  # 같은 날 올라온 결산 설명·보충 자료·질의응답 링크(따로 보내지 않음)
         mats = [[mat_label(nfkc(x["title"])), x["pdf"]] for x in st.get("queue", []) if x["code"] == code and x["d"] == d and is_mat(nfkc(x["title"]))]
@@ -1507,7 +1574,8 @@ def ai_reasons(items):
         part = allx[i0:i0 + 25]
         lines = []
         for _, (j, x) in enumerate(part):
-            lines.append(f"#{j + 1} [{dict(SECTIONS)[x['sec']]}] {x['name']} {x['code']} (시총 {x['mct'] or '?'}) : {x['txt']}\n원문: {x.get('src') or '(없음)'}")
+            body = f"사유(확정, 그대로 사용): {x['why0']}" if x.get("why0") else f"원문: {x.get('src') or '(없음)'}"
+            lines.append(f"#{j + 1} [{dict(SECTIONS)[x['sec']]}] {x['name']} {x['code']} (시총 {x['mct'] or '?'}) : {x['txt']}\n{body}")
         out = gemini_json(AI_PROMPT.format(items="\n\n".join(lines)))
         if not out: break
         for k, v in (out.get("reasons") or {}).items():
@@ -1517,6 +1585,8 @@ def ai_reasons(items):
             try: top.append((int(str(t["i"]).strip("#")) - 1, str(t["why"]).strip()))
             except Exception: pass
     if len(allx) > 25: top = top[:3]
+    for i, x in allx:  # 메시지 때 만든 사유는 그대로
+        if x.get("why0") and x["sec"] != "mon": reasons[i] = x["why0"]
     return reasons, top
 
 def fallback_reasons(st, items):
@@ -2054,7 +2124,8 @@ def main():
         if miss: quotes.update(yf_quotes(miss))
         trmap = translate(st, [r["title"] for r in batch])
         trmap = {k: esc(v) if v else None for k, v in trmap.items()}
-        for r in batch:
+        prepared, tasks = [], []
+        for r in batch:  # ① 메시지 준비(본문·차트) — AI 작업은 모아 둠
             if time.time() - t0 > RUN_SECONDS: break
             why = muted(r, names, quotes, st)
             if why:
@@ -2065,14 +2136,21 @@ def main():
                 continue
             r2 = dict(r); r2["title"] = r["title"]
             try:
-                msg = build(r2, st, names, quotes, {r["title"]: trmap.get(r["title"]) or esc(r["title"])})
+                msg = build(r2, st, names, quotes, {r["title"]: trmap.get(r["title"]) or esc(r["title"])}, tasks)
             except Exception:
                 traceback.print_exc(); msg = None
+            prepared.append((r, msg, HL.get("chart")))
+        res = {}
+        if tasks:  # ② 사유·핵심 수치 AI를 묶어서 한 번에
+            try: res = ai_batch(st, tasks)
+            except Exception: traceback.print_exc()
+        for r, msg, chart in prepared:  # ③ 발송
+            if msg: msg = ai_fill(msg, res)
             wait = SEND_GAP - (time.time() - last_send)
             if wait > 0: time.sleep(wait)
             ok = tg_send(msg) if msg else True
-            if ok and msg and HL.get("chart"):  # 월차 차트는 본문 바로 뒤에 이미지로
-                tg_photo(HL["chart"])
+            if ok and msg and chart:  # 차트는 본문 바로 뒤에 이미지로
+                tg_photo(chart)
             last_send = time.time()
             if ok or not msg:
                 st["queue"].remove(r)
