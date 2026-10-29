@@ -482,13 +482,33 @@ def body_revision(row):
 
 # ───────────────────────── 차트(텔레그램 이미지) ─────────────────────────
 CH = dict(INK="#0b0b0b", INK2="#52514e", MUT="#8a8983", GRID="#e6e5e0", SURF="#fcfcfb", BAR="#7d8b99", HI="#2a78d6", ALT="#eb6834", LIGHT="#c3cbd3")
+_FONT_OK = False
 def _plt():
+    """matplotlib + 한글 글꼴. koreanize-matplotlib 패키지는 import하면 파이썬 3.12에서 실패(distutils 없음)해서
+    글꼴이 기본(DejaVu)으로 남아 한글이 네모로 깨졌음 → 패키지에 든 나눔고딕 파일만 직접 등록"""
+    global _FONT_OK
     import matplotlib; matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    if _FONT_OK: return plt
+    from matplotlib import font_manager as fm
     try:
-        import koreanize_matplotlib  # noqa: F401  (한글 글꼴)
-    except Exception:
-        pass
+        import importlib.util, glob
+        sp = importlib.util.find_spec("koreanize_matplotlib")
+        for d in (sp.submodule_search_locations or []) if sp else []:
+            for f in glob.glob(os.path.join(d, "fonts", "*.ttf")): fm.fontManager.addfont(f)
+    except Exception as e:
+        log("font error", e)
+    for f in fm.findSystemFonts():
+        if "NotoSansCJK" in f or "NanumGothic" in f:
+            try: fm.fontManager.addfont(f)
+            except Exception: pass
+    names = {f.name for f in fm.fontManager.ttflist}
+    for nm in ("NanumGothic", "Noto Sans CJK KR", "Noto Sans CJK JP"):
+        if nm in names:
+            plt.rcParams["font.family"] = nm; _FONT_OK = True; break
+    else:
+        log("한글 글꼴을 찾지 못했습니다")
+    plt.rcParams["axes.unicode_minus"] = False
     return plt
 def _fmt_k():
     import matplotlib.ticker as tk
@@ -979,12 +999,8 @@ def mon_chart(row, hist, met, scope):
     yo = [k for k in ks if hist[k].get("all") is not None or hist[k].get("ex") is not None]
     if len(yo) < 4: return None
     ks = ks[ks.index(yo[0]):]
-    import matplotlib; matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    try:
-        import koreanize_matplotlib  # noqa: F401  (한글 글꼴)
-    except Exception:
-        pass
+    plt = _plt()
+    import matplotlib
     absk, absl = None, None
     for key, lab in (("amt", f"월 {met} (백만엔)"), ("stores", "월말 점포수")):
         if sum(1 for k in ks if hist[k].get(key)) >= 3: absk, absl = key, lab; break
