@@ -964,6 +964,27 @@ def is_tanshin(r):
     return ("決算短信" in t and r.get("xbrl") and "訂正" not in t and "REIT" not in t.upper() and "ETF" not in t.upper()
             and not re.search(r"投資法人|ファンド", r["name"]))
 
+def post_selected(st, spec):
+    """지정한 날짜·종목의 결산단신만 판별해 통과하면 카드 게시(기준 변경 등으로 놓친 카드 보충용, 이미 있는 카드는 건너뜀)"""
+    done = {(c.get("d"), c.get("code")) for c in st.get("cards", {}).values()}
+    for part in spec.split(";"):
+        day, _, codes = part.partition(":")
+        day = day.strip(); want = [c.strip().upper() for c in codes.split(",") if c.strip()]
+        if not re.fullmatch(r"\d{8}", day) or not want: continue
+        rows = scan_tdnet(day)
+        for row in reversed([r for r in rows if is_tanshin(r) and r["code"] in want]):
+            if (day, row["code"]) in done: log("이미 카드 있음", day, row["code"]); continue
+            try:
+                a = analyze(row, rows, st)
+            except Exception:
+                traceback.print_exc(); continue
+            if not a or not a["pass"]: log("탈락", row["code"], (a or {}).get("why")); continue
+            cid = re.sub(r"\D", "", row["id"])[-12:]
+            st.setdefault("seen", {})[row["id"]] = day
+            if make_card(st, cid, a, row) is not None or DRY:
+                done.add((day, row["code"])); log("보충 카드", day, row["code"], row["name"])
+            save(st); time.sleep(3.5)
+
 def process_day(st, day, test=False):
     rows = scan_tdnet(day)
     seen = st.setdefault("seen", {})
@@ -1036,7 +1057,10 @@ def main():
     if TEST_REPORT:
         for c in re.split(r"[,\s]+", TEST_REPORT.strip()):
             if c: st.setdefault("ask_q", []).append({"code": c.upper(), "chat": CHANNEL, "ts": time.time(), "report": True, "ir": True})
-    if TEST_DAY:
+    if TEST_DAY and ":" in TEST_DAY:  # 놓친 카드 보충: '20261015:6532,7730;20261022:6146'
+        post_selected(st, TEST_DAY); save(st)
+        if DRY: return
+    elif TEST_DAY:
         n = process_day(st, TEST_DAY, test=True)
         log("test done, 통과", n); save(st)
         if DRY: return
