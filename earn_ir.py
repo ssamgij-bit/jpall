@@ -91,10 +91,32 @@ def _links(base, page):
         if not d:
             m8 = re.findall(r"(?<!\d)(20\d\d)(0[1-9]|1[0-2])([0-2]\d|3[01])(?!\d)", urllib.parse.unquote(u))
             if m8: d = "".join(m8[-1])
+        if not d:  # 파일 이름의 YYMMDD(예: _261028_, _240625_)
+            m6 = re.findall(r"(?<![0-9])(2\d)(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?![0-9])", urllib.parse.unquote(u).rsplit("/", 1)[-1])
+            if m6: d = "20" + "".join(m6[-1])
         out.append((u, t, d))
     return out
 
 MAT_LINK = re.compile(r"決算説明|説明会資料|説明資料|プレゼンテーション|Presentation|決算補足|補足資料|ファクトブック|Fact ?Book|データブック|Data ?Book|決算資料", re.I)
+
+def stale_years(txt, since_day):
+    """글·주소에 나오는 연도(2024, FY2024, 2024年3月期 등)가 모두 결산 연도보다 2년 이상 이전이면 True"""
+    ys = [int(y) for y in re.findall(r"(?<!\d)(20[0-4]\d)(?!\d)", txt)]
+    return bool(ys) and max(ys) < int(since_day[:4]) - 1
+
+def doc_dates(kind, body):
+    """자료 첫 부분에 적힌 날짜들(YYYYMMDD) — 옛 자료 걸러내기용"""
+    if kind == "pdf":
+        try:
+            import io
+            from pdfminer.high_level import extract_text
+            body = E.nfkc(extract_text(io.BytesIO(body), maxpages=2))
+        except Exception:
+            return []
+    head = body[:4000]
+    out = [f"{y}{int(m):02d}{int(d):02d}" for y, m, d in re.findall(r"(20\d\d)\s*[年./-]\s*(\d{1,2})\s*[月./-]\s*(\d{1,2})", head)
+           if 1 <= int(m) <= 12 and 1 <= int(d) <= 31]
+    return out
 
 def ir_site_docs(code, since_day, limit=2, pat=None):
     """회사 IR 홈페이지에서 이번 결산 이후의 질의응답·설명회 기록(pat 지정 시 그 자료) 링크 → [(이름, url, 날짜)]"""
@@ -113,7 +135,9 @@ def ir_site_docs(code, since_day, limit=2, pat=None):
             for u, t, d in _links(p, body):
                 h = urllib.parse.urlparse(u).netloc
                 if pat.search(t) or pat.search(urllib.parse.unquote(u)):
+                    if re.search(r"\.(mp4|mp3|m4a|wav)($|\?)", u, re.I): continue  # 음성·영상
                     if d and d < since_day: continue
+                    if not d and stale_years(t + " " + urllib.parse.unquote(u), since_day): continue  # 날짜 없이 옛 연도만 보이는 자료(예: 2024년 설명회)
                     hits.append((t[:60] or "질의응답 자료", u, d))
                 elif depth == 0 and h == host and re.search(r"/ir|investor|kabunushi|stock|library|news", u, re.I) and \
                         re.search(r"IR|投資家|株主|ライブラリ|資料|ニュース|news|library", t + u, re.I):
@@ -122,6 +146,7 @@ def ir_site_docs(code, since_day, limit=2, pat=None):
     out, urls = [], set()
     # 날짜가 있는 것(최신 순) → PDF 직링크 → 나머지(목록 페이지 등)
     for t, u, d in sorted(hits, key=lambda x: (x[2] or "0", bool(re.search(r"\.pdf($|\?)", x[1], re.I))), reverse=True):
+        if not d and any(h[2] for h in hits if h[1] != u) and len(out) >= 1: continue  # 날짜 확인된 자료가 있으면 날짜 모르는 것은 뒤로(채우지 않음)
         if u in urls: continue
         urls.add(u); out.append((t, u, d))
     return out[:limit]
@@ -175,6 +200,10 @@ def other_qa(card):
         try:
             kind, body = fetch_doc(url)
             if kind == "text" and len(body) < 500: continue
+            ds = [x for x in doc_dates(kind, body) if x <= E.now().strftime("%Y%m%d")]
+            lim = (dt.datetime.strptime(since, "%Y%m%d") - dt.timedelta(days=45)).strftime("%Y%m%d")
+            if ds and max(ds) < lim:  # 본문 날짜가 이번 결산보다 한참 전 → 옛 자료
+                E.log("qa skip old doc", url, max(ds)); continue
             sig = (kind, len(body))
             if sig in sigs: continue  # 같은 PDF로 이어지는 링크 중복
             sigs.add(sig)

@@ -757,7 +757,18 @@ def qa_followup(st, day, rows):
         if not w or card.get("deleted"): continue
         if time.time() - w > 86400 * 14: card.pop("qa_watch", None); continue
         hits = [r for r in rows if r["code"] == card["code"] and earn_ir.QA_RE.search(r["title"]) and r["id"] not in card.get("qa_seen", [])]
-        if not hits: continue
+        if not hits:  # TDnet에 없으면 6시간마다 회사 IR 홈페이지·로그미도 다시 확인
+            if time.time() - card.get("qa_site_ts", 0) < 6 * 3600: continue
+            card["qa_site_ts"] = time.time()
+            try:
+                if not earn_ir.other_qa(card): continue
+                texts, has_qa = earn_ir.build(card, qa_rows=[])
+                if texts and has_qa:
+                    texts[0] = "📞 <b>회사 IR 홈페이지에 질의응답 자료가 올라와 Q&amp;A를 추가했습니다</b>\n\n" + texts[0]
+                    send_texts(card, texts); card.pop("qa_watch", None)
+            except Exception:
+                traceback.print_exc()
+            continue
         card.setdefault("qa_seen", []).extend(r["id"] for r in hits)
         try:
             texts, has_qa = earn_ir.build(card, qa_rows=hits)
