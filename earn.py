@@ -914,12 +914,10 @@ def analyze_code(code):
     if "name" not in row: row["name"] = jp
     return a, row
 
-WATCH_MAX = 50                                       # 1인당 관심 종목 수
 HELP_TXT = ("일본 실적 스크리닝 봇 사용법\n"
             "• 종목 코드(예: 6857)나 이름(예: 어드반테스트, 화낙)을 보내면 최근 분기 실적 카드를 이 대화로 보내드립니다.\n"
             "• /add 6857 7203 — 관심 종목 등록: 결산단신이 나오면 스크리닝 통과 여부와 상관없이 카드를 이 대화로 보내드립니다.\n"
             "• /del 6857 — 관심 종목 삭제 · /list — 내 관심 종목 보기\n"
-            f"• 관심 종목은 1인당 최대 {WATCH_MAX}개입니다.\n"
             "• 카드의 📄 리포트·🗣 IR·Q&A 버튼으로 상세 자료도 받을 수 있습니다.\n"
             "스크리닝 기준을 통과한 종목은 지금처럼 채널에 올라갑니다.")
 
@@ -937,7 +935,7 @@ def user_cmd(st, chat, text):
         except Exception: c = None
         if c: codes.append(c)
     if cmd in ("add", "추가"):
-        new = [c for c in codes if c not in mine][:max(0, WATCH_MAX - len(mine))]
+        new = [c for c in codes if c not in mine]
         mine += new
         msg = (f"추가: {', '.join(label_of(c) for c in new)}" if new else "추가할 종목을 찾지 못했습니다. 예) /add 6857 7203") + f"\n(관심 종목 {len(mine)}개)"
     elif cmd in ("del", "삭제"):
@@ -1137,9 +1135,9 @@ def main():
                    "이 채널에는 일본 상장사 결산단신 중 스크리닝 기준(매출 성장·이익 성장·성장 가속·턴어라운드, 시총 300억 엔 이상)을 통과한 종목 카드가 자동으로 올라옵니다.\n\n"
                    f"<b>내 종목만 따로 받기</b> — 봇 @{me} 과 1:1 대화를 열고(채널 구독자는 채널에 글을 쓸 수 없습니다)\n"
                    "• 종목 코드나 이름 보내기(예: 6857, 어드반테스트) → 최근 분기 실적 카드를 개인 대화로\n"
-                   "• /add 6857 7203 → 관심 종목 등록. 결산단신이 나오면 스크리닝 통과 여부와 상관없이 개인 대화로 카드 발송(1인당 최대 50종목)\n"
+                   "• /add 6857 7203 → 관심 종목 등록. 결산단신이 나오면 스크리닝 통과 여부와 상관없이 개인 대화로 카드 발송\n"
                    "• /del 6857 삭제 · /list 목록 · /start 사용법\n\n"
-                   "카드의 📄 리포트(사업부·지역별 상세 분석), 🗣 IR·Q&A(설명회 질의응답 요약) 버튼은 누구나 누를 수 있습니다.\n"
+                   "카드의 📄 리포트(사업부·지역별 상세 분석, note·야후 게시판·증권사 레이팅 등 시장 반응), 🗣 IR·Q&A(설명회 질의응답 요약) 버튼은 누구나 누를 수 있습니다.\n"
                    "<i>투자 자문이 아닌 공시 정리입니다.</i>")
             r = tg("sendMessage", {"chat_id": CHANNEL, "text": txt, "parse_mode": "HTML", "disable_web_page_preview": True})
             mid = (r.get("result") or {}).get("message_id")

@@ -469,6 +469,12 @@ def build(card):
             f"<p><b>Q{i}. {esc(x['q'])}</b><br>{esc(x.get('a'))}" + (f" <small>— {esc(x.get('who'))}</small>" if x.get("who") else "") + "</p>"
             for i, x in enumerate(qa, 1)) + "<p class=muted>출처: " + " · ".join(f"<a href='{esc(u)}'>{esc(n)}</a>" for n, u in rec_links) + "</p></div>")
 
+    # 6-2) 다른 사람들의 의견(note·야후 게시판·가부탄 뉴스)
+    try:
+        import earn_opinion
+        op_html = earn_opinion.build_section(card)
+    except Exception as e:
+        E.log("opinion error", e); op_html = ""
     # 7) 실적 표·차트
     charts = []
     try:
@@ -596,6 +602,7 @@ figure{{margin:10px 0;background:#fff;border-radius:10px;padding:8px}} figure im
 {reg_html}
 {ins_html}
 {qa_html}
+{op_html}
 <h2>분기 실적 (3개월 단독, {esc(r.get('scope') or '')})</h2><div class=scroll><table>
 <tr><th>분기</th><th>발표일</th><th>매출</th><th>YoY</th><th>영업이익</th><th>YoY</th><th>영업이익률</th><th>순이익</th><th>YoY</th></tr>{''.join(qrows)}</table></div>
 {pl_html}
