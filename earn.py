@@ -613,7 +613,7 @@ def keyboard(cid, card=None):
     card = card or {}
     row = [] if card.get("report_sent") else [{"text": "📄 리포트", "callback_data": f"rep:{cid}"}]
     if not card.get("ir_sent"): row.append({"text": "🗣 IR·Q&A", "callback_data": f"ir:{cid}"})
-    return json.dumps({"inline_keyboard": [row + [{"text": "🗑 삭제", "callback_data": f"del:{cid}"}]]})
+    return json.dumps({"inline_keyboard": [row] if row else []})
 
 def find_channel(st):
     global CHANNEL
@@ -628,7 +628,7 @@ def find_channel(st):
         st["channel"] = CHANNEL; log("channel found", CHANNEL)
     return CHANNEL
 
-def post_card(st, cid, caption, png):
+def post_card(st, cid, caption, png, chat=None):
     if DRY:
         os.makedirs(OUT_DIR, exist_ok=True)
         open(os.path.join(OUT_DIR, f"{cid}.png"), "wb").write(png)
@@ -636,7 +636,7 @@ def post_card(st, cid, caption, png):
         print("-" * 60 + "\n" + re.sub(r"</?b>", "", caption), f"\n[{len(caption)}자]"); return 0
     if len(caption) > 1024:  # 사진 설명 글 한도 → '왜 좋았나' 세부 줄부터 줄임
         caption = shrink(caption)
-    r = tg("sendPhoto", {"chat_id": CHANNEL, "caption": caption, "parse_mode": "HTML", "reply_markup": keyboard(cid)},
+    r = tg("sendPhoto", {"chat_id": chat or CHANNEL, "caption": caption, "parse_mode": "HTML", "reply_markup": keyboard(cid)},
            files={"photo": (f"{cid}.png", png, "image/png")})
     return (r.get("result") or {}).get("message_id")
 
@@ -687,7 +687,7 @@ def update_reactions(st):
         if not rx: continue
         cap = c["caption"].replace("▶️ <b>주가</b> 다음 거래일 장 마감 후 업데이트", "▶️ <b>주가</b>\n" + reaction_line(rx))
         cap = shrink(cap) if len(cap) > 1024 else cap
-        r = tg("editMessageCaption", {"chat_id": CHANNEL, "message_id": c["msg"], "caption": cap, "parse_mode": "HTML",
+        r = tg("editMessageCaption", {"chat_id": c.get("chat") or CHANNEL, "message_id": c["msg"], "caption": cap, "parse_mode": "HTML",
                                       "reply_markup": keyboard(cid, c)})
         if r.get("ok") or "not modified" in str(r.get("description", "")) or "not found" in str(r.get("description", "")):
             c["rx"] = rx; c["caption"] = cap
@@ -709,6 +709,8 @@ def poll_buttons(st, wait=0):
         act, _, cid = data.partition(":")
         card = st.get("cards", {}).get(cid)
         msg = cq.get("message") or {}
+        if act == "del" and (cq.get("from") or {}).get("id") != st.get("owner"):  # 삭제 버튼은 없앰(예전 카드의 버튼은 주인만)
+            tg("answerCallbackQuery", {"callback_query_id": cq["id"], "text": "삭제 기능은 제공하지 않습니다."}); continue
         if act == "del":
             tg("answerCallbackQuery", {"callback_query_id": cq["id"], "text": "삭제했습니다."})
             tg("deleteMessage", {"chat_id": msg.get("chat", {}).get("id", CHANNEL), "message_id": msg.get("message_id")})
@@ -725,9 +727,9 @@ def poll_buttons(st, wait=0):
 def send_texts(card, texts):
     ok = False
     for t in texts:
-        r = tg("sendMessage", {"chat_id": CHANNEL, "text": t, "parse_mode": "HTML", "disable_web_page_preview": True, "reply_to_message_id": card["msg"]})
+        r = tg("sendMessage", {"chat_id": card.get("chat") or CHANNEL, "text": t, "parse_mode": "HTML", "disable_web_page_preview": True, "reply_to_message_id": card["msg"]})
         if not r.get("ok"):
-            r = tg("sendMessage", {"chat_id": CHANNEL, "text": re.sub(r"<[^>]+>", "", t), "reply_to_message_id": card["msg"]})
+            r = tg("sendMessage", {"chat_id": card.get("chat") or CHANNEL, "text": re.sub(r"<[^>]+>", "", t), "reply_to_message_id": card["msg"]})
         ok = ok or bool(r.get("ok")); time.sleep(1)
     return ok
 
@@ -741,11 +743,11 @@ def do_ir(st):
             import earn_ir
             texts, has_qa = earn_ir.build(card)
             if not texts:
-                tg("sendMessage", {"chat_id": CHANNEL, "text": f"IR·Q&A 요약 생성 실패({card['code']}). AI 한도일 수 있으니 잠시 뒤 다시 눌러 주세요.", "reply_to_message_id": card["msg"]}); continue
+                tg("sendMessage", {"chat_id": card.get("chat") or CHANNEL, "text": f"IR·Q&A 요약 생성 실패({card['code']}). AI 한도일 수 있으니 잠시 뒤 다시 눌러 주세요.", "reply_to_message_id": card["msg"]}); continue
             if send_texts(card, texts):
                 card["ir_sent"] = True
                 if not has_qa: card["qa_watch"] = time.time()
-                tg("editMessageReplyMarkup", {"chat_id": CHANNEL, "message_id": card["msg"], "reply_markup": keyboard(cid, card)})
+                tg("editMessageReplyMarkup", {"chat_id": card.get("chat") or CHANNEL, "message_id": card["msg"], "reply_markup": keyboard(cid, card)})
         except Exception:
             traceback.print_exc()
 
@@ -792,14 +794,14 @@ def do_reports(st):
             ok_ai = card.pop("_ai_ok", True)
             cap = f"📄 {card.get('name_ko') or card['name']}({card['code']}) 리포트 — 파일을 열어 보세요"
             if not ok_ai: cap += "\n⚠️ AI 분석(결론·사업부·IR 핵심 데이터·Q&A)은 구글 서버 혼잡으로 빠졌습니다. 잠시 뒤 📄 리포트를 다시 누르면 새로 만듭니다."
-            res = tg("sendDocument", {"chat_id": CHANNEL, "caption": cap,
+            res = tg("sendDocument", {"chat_id": card.get("chat") or CHANNEL, "caption": cap,
                                       "reply_to_message_id": card["msg"]}, files={"document": (fn, blob, "text/html")}, timeout=90)
             if res.get("ok") and ok_ai:
                 card["report_sent"] = True
-                tg("editMessageReplyMarkup", {"chat_id": CHANNEL, "message_id": card["msg"], "reply_markup": keyboard(cid, card)})
+                tg("editMessageReplyMarkup", {"chat_id": card.get("chat") or CHANNEL, "message_id": card["msg"], "reply_markup": keyboard(cid, card)})
         except Exception:
             traceback.print_exc()
-            tg("sendMessage", {"chat_id": CHANNEL, "text": f"리포트 생성 실패({card['code']}). 잠시 뒤 다시 눌러 주세요.", "reply_to_message_id": card["msg"]})
+            tg("sendMessage", {"chat_id": card.get("chat") or CHANNEL, "text": f"리포트 생성 실패({card['code']}). 잠시 뒤 다시 눌러 주세요.", "reply_to_message_id": card["msg"]})
 
 # ───────────────────────── 요청 분석: 종목명·코드를 보내면 최근 분기 실적 카드 ─────────────────────────
 _IDX = None
@@ -912,6 +914,65 @@ def analyze_code(code):
     if "name" not in row: row["name"] = jp
     return a, row
 
+ASK_CAP = int(os.environ.get("ASK_CAP", "10"))     # 주인 외 사용자 1인당 하루 요청 분석 한도(AI 사용량 보호)
+WATCH_CAP = int(os.environ.get("WATCH_CAP", "20"))  # 1인당 하루 관심 종목 실적 알림 한도
+WATCH_MAX = 50                                       # 1인당 관심 종목 수
+HELP_TXT = ("일본 실적 스크리닝 봇 사용법\n"
+            "• 종목 코드(예: 6857)나 이름(예: 어드반테스트, 화낙)을 보내면 최근 분기 실적 카드를 이 대화로 보내드립니다.\n"
+            "• /add 6857 7203 — 관심 종목 등록: 결산단신이 나오면 스크리닝 통과 여부와 상관없이 카드를 이 대화로 보내드립니다.\n"
+            "• /del 6857 — 관심 종목 삭제 · /list — 내 관심 종목 보기\n"
+            "• 카드의 📄 리포트·🗣 IR·Q&A 버튼으로 상세 자료도 받을 수 있습니다.\n"
+            f"하루 요청 {ASK_CAP}건·관심 종목 알림 {WATCH_CAP}건까지(무료 AI 한도 공유). 스크리닝 통과 종목은 채널에 그대로 올라갑니다.")
+
+def take_quota(st, uid, kind):
+    q = st.setdefault("quota", {}); d = now().strftime("%Y%m%d")
+    if q.get("d") != d: q.clear(); q["d"] = d
+    k = f"{kind}:{uid}"; cap = ASK_CAP if kind == "ask" else WATCH_CAP
+    if q.get(k, 0) >= cap: return False
+    q[k] = q.get(k, 0) + 1; return True
+
+def user_cmd(st, chat, text):
+    """개인 대화 명령: /add /del /list (사용자마다 관심 종목 따로 보관)"""
+    m = re.match(r"^/(add|del|list|추가|삭제|목록)\b(.*)$", text.strip(), re.I)
+    if not m: return False
+    cmd, rest = m.group(1).lower(), m.group(2)
+    subs = st.setdefault("subs", {}); uid = str(chat["id"]); mine = subs.setdefault(uid, [])
+    codes = []
+    for tok in re.split(r"[,\s]+", rest.strip()):
+        if not tok: continue
+        try: c, _ = resolve(tok)
+        except Exception: c = None
+        if c: codes.append(c)
+    if cmd in ("add", "추가"):
+        new = [c for c in codes if c not in mine][:max(0, WATCH_MAX - len(mine))]
+        mine += new
+        msg = (f"추가: {', '.join(label_of(c) for c in new)}" if new else "추가할 종목을 찾지 못했습니다. 예) /add 6857 7203") + f"\n(관심 종목 {len(mine)}개)"
+    elif cmd in ("del", "삭제"):
+        gone = [c for c in codes if c in mine]
+        for c in gone: mine.remove(c)
+        msg = (f"삭제: {', '.join(label_of(c) for c in gone)}" if gone else "목록에 없는 종목입니다.") + f"\n(관심 종목 {len(mine)}개)"
+    else:
+        msg = f"관심 종목 {len(mine)}개\n" + ("\n".join(label_of(c) for c in mine) if mine else "(없음) /add 6857 처럼 추가하세요.")
+    if not mine: subs.pop(uid, None)
+    tg("sendMessage", {"chat_id": chat["id"], "text": msg})
+    return True
+
+def notify_watchers(st, rows):
+    """관심 종목으로 등록한 사용자에게 결산단신 카드를 개인 대화로(스크리닝 통과 여부 무관)"""
+    subs = st.get("subs") or {}
+    if not subs: return
+    sent = st.setdefault("watch_sent", {})
+    for r in rows:
+        for uid, codes in subs.items():
+            if r["code"] not in codes: continue
+            key = f"{uid}:{r['id']}"
+            if key in sent: continue
+            sent[key] = r["d"]
+            if not take_quota(st, uid, "watch"): continue
+            st.setdefault("ask_q", []).append({"code": r["code"], "chat": int(uid) if uid.lstrip("-").isdigit() else uid, "ts": time.time(), "watch": True})
+    if len(sent) > 5000:
+        for k in sorted(sent, key=sent.get)[:1000]: sent.pop(k)
+
 def handle_text(st, chat, text):
     """채널 글·봇 개인 메시지로 온 종목명/코드 → 요청 분석 대기열"""
     text = (text or "").strip()
@@ -919,17 +980,20 @@ def handle_text(st, chat, text):
     if chat.get("type") == "channel" and str(chat.get("id")) != str(CHANNEL): return
     if chat.get("type") == "private":
         if st.get("owner") is None: st["owner"] = chat["id"]
-        if chat["id"] != st["owner"]: return
+        if user_cmd(st, chat, text): return
     if text.startswith("/start") or text.startswith("/help"):
-        tg("sendMessage", {"chat_id": chat["id"], "text": "종목 코드(예: 6999)나 종목명(예: KOA, 화낙, ファナック)을 보내면 최근 분기 실적 카드를 채널에 올립니다."}); return
+        tg("sendMessage", {"chat_id": chat["id"], "text": HELP_TXT}); return
+    if chat.get("type") == "private" and chat["id"] != st.get("owner") and not take_quota(st, chat["id"], "ask"):
+        tg("sendMessage", {"chat_id": chat["id"], "text": f"오늘 요청 한도({ASK_CAP}건)를 다 썼습니다. 내일 다시 보내 주세요."}); return
     try:
         code, cands = resolve(text)
     except Exception as e:
         log("resolve error", e); return
     if code:
         recent = st.setdefault("ask_recent", {})
-        if time.time() - recent.get(code, 0) < 180 or any(j["code"] == code for j in st.get("ask_q", [])): return  # 같은 요청 중복
-        recent[code] = time.time()
+        rk = f"{chat['id']}:{code}"
+        if time.time() - recent.get(rk, 0) < 180 or any(j["code"] == code and str(j["chat"]) == str(chat["id"]) for j in st.get("ask_q", [])): return  # 같은 사람의 같은 요청 중복
+        recent[rk] = time.time()
         st.setdefault("ask_q", []).append({"code": code, "chat": chat["id"], "ts": time.time()})
         tg("sendMessage", {"chat_id": chat["id"], "text": f"{label_of(code)} 최근 분기 실적을 분석하고 있습니다(1~2분)."})
     elif cands:
@@ -945,13 +1009,14 @@ def do_asks(st):
         try:
             a, row = analyze_code(code)
             cid = f"q{code}{int(time.time()) % 100000000}"
-            msg = make_card(st, cid, a, row)
+            personal = job.get("watch") or str(job["chat"]) not in (str(CHANNEL), str(st.get("owner")))
+            msg = make_card(st, cid, a, row, job["chat"] if personal else None)  # 다른 사용자 요청은 그 사람 개인 대화로
             if msg is not None and job.get("report"):
                 st.setdefault("rep_q", []).append(cid)
                 if job.get("ir"): st.setdefault("ir_q", []).append(cid)
             if msg is None:
                 tg("sendMessage", {"chat_id": job["chat"], "text": f"{label_of(code)} 카드 게시에 실패했습니다."})
-            elif str(job["chat"]) != str(CHANNEL):
+            elif str(job["chat"]) != str(CHANNEL) and not personal:
                 tg("sendMessage", {"chat_id": job["chat"], "text": f"{label_of(code)} 카드를 채널에 올렸습니다."})
             log("요청 분석", code, "통과" if a["pass"] else a["why"])
         except Exception as e:
@@ -992,6 +1057,9 @@ def process_day(st, day, test=False):
         try: qa_followup(st, day, rows)
         except Exception: traceback.print_exc()
     todo = [r for r in rows if is_tanshin(r) and (test or r["id"] not in seen)]
+    if not test:
+        try: notify_watchers(st, todo)
+        except Exception: traceback.print_exc()
     if not todo: return 0
     log(day, "결산단신", len(todo))
     passed = 0
@@ -1016,7 +1084,7 @@ def process_day(st, day, test=False):
         time.sleep(3.5)
     return passed
 
-def make_card(st, cid, a, row):
+def make_card(st, cid, a, row, chat=None):
     """분석 결과 → Gemini 요약 → 카드(차트+글) 게시 → 상태에 저장. 게시 실패면 None"""
     if True:
         fem = fy_end_month_of(a["r"])
@@ -1030,14 +1098,14 @@ def make_card(st, cid, a, row):
         buf = io.BytesIO()
         chart_name = name_of(a["code"], a["name"], ai) + f"({a['code']})"
         card_chart(chart_name, a["series"], fem, buf)
-        msg = post_card(st, cid, cap, buf.getvalue())
+        msg = post_card(st, cid, cap, buf.getvalue(), chat)
         if msg is None and not DRY: return None
         st.setdefault("cards", {})[cid] = {
             "code": a["code"], "name": a["name"], "name_ko": name_of(a["code"], a["name"], ai), "d": row["d"], "t": row.get("t") or "15:30", "msg": msg,
             "caption": cap, "ts": time.time(), "sector": a["sector"], "cap": a.get("cap"), "pdf": row.get("pdf"), "xbrl": row.get("xbrl"),
             "mat": mat_url, "mat_src": mat_src, "fem": fem, "series": a["series"][-8:], "hit": a["hit"],
             "r": {k: a["r"].get(k) for k in ("q", "start", "end", "fc", "fc_end", "rev", "op", "ni", "scope")},
-            "ai": ai, "profile": a.get("profile", "")[:600], "qual": a.get("qual", "")[:8000]}
+            "ai": ai, "profile": a.get("profile", "")[:600], "qual": a.get("qual", "")[:8000], "chat": str(chat or CHANNEL)}
         return msg
 
 def cleanup(st):
@@ -1072,6 +1140,11 @@ def main():
                 if is_tanshin(r): st.setdefault("seen", {})[r["id"]] = d
         st["init"] = now().isoformat(); save(st)
         tg("sendMessage", {"chat_id": CHANNEL, "text": "실적 스크리닝 봇이 연결됐습니다. 이제부터 올라오는 결산단신을 판별해 기준을 통과한 종목만 카드로 보냅니다."})
+    if not st.get("kb_v2") and not DRY:  # 기존 카드의 🗑 삭제 버튼 없애기(한 번)
+        for cid, c in list(st.get("cards", {}).items()):
+            if c.get("msg") and not c.get("deleted"):
+                tg("editMessageReplyMarkup", {"chat_id": c.get("chat") or CHANNEL, "message_id": c["msg"], "reply_markup": keyboard(cid, c)}); time.sleep(0.5)
+        st["kb_v2"] = True; save(st)
     last_scan = 0
     while time.time() - t0 < RUN_SECONDS:
         try:
