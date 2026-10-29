@@ -40,8 +40,13 @@ def muted(r, names, quotes, st):
     mc = (quotes.get(code) or {}).get("marketCap")
     if mc and mc < MIN_CAP: return f"시총 {MIN_CAP / 1e8:,.0f}억 엔 미만"
     t = nfkc(r["title"])
-    if MAT_RE.search(t) and "決算短信" not in t:  # 설명·보충 자료 → 같은 날 결산단신 메시지에 링크로
-        st.setdefault("matlinks", {})[code] = [r["d"], r["pdf"]]
+    if is_mat(t):  # 설명·보충 자료·질의응답 → 같은 날 결산단신 메시지에 링크로
+        ml = st.setdefault("matlinks", {})
+        cur = ml.get(code) if isinstance(ml.get(code), dict) and ml[code].get("d") == r["d"] else {"d": r["d"], "items": []}
+        if r["pdf"] not in [u for _, u in cur["items"]]: cur["items"].append([mat_label(t), r["pdf"]])
+        ml[code] = cur
+        if len(ml) > 600:
+            for k in sorted(ml, key=lambda k: (ml[k].get("d", "") if isinstance(ml[k], dict) else ""))[:200]: ml.pop(k, None)
         return "설명 자료(결산단신에 링크)"
     for pat, keep, why in PRE:  # 중요 키워드(자사주·합병 등)가 들어 있어도 빼는 진행·내부 공시
         if re.search(pat, t) and not (keep and re.search(keep, t)): return why
@@ -51,6 +56,16 @@ def muted(r, names, quotes, st):
     return None
 
 MAT_RE = re.compile(r"決算説明|説明会資料|説明資料|補足資料|補足説明資料|プレゼンテーション資料|ファクトブック|データブック|決算概要|決算の概要|決算概況|中間決算の概況|決算.{0,6}参考資料|決算報告資料")
+QA_RE = re.compile(r"質疑応答|Q&A|Q&amp;A|QA集|よくあるご質問")
+def is_mat(t):
+    """결산 설명·보충 자료(결산단신 본문 제외). 제목에 '결산단신'이 들어간 보충자료, 'n분기 결산'·'결산 자료'만 있는 제목, 결산 질의응답도 포함"""
+    if re.search(r"決算短信", t) and not re.search(r"補足|説明|参考|プレゼン", t): return False
+    if MAT_RE.search(t) or re.search(r"決算(説明)?資料", t): return True
+    if re.search(r"決算", t) and QA_RE.search(t): return True
+    core = re.sub(r"\d{4}\s*年\s*\d{1,2}\s*月期|FY\S+|[\s　()（）〔〕\[\]]", "", t)
+    return bool(re.fullmatch(r"(第[1-4]四半期|中間期?|通期|上期|下期|期末)*(連結)?決算(発表|報告)?", core))
+def mat_label(t):
+    return "질의응답" if QA_RE.search(t) else "설명 자료"
 # KEEP_ALWAYS보다 먼저 보는 제외 규칙
 PRE = [
     (r"^\(?開示事項の経過\)?.*自己株式|自己株式.{0,12}(取得状況|取得結果|取得終了|取得の終了|消却完了|消却の完了)",
@@ -1185,6 +1200,33 @@ def why_line(st, row, kind, src):
     z = (pick or sents or [""])[0]
     return (translate(st, [z]).get(z) or "") if z else ""
 
+FACTS_PROMPT = """너는 일본 주식 애널리스트다. 아래는 도쿄증시 적시공시 원문(일본어, 앞부분)이다. 제목: {title}
+투자자가 메시지만 보고 내용을 알 수 있게 핵심을 뽑아라.
+- facts: 핵심 사실 1~3줄(각 70자 이내). 숫자를 반드시 넣는다: 금액(억 엔 단위로 환산), 비율, 주식 수, 일정(YYYY.MM.DD), 대상 회사.
+  · 배당: 중간·기말·연간 주당배당을 "이전 → 수정(전기 실적)" 형식으로, 증배·감배·특별배당 여부.
+  · 특별손익·비용 계상: 금액, 반영 기간, 실적 전망 반영 여부(원문에 있으면).
+  · 설비투자·자산 취득·매각: 금액, 대상, 일정, 목적 사업.
+  · M&A·경영통합·완전자회사화·주식교환: 상대방, 방식, 통합(교환) 비율, 취득 지분율·가격, 일정.
+  · 대표이사 교체: 누가 누구로, 날짜, 새 대표의 이전 직책.
+  · 주식분할·병합: 비율, 기준일·효력일.
+  · 그 밖: 가장 중요한 숫자와 일정.
+- why: 원문에 적힌 이유·목적을 1문장(80자 이내). 원문에 없으면 빈 문자열.
+- 원문에 없는 내용·추측 금지. 일본어 문자는 쓰지 말고 고유명사는 한글로. 숫자가 전혀 없는 공시면 facts에 내용 요약 1줄.
+출력 JSON만: {{"facts": ["..."], "why": "..."}}
+
+원문:
+{src}"""
+def facts_line(st, row):
+    """수치 파서가 없는 공시 → ([핵심 1~3줄], 사유)"""
+    t = re.sub(r"[ \t\u3000]+", "", pdf_text(row["pdf"])); t = re.sub(r"\n+", "\n", t)
+    k = t.find("記")
+    src = (t[:600] + "\n" + t[k:k + 3400]) if k > 600 else t[:4000]
+    out = gemini_json(FACTS_PROMPT.format(title=row["title"], src=src), timeout=60, models=MON_MODELS) or {}
+    jp = lambda x: re.search(r"[\u3040-\u30ff]", x)
+    facts = [str(x).strip().lstrip("•·- ") for x in (out.get("facts") or []) if str(x).strip() and not jp(str(x))][:3]
+    why = str(out.get("why") or "").strip()
+    return facts, ("" if jp(why) else why)
+
 def build(row, st, names, quotes, trmap):
     code = row["code"]; n = names.get(code)
     name_ko = n["ko"] if n else jp2ko(row["name"])
@@ -1222,12 +1264,19 @@ def build(row, st, names, quotes, trmap):
     try: biz = biz_line(st, code)
     except Exception as e: log("biz error", code, e)
     kind = HL.get("kind") or (None if body else next(("evt" for pat, _ in EVT_RULES if re.search(pat, title)), None))
-    if kind in WHY_KIND and not re.match(r"[(（](訂正|変更)", title):
+    facts = ""
+    if body and kind in WHY_KIND and not re.match(r"[(（](訂正|変更)", title):
         try:
             HL["src"] = reason_src(row, kind)
             why = why_line(st, row, kind, HL["src"])
         except Exception as e:
             log("why error", code, e)
+    elif not body and not re.match(r"[(（]訂正", title):  # 수치 파서가 없는 공시: AI가 원문에서 핵심 수치·사유를 뽑음
+        try:
+            if kind == "evt": HL["src"] = reason_src(row, "evt")
+            facts, why = facts_line(st, row)
+        except Exception as e:
+            log("facts error", code, e)
     try:
         record_hl(row, st, name_ko, quotes.get(code), trmap.get(title) or title)
     except Exception as e:
@@ -1235,13 +1284,17 @@ def build(row, st, names, quotes, trmap):
     if biz: head.insert(len(head) - 1, f"사업: {esc(biz)}")
     msg = "\n".join(head)
     if body: msg += "\n\n" + body
-    if why: msg += f"\n\n<b>사유</b> : {esc(why)}"
+    if facts: msg += "\n\n<b>[핵심]</b>\n" + "\n".join(esc(x) for x in facts)
+    if why: msg += ("\n" if facts else "\n\n") + f"<b>사유</b> : {esc(why)}"
     msg += f"\n\n공시링크: {row['pdf']}"
-    if "決算短信" in title:  # 같은 날 올라온 결산 설명·보충 자료 링크(따로 보내지 않음)
-        mat = next((x["pdf"] for x in st.get("queue", []) if x["code"] == code and x["d"] == d and MAT_RE.search(nfkc(x["title"])) and "決算短信" not in x["title"]), None)
+    if "決算短信" in title and not is_mat(nfkc(title)):  # 같은 날 올라온 결산 설명·보충 자료·질의응답 링크(따로 보내지 않음)
+        mats = [[mat_label(nfkc(x["title"])), x["pdf"]] for x in st.get("queue", []) if x["code"] == code and x["d"] == d and is_mat(nfkc(x["title"]))]
         ml = (st.get("matlinks") or {}).get(code)
-        if not mat and ml and ml[0] == d: mat = ml[1]
-        if mat: msg += f"\n설명 자료: {mat}"
+        if isinstance(ml, dict) and ml.get("d") == d: mats += ml["items"]
+        seen = set()
+        for lab, u in mats:
+            if u in seen: continue
+            seen.add(u); msg += f"\n{lab}: {u}"
     msg += f"\n회사정보: https://kabutan.jp/stock/?code={code}"
     return msg
 
