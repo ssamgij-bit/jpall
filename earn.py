@@ -975,6 +975,30 @@ def user_cmd(st, chat, text):
     tg("sendMessage", {"chat_id": chat["id"], "text": msg})
     return True
 
+JP_STATE_URL = "https://raw.githubusercontent.com/ssamgij-bit/jpall/state/state.json"
+def sync_jp_stock(st):
+    """japan stock 봇(@JP_stock_yh_bot) 구독 목록 → 이 봇 관심 종목(주인). 공시 채널 봇(JP_ALL)이 하루 한 번 받아 둔 목록을 읽음.
+    직접 /add 한 종목은 그대로 두고, japan stock 봇에서 빠진 종목만 같이 뺌"""
+    d = now().strftime("%Y%m%d")
+    if st.get("jps_date") == d: return
+    st["jps_date"] = d
+    try:
+        j = json.loads(http(JP_STATE_URL, timeout=30))
+    except Exception as e:
+        log("jp stock sync error", e); return
+    owner = j.get("owner")
+    if owner and st.get("owner") is None: st["owner"] = owner  # 주인 = 두 봇에 같은 텔레그램 계정
+    if not owner or str(owner) != str(st.get("owner")): return
+    codes = sorted((j.get("watch") or {}).keys())
+    subs = st.setdefault("subs", {}); uid = str(owner)
+    old = set(st.get("jps_codes") or [])
+    mine = [c for c in subs.get(uid, []) if c not in old or c in codes]
+    mine += [c for c in codes if c not in mine]
+    if mine: subs[uid] = mine
+    else: subs.pop(uid, None)
+    st["jps_codes"] = codes
+    log("jp stock watchlist synced", len(codes))
+
 def notify_watchers(st, rows):
     """관심 종목으로 등록한 사용자에게 결산단신 카드를 개인 대화로(스크리닝 통과 여부 무관)"""
     subs = st.get("subs") or {}
@@ -1174,6 +1198,8 @@ def main():
             if c.get("msg") and not c.get("deleted"):
                 tg("editMessageReplyMarkup", {"chat_id": c.get("chat") or CHANNEL, "message_id": c["msg"], "reply_markup": keyboard(cid, c)}); time.sleep(0.5)
         st["kb_v2"] = True; save(st)
+    try: sync_jp_stock(st)
+    except Exception: traceback.print_exc()
     last_scan = 0
     while time.time() - t0 < RUN_SECONDS:
         try:
