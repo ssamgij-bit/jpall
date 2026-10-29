@@ -2,7 +2,7 @@ name: JP_ALL
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # 10분마다 시작 시도(실행 중이면 대기) → 끊김 없이 이어서 실행
+    - cron: "*/10 * * * *"   # 10분마다 시작 시도(실행 중이면 대기). GitHub 예약 실행은 몇 시간씩 밀리므로 끝날 때 다음 실행을 직접 띄움(이어 달리기)
   workflow_dispatch: {}
 
 concurrency:
@@ -11,6 +11,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   run:
@@ -76,3 +77,13 @@ jobs:
           git add -A
           git commit -qm "state $(date -u +%FT%TZ)" || exit 0
           git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" state
+
+      - name: 다음 실행 이어 붙이기(예약 실행이 늦거나 안 돌 때 대비)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 이미 대기 중이거나 실행 중인 다른 JP_ALL 실행이 있으면 건너뜀(중복 방지)
+          n=$(gh run list -R "${{ github.repository }}" --workflow jpall.yml --limit 20 --json status,databaseId \
+               -q '[.[] | select((.status=="queued" or .status=="in_progress" or .status=="pending" or .status=="waiting") and .databaseId != ${{ github.run_id }})] | length')
+          if [ "${n:-0}" = "0" ]; then gh workflow run jpall.yml -R "${{ github.repository }}" --ref main && echo "다음 실행 요청"; else echo "다른 실행 $n개 있음 → 건너뜀"; fi
