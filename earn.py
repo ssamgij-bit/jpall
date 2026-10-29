@@ -914,22 +914,15 @@ def analyze_code(code):
     if "name" not in row: row["name"] = jp
     return a, row
 
-ASK_CAP = int(os.environ.get("ASK_CAP", "10"))     # 주인 외 사용자 1인당 하루 요청 분석 한도(AI 사용량 보호)
-WATCH_CAP = int(os.environ.get("WATCH_CAP", "20"))  # 1인당 하루 관심 종목 실적 알림 한도
 WATCH_MAX = 50                                       # 1인당 관심 종목 수
 HELP_TXT = ("일본 실적 스크리닝 봇 사용법\n"
             "• 종목 코드(예: 6857)나 이름(예: 어드반테스트, 화낙)을 보내면 최근 분기 실적 카드를 이 대화로 보내드립니다.\n"
             "• /add 6857 7203 — 관심 종목 등록: 결산단신이 나오면 스크리닝 통과 여부와 상관없이 카드를 이 대화로 보내드립니다.\n"
             "• /del 6857 — 관심 종목 삭제 · /list — 내 관심 종목 보기\n"
+            f"• 관심 종목은 1인당 최대 {WATCH_MAX}개입니다.\n"
             "• 카드의 📄 리포트·🗣 IR·Q&A 버튼으로 상세 자료도 받을 수 있습니다.\n"
-            f"하루 요청 {ASK_CAP}건·관심 종목 알림 {WATCH_CAP}건까지(무료 AI 한도 공유). 스크리닝 통과 종목은 채널에 그대로 올라갑니다.")
+            "스크리닝 기준을 통과한 종목은 지금처럼 채널에 올라갑니다.")
 
-def take_quota(st, uid, kind):
-    q = st.setdefault("quota", {}); d = now().strftime("%Y%m%d")
-    if q.get("d") != d: q.clear(); q["d"] = d
-    k = f"{kind}:{uid}"; cap = ASK_CAP if kind == "ask" else WATCH_CAP
-    if q.get(k, 0) >= cap: return False
-    q[k] = q.get(k, 0) + 1; return True
 
 def user_cmd(st, chat, text):
     """개인 대화 명령: /add /del /list (사용자마다 관심 종목 따로 보관)"""
@@ -968,7 +961,6 @@ def notify_watchers(st, rows):
             key = f"{uid}:{r['id']}"
             if key in sent: continue
             sent[key] = r["d"]
-            if not take_quota(st, uid, "watch"): continue
             st.setdefault("ask_q", []).append({"code": r["code"], "chat": int(uid) if uid.lstrip("-").isdigit() else uid, "ts": time.time(), "watch": True})
     if len(sent) > 5000:
         for k in sorted(sent, key=sent.get)[:1000]: sent.pop(k)
@@ -983,8 +975,6 @@ def handle_text(st, chat, text):
         if user_cmd(st, chat, text): return
     if text.startswith("/start") or text.startswith("/help"):
         tg("sendMessage", {"chat_id": chat["id"], "text": HELP_TXT}); return
-    if chat.get("type") == "private" and chat["id"] != st.get("owner") and not take_quota(st, chat["id"], "ask"):
-        tg("sendMessage", {"chat_id": chat["id"], "text": f"오늘 요청 한도({ASK_CAP}건)를 다 썼습니다. 내일 다시 보내 주세요."}); return
     try:
         code, cands = resolve(text)
     except Exception as e:
@@ -1140,6 +1130,24 @@ def main():
                 if is_tanshin(r): st.setdefault("seen", {})[r["id"]] = d
         st["init"] = now().isoformat(); save(st)
         tg("sendMessage", {"chat_id": CHANNEL, "text": "실적 스크리닝 봇이 연결됐습니다. 이제부터 올라오는 결산단신을 판별해 기준을 통과한 종목만 카드로 보냅니다."})
+    if not st.get("guide_v1") and not DRY:  # 채널 고정 공지: 봇 아이디 + 사용법(한 번)
+        try:
+            me = (tg("getMe").get("result") or {}).get("username", "")
+            txt = ("📌 <b>실적 스크리닝 채널 사용법</b>\n\n"
+                   "이 채널에는 일본 상장사 결산단신 중 스크리닝 기준(매출 성장·이익 성장·성장 가속·턴어라운드, 시총 300억 엔 이상)을 통과한 종목 카드가 자동으로 올라옵니다.\n\n"
+                   f"<b>내 종목만 따로 받기</b> — 봇 @{me} 과 1:1 대화를 열고(채널 구독자는 채널에 글을 쓸 수 없습니다)\n"
+                   "• 종목 코드나 이름 보내기(예: 6857, 어드반테스트) → 최근 분기 실적 카드를 개인 대화로\n"
+                   "• /add 6857 7203 → 관심 종목 등록. 결산단신이 나오면 스크리닝 통과 여부와 상관없이 개인 대화로 카드 발송(1인당 최대 50종목)\n"
+                   "• /del 6857 삭제 · /list 목록 · /start 사용법\n\n"
+                   "카드의 📄 리포트(사업부·지역별 상세 분석), 🗣 IR·Q&A(설명회 질의응답 요약) 버튼은 누구나 누를 수 있습니다.\n"
+                   "<i>투자 자문이 아닌 공시 정리입니다.</i>")
+            r = tg("sendMessage", {"chat_id": CHANNEL, "text": txt, "parse_mode": "HTML", "disable_web_page_preview": True})
+            mid = (r.get("result") or {}).get("message_id")
+            if mid:
+                tg("pinChatMessage", {"chat_id": CHANNEL, "message_id": mid, "disable_notification": True})
+                st["guide_v1"] = mid; save(st); log("guide posted", me)
+        except Exception:
+            traceback.print_exc()
     if not st.get("kb_v2") and not DRY:  # 기존 카드의 🗑 삭제 버튼 없애기(한 번)
         for cid, c in list(st.get("cards", {}).items()):
             if c.get("msg") and not c.get("deleted"):
