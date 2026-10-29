@@ -29,6 +29,7 @@ IR_PROMPT = """첨부 PDF는 일본 상장사 {name}({code})의 이번 결산 �
  "qa_source": "질의응답 출처 자료 이름(없으면 빈 문자열)"}}
 """
 
+SLOW = {}  # 모델 → 다시 시도할 시각(응답 지연·과부하일 때)
 def gemini_pdfs(prompt, pdfs):
     key = os.environ.get("GEMINI_API_KEY")
     if not key or not pdfs: return None
@@ -36,6 +37,7 @@ def gemini_pdfs(prompt, pdfs):
     body = json.dumps({"contents": [{"parts": parts}],
                        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 12000, "responseMimeType": "application/json"}}).encode()
     for model in GEMINI_MODELS + GEMINI_MODELS:  # 구글 서버가 붐비면(503) 한 바퀴 더
+        if SLOW.get(model, 0) > time.time(): continue  # 방금 응답 없던 모델은 잠시 건너뜀
         try:
             r = json.loads(http(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}",
                                 timeout=240, data=body, headers={"content-type": "application/json"}))
@@ -45,6 +47,7 @@ def gemini_pdfs(prompt, pdfs):
             return out
         except Exception as e:
             E.log("gemini ir error", model, str(e)[:150])
+            if "timed out" in str(e) or "503" in str(e): SLOW[model] = time.time() + 1200  # 응답 지연·과부하 → 20분간 건너뜀
             if "429" in str(e) or "503" in str(e) or "timed out" in str(e): time.sleep(8)
     return None
 
