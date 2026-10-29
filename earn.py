@@ -925,6 +925,30 @@ HELP_TXT = ("일본 실적 스크리닝 봇 사용법\n"
             "스크리닝 기준을 통과한 종목은 지금처럼 채널에 올라갑니다.")
 
 
+GUIDE_VER = 2  # 공지 문구를 바꾸면 올림 → 고정 공지를 새 내용으로 수정
+def guide_text(me):
+    R = RULES
+    sec = ", ".join(sorted(dict.fromkeys(SECTOR_KO.get(x, x) for x in EXCL_SECTORS)))
+    return ("📌 <b>실적 스크리닝 채널 사용법</b>\n\n"
+            "일본 상장사 결산단신이 나오면 아래 규칙으로 자동 판별해, 통과한 종목만 카드로 이 채널에 올립니다.\n\n"
+            "<b>스크리닝 규칙</b>(분기 3개월 단독 실적, 전년 동기 대비)\n"
+            "아래 중 하나라도 충족하면 통과\n"
+            f"• 매출·이익 성장: 매출 YoY ≥{R['R1_rev_yoy']:.0f}% 그리고 영업이익 YoY ≥{R['R2_op_yoy']:.0f}%(흑자)\n"
+            f"• 매출 고성장: 이익과 상관없이 매출 YoY ≥{R['R5_rev_only_yoy']:.0f}%\n"
+            f"• 성장 가속: 매출·영업이익 YoY 모두 플러스이고, 둘 중 하나가 직전 분기보다 +{R['R3_accel_pp']:.0f}%p 이상\n"
+            f"• 턴어라운드: 영업적자→흑자 전환, 또는 2개 분기 연속 감익 뒤 영업이익 YoY ≥{R['R4_turn_yoy']:.0f}%\n"
+            "단, 아래에 해당하면 제외\n"
+            "• 매출·영업이익 증가율이 직전 분기보다 둘 다 낮아짐\n"
+            "• 매출이 2개 분기 연속 전년 대비 감소\n"
+            f"• 시가총액 {R['X5_min_cap_oku']:,.0f}억 엔 미만\n"
+            f"• 업종: {sec}\n\n"
+            f"<b>내 종목만 따로 받기</b> — 봇 @{me} 과 1:1 대화를 열고(채널 구독자는 채널에 글을 쓸 수 없습니다)\n"
+            "• 종목 코드나 이름 보내기(예: 6857, 어드반테스트) → 최근 분기 실적 카드를 개인 대화로(규칙 통과 여부 표시)\n"
+            "• /add 6857 7203 → 관심 종목 등록. 결산단신이 나오면 규칙 통과 여부와 상관없이 개인 대화로 카드 발송\n"
+            "• /del 6857 삭제 · /list 목록 · /start 사용법\n\n"
+            "카드의 📄 리포트(사업부·지역별 상세 분석, note·야후 게시판·증권사 레이팅 등 시장 반응), 🗣 IR·Q&A(설명회 질의응답 요약) 버튼은 누구나 누를 수 있습니다.\n"
+            "<i>투자 자문이 아닌 공시 정리입니다.</i>")
+
 def user_cmd(st, chat, text):
     """개인 대화 명령: /add /del /list (사용자마다 관심 종목 따로 보관)"""
     m = re.match(r"^/(add|del|list|추가|삭제|목록)\b(.*)$", text.strip(), re.I)
@@ -1131,22 +1155,18 @@ def main():
                 if is_tanshin(r): st.setdefault("seen", {})[r["id"]] = d
         st["init"] = now().isoformat(); save(st)
         tg("sendMessage", {"chat_id": CHANNEL, "text": "실적 스크리닝 봇이 연결됐습니다. 이제부터 올라오는 결산단신을 판별해 기준을 통과한 종목만 카드로 보냅니다."})
-    if not st.get("guide_v1") and not DRY:  # 채널 고정 공지: 봇 아이디 + 사용법(한 번)
+    if st.get("guide_ver") != GUIDE_VER and not DRY:  # 채널 고정 공지(봇 아이디·사용법·스크리닝 규칙): 처음엔 올리고 고정, 내용이 바뀌면 수정
         try:
             me = (tg("getMe").get("result") or {}).get("username", "")
-            txt = ("📌 <b>실적 스크리닝 채널 사용법</b>\n\n"
-                   "이 채널에는 일본 상장사 결산단신 중 스크리닝 기준(매출·이익 성장, 매출 고성장, 성장 가속, 턴어라운드, 시총 300억 엔 이상)을 통과한 종목 카드가 자동으로 올라옵니다.\n\n"
-                   f"<b>내 종목만 따로 받기</b> — 봇 @{me} 과 1:1 대화를 열고(채널 구독자는 채널에 글을 쓸 수 없습니다)\n"
-                   "• 종목 코드나 이름 보내기(예: 6857, 어드반테스트) → 최근 분기 실적 카드를 개인 대화로\n"
-                   "• /add 6857 7203 → 관심 종목 등록. 결산단신이 나오면 스크리닝 통과 여부와 상관없이 개인 대화로 카드 발송\n"
-                   "• /del 6857 삭제 · /list 목록 · /start 사용법\n\n"
-                   "카드의 📄 리포트(사업부·지역별 상세 분석, note·야후 게시판·증권사 레이팅 등 시장 반응), 🗣 IR·Q&A(설명회 질의응답 요약) 버튼은 누구나 누를 수 있습니다.\n"
-                   "<i>투자 자문이 아닌 공시 정리입니다.</i>")
-            r = tg("sendMessage", {"chat_id": CHANNEL, "text": txt, "parse_mode": "HTML", "disable_web_page_preview": True})
-            mid = (r.get("result") or {}).get("message_id")
+            txt = guide_text(me)
+            mid = st.get("guide_v1")
+            r = tg("editMessageText", {"chat_id": CHANNEL, "message_id": mid, "text": txt, "parse_mode": "HTML", "disable_web_page_preview": True}) if mid else {}
+            if not r.get("ok") and "not modified" not in str(r.get("description", "")):
+                r = tg("sendMessage", {"chat_id": CHANNEL, "text": txt, "parse_mode": "HTML", "disable_web_page_preview": True})
+                mid = (r.get("result") or {}).get("message_id")
+                if mid: tg("pinChatMessage", {"chat_id": CHANNEL, "message_id": mid, "disable_notification": True})
             if mid:
-                tg("pinChatMessage", {"chat_id": CHANNEL, "message_id": mid, "disable_notification": True})
-                st["guide_v1"] = mid; save(st); log("guide posted", me)
+                st["guide_v1"] = mid; st["guide_ver"] = GUIDE_VER; save(st); log("guide posted/updated", me)
         except Exception:
             traceback.print_exc()
     if not st.get("kb_v2") and not DRY:  # 기존 카드의 🗑 삭제 버튼 없애기(한 번)
