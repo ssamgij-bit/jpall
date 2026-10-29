@@ -703,6 +703,60 @@ def body_buyback(row):
     if per: s += f"\n기간 : {per[0]}.{int(per[1]):02d}.{int(per[2]):02d}~{per[3]}.{int(per[4]):02d}.{int(per[5]):02d}"
     return s
 
+def body_tostnet(row):
+    """ToSTNeT-3(장 시작 전 8:45 시간외 거래)로 자사주를 사는 공시: 매수 가격·주식 수·금액·비율, 근거가 된 자사주 취득 결의"""
+    t = re.sub(r"\s+", "", pdf_text(row["pdf"]))
+    p = re.search(r"終値[^0-9]{0,20}([\d,]+(?:\.\d+)?)円", t)
+    n = re.search(r"(?:取得し得る|取得予定|買付け?予定)株式(?:の)?総?数[^0-9]{0,6}([\d,.]+)(万|千)?株", t)
+    when = re.search(DATE + r"午前(\d{1,2})時(\d{1,2})分", t)
+    if not (p and n): return None
+    price = float(p.group(1).replace(",", ""))
+    sh = float(n.group(1).replace(",", "")) * {"万": 1e4, "千": 1e3, None: 1}[n.group(2)]
+    lines = ["<b>[자사주 매입 · ToSTNeT-3(장 시작 전 시간외 거래)]</b>",
+             f"매수 : {sh:,.0f}주 × {price:,.1f}엔(공시일 종가) = 약 {oku(price * sh)}엔"]
+    ref = t[t.find("参考"):] if "参考" in t else ""
+    rn = re.search(r"株式の総数([\d,.]+)(万|千)?株", ref); rr = re.search(r"割合([\d.]+)%", ref); ra = re.search(r"総額([\d,.]+)(百万|千|億)?円", ref)
+    ratio = None
+    if rn and rr:
+        tot = float(rn.group(1).replace(",", "")) * {"万": 1e4, "千": 1e3, None: 1}[rn.group(2)]
+        if tot: ratio = sh / tot * float(rr.group(1)); lines[-1] += f" (자사주 제외 발행주식의 약 {ratio:.1f}%)"
+    if when: lines.append(f"매수일 : {when.group(1)}.{int(when.group(2)):02d}.{int(when.group(3)):02d} {int(when.group(4)):02d}:{int(when.group(5)):02d}")
+    if rn:
+        prog = f"근거 결의 : 최대 {tot:,.0f}주" + (f"(발행주식의 {rr.group(1)}%)" if rr else "")
+        if ra: prog += f" · {oku(float(ra.group(1).replace(',', '')) * {None: 1, '千': 1e3, '百万': 1e6, '億': 1e8}[ra.group(2)])}엔"
+        lines.append(prog)
+    if ra:
+        cap_yen = float(ra.group(1).replace(',', '')) * {None: 1, '千': 1e3, '百万': 1e6, '億': 1e8}[ra.group(2)]
+        if price * sh > cap_yen * 1.001: lines.append(f"※ 결의 금액 한도({oku(cap_yen)}엔) 안에서만 매수")
+    lines.append("※ 미리 나온 매도 물량(대주주·정책보유 해소 등)을 공시일 종가로 한 번에 사는 방식. 실제 매수량은 다음 날 결과 공시로 확정")
+    HL.update(kind="bb", ratio=round(ratio, 2) if ratio else None, yen=price * sh)
+    return "\n".join(lines)
+
+def body_cancel(row, q=None):
+    """자사주 소각: 소각 주식 수·발행주식 대비 비율·시가 환산 금액·소각일"""
+    t = re.sub(r"\s+", "", pdf_text(row["pdf"]))
+    k = t.find("消却する株式の"); t2 = t[k:] if k >= 0 else t
+    n = re.search(r"消却する株式の(?:総)?数[^0-9]{0,20}([\d,.]+)(万|千)?株", t2)
+    if not n:
+        m0 = re.search(r"消却する株式の(?:総)?数(.{0,100}?)(全株式|全数)", t2)
+        if m0:
+            d = re.search(r"消却(?:予定)?日[^0-9]{0,4}" + DATE, t2)
+            return "<b>[자사주 소각]</b>\n소각 : 이번에 취득하는 자사주 전부" + (" (일부는 제외 — 원문 확인)" if "除" in m0.group(1) else "") + (f"\n소각일 : {d.group(1)}.{int(d.group(2)):02d}.{int(d.group(3)):02d}" if d else "")
+        return None
+    sh = float(n.group(1).replace(",", "")) * {"万": 1e4, "千": 1e3, None: 1}[n.group(2)]
+    r = re.search(r"割合[^0-9]{0,4}([\d.]+)%", t2)
+    d = re.search(r"消却(?:予定)?日[^0-9]{0,4}" + DATE, t2)
+    after = re.search(r"消却後の(?:当社の)?発行済株式(?:の)?総数[^0-9]{0,12}([\d,]+)株", t2)
+    line = f"소각 : {sh:,.0f}주" + (f" (소각 전 발행주식의 {r.group(1)}%)" if r else "")
+    mc = (q or {}).get("marketCap")
+    if mc and r: line += f" · 현재 시가 약 {oku(mc * float(r.group(1)) / 100)}엔"
+    lines = ["<b>[자사주 소각]</b>", line]
+    if d: lines.append(f"소각일 : {d.group(1)}.{int(d.group(2)):02d}.{int(d.group(3)):02d}")
+    if after: lines.append(f"소각 후 발행주식 : {after.group(1)}주")
+    if re.search(r"保有する自己株式の(全部|全て|すべて)", t): lines.append("※ 보유 자사주 전부 소각")
+    if re.search(r"株式併合|承認可決されることを条件", t): lines.append("※ 조건부(주주총회 승인·주식병합 등) — 원문 확인")
+    return "\n".join(lines)
+
 def body_tob(row):
     t = re.sub(r"\s+", "", pdf_text(row["pdf"]))
     p = re.search(r"1株につき、?金?([\d,]+)円", t) or re.search(r"買付け?等の価格.{0,40}?金([\d,]+)円", t)
@@ -1091,6 +1145,46 @@ def body_monthly(row, st):
     HL.update(kind="mon", mon=line + trend + (" ⚠원문 확인" if r.get("src") == "mismatch" else ""))
     return s
 
+# ───────────────────────── 공시 메시지 보강: 회사 한 줄 소개 · 사유 ─────────────────────────
+def biz_line(st, code):
+    """카부탄 '개요'(회사 한 줄 소개) → 한국어. 30일 캐시"""
+    pc = st.setdefault("prof", {})
+    c = pc.get(code)
+    if c and time.time() - c[0] < 30 * 86400: return c[1]
+    ko = ""
+    try:
+        h = http(f"https://kabutan.jp/stock/?code={code}", timeout=20).decode("utf-8", "ignore")
+        m = re.search(r"<th[^>]*>概要</th>\s*<td[^>]*>(.*?)</td>", h, re.S)
+        jp = nfkc(re.sub(r"<[^>]+>", "", m.group(1))).strip() if m else ""
+        if jp: ko = (translate(st, [jp]).get(jp) or "").strip()
+    except Exception as e:
+        log("biz error", code, e)
+    if ko or not c: pc[code] = [time.time(), ko]
+    if len(pc) > 3000:
+        for k in sorted(pc, key=lambda k: pc[k][0])[:500]: pc.pop(k, None)
+    return ko or (c[1] if c else "")
+
+WHY_PROMPT = """아래는 일본 기업 적시공시 원문(일본어)에서 이유·설명 부분을 잘라낸 글이다. 공시 종류: {kind}. 공시 제목: {title}
+투자자가 "왜 이렇게 됐나"를 바로 알 수 있게 한국어로 1~2문장(합계 120자 이내)으로 요약하라.
+- 원문에 적힌 사유만 쓴다. 추측·일반론 금지. 사유가 없으면 빈 문자열.
+- 무엇이 얼마나 좋아/나빠졌는지(사업·제품·지역·수요 요인), 일회성 요인(특별손익·환율·세금)이 있으면 그것도.
+- 배당·자사주 변경이 함께 있으면 그 이유도 짧게.
+- 일본어 고유명사는 한글로, 일본어 문자는 쓰지 않는다.
+출력 JSON만: {{"why": "..."}}
+
+원문:
+{src}"""
+WHY_KIND = {"res": "결산 실적", "rev": "실적 전망 수정", "div": "배당 전망 수정", "bb": "자사주 취득", "tob": "공개매수", "evt": "정책·구조 변화"}
+def why_line(st, row, kind, src):
+    if not src: return ""
+    out = gemini_json(WHY_PROMPT.format(kind=WHY_KIND.get(kind, kind), title=row["title"], src=src[:3000]), timeout=60, models=MON_MODELS)
+    w = str((out or {}).get("why") or "").strip()
+    if w and not re.search(r"[\u3040-\u30ff]", w): return w
+    sents = re.findall(r"[^。]{15,200}。", src.split(" [今後の見通し] ")[0])  # AI 실패: 사유가 담긴 첫 문장 번역
+    pick = [z for z in sents if re.search(r"増収|減収|増益|減益|上回|下回|増加|減少|伸長|好調|低調|不振|寄与|影響|ため|により", z) and "経済" not in z]
+    z = (pick or sents or [""])[0]
+    return (translate(st, [z]).get(z) or "") if z else ""
+
 def build(row, st, names, quotes, trmap):
     code = row["code"]; n = names.get(code)
     name_ko = n["ko"] if n else jp2ko(row["name"])
@@ -1111,20 +1205,37 @@ def build(row, st, names, quotes, trmap):
             elif "予想" in title or "修正" in title: body = body_revision(row) or body_dividend(row)
         elif re.search(r"自己株式(の)?取得に係る事項の決定|自己株式取得に係る事項の決定|自己株式の取得及び", title):
             body = body_buyback(row)
+        elif "ToSTNeT" in title and re.search(r"買付", title) and not re.search(r"結果|終了", title):
+            body = body_tostnet(row)
         elif re.search(r"公開買付けの開始|公開買付けに関する意見表明|MBO", title) and not re.match(r"[(（](訂正|変更|経過開示)", title):
             body = body_tob(row)
         elif re.search(MON_RE, title) and "訂正" not in title:
             body = body_monthly(row, st)
         elif re.search(r"業績予想|業績見通し|予想(値)?の修正|業績予想の修正", title) and not re.search(r"訂正|配当予想(の修正)?に関する", title):
             body = body_forecast_pdf(row, st)
+        if "消却" in title and not re.search(r"完了|結果|訂正|方針", title.replace("消却方針の変更", "")):
+            c = body_cancel(row, quotes.get(code))
+            if c: body = f"{body}\n\n{c}" if body else c
     except Exception as e:
         log("body error", code, title[:30], e)
+    biz = why = ""
+    try: biz = biz_line(st, code)
+    except Exception as e: log("biz error", code, e)
+    kind = HL.get("kind") or (None if body else next(("evt" for pat, _ in EVT_RULES if re.search(pat, title)), None))
+    if kind in WHY_KIND and not re.match(r"[(（](訂正|変更)", title):
+        try:
+            HL["src"] = reason_src(row, kind)
+            why = why_line(st, row, kind, HL["src"])
+        except Exception as e:
+            log("why error", code, e)
     try:
         record_hl(row, st, name_ko, quotes.get(code), trmap.get(title) or title)
     except Exception as e:
         log("highlight error", code, e)
+    if biz: head.insert(len(head) - 1, f"사업: {esc(biz)}")
     msg = "\n".join(head)
     if body: msg += "\n\n" + body
+    if why: msg += f"\n\n<b>사유</b> : {esc(why)}"
     msg += f"\n\n공시링크: {row['pdf']}"
     if "決算短信" in title:  # 같은 날 올라온 결산 설명·보충 자료 링크(따로 보내지 않음)
         mat = next((x["pdf"] for x in st.get("queue", []) if x["code"] == code and x["d"] == d and MAT_RE.search(nfkc(x["title"])) and "決算短信" not in x["title"]), None)
@@ -1253,7 +1364,7 @@ def record_hl(row, st, name_ko, q, title_ko):
         items.insert(0, ("watch", title_ko, 0))
     if not items: return
     src = ""
-    try: src = h["mon"] if h.get("mon") else reason_src(row, h.get("kind"))
+    try: src = h["mon"] if h.get("mon") else (h.get("src") if "src" in h else reason_src(row, h.get("kind")))
     except Exception as e: log("reason src error", row["code"], e)
     hl = st.setdefault("hl", [])
     have = {(x["id"], x["sec"]) for x in hl}
