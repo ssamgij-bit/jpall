@@ -4,3 +4,5 @@ lxml
 pdfminer.six
 pykakasi
 yfinance
+matplotlib
+koreanize-matplotlib

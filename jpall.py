@@ -445,6 +445,10 @@ def body_results(row, st):
         if lines[-1]: lines.append("")
         lines.append("<b>최근 분기 실적 추이</b> (매출/ 영업익/ 순이익)")
         lines += hist
+    try:
+        HL["chart"] = res_chart(row, kq, single, end)
+    except Exception as e:
+        log("res chart error", row.get("code"), e)
     return "\n".join(lines)
 
 def body_revision(row):
@@ -467,6 +471,179 @@ def body_revision(row):
         lines.append(f"{lab} : {oku(a)} → {oku(b)}" + (f" ({c})" if c else ""))
     a, b = r["rows"]["eps"]
     if b is not None: lines.append(f"EPS : {a if a is not None else '—'}엔 → {b:,.2f}엔")
+    try:
+        items = [{"label": lab, "unit": "백만엔", "prev": (r["rows"][m][0] / 1e6 if r["rows"][m][0] is not None else None),
+                  "new": r["rows"][m][1] / 1e6, "new_hi": None, "last": None}
+                 for m, lab in [("rev", "매출액"), ("op", "영업이익"), ("ord", "경상이익"), ("ni", "순이익")] if r["rows"][m][1] is not None]
+        HL["chart"] = fc_chart(row, items, f"실적 전망 수정 · {fy} {per} · {r['scope']}")
+    except Exception as e:
+        log("rev chart error", row.get("code"), e)
+    return "\n".join(lines)
+
+# ───────────────────────── 차트(텔레그램 이미지) ─────────────────────────
+CH = dict(INK="#0b0b0b", INK2="#52514e", MUT="#8a8983", GRID="#e6e5e0", SURF="#fcfcfb", BAR="#7d8b99", HI="#2a78d6", ALT="#eb6834", LIGHT="#c3cbd3")
+def _plt():
+    import matplotlib; matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    try:
+        import koreanize_matplotlib  # noqa: F401  (한글 글꼴)
+    except Exception:
+        pass
+    return plt
+def _fmt_k():
+    import matplotlib.ticker as tk
+    return tk.FuncFormatter(lambda v, _: f"{v:,.0f}" if abs(v) >= 10 or v == 0 else f"{v:,.1f}")
+def _ax_style(ax):
+    ax.set_facecolor(CH["SURF"]); ax.grid(axis="y", color=CH["GRID"], lw=0.7, zorder=0)
+    for sp in ax.spines.values(): sp.set_visible(False)
+    ax.tick_params(length=0, colors=CH["MUT"], labelsize=8)
+def _save(fig, row, tag):
+    path = os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), f"{tag}_{row.get('code')}_{row.get('d')}_{abs(hash(row.get('pdf', ''))) % 10**6}.png")
+    fig.savefig(path, facecolor=CH["SURF"]); _plt().close(fig)
+    return path
+def _title(fig, row, sub):
+    fig.suptitle(f"{row.get('_name') or row.get('code')}({row.get('code')}) {sub}", x=0.02, ha="left", fontsize=11, fontweight="bold", color=CH["INK"])
+
+def fc_chart(row, items, head):
+    """실적 전망(신규·수정): 항목별 작은 막대 — 전기 실적 / 이전 예상 / 이번 예상(범위면 위아래 표시)"""
+    its = [i for i in items if i.get("new") is not None][:6]
+    if not its: return None
+    plt = _plt()
+    n = len(its); cols = min(n, 3); rows_ = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows_, cols, figsize=(3.0 * cols + 0.4, 2.7 * rows_ + 0.5), dpi=150, squeeze=False)
+    fig.patch.set_facecolor(CH["SURF"])
+    for ax in axes.flat[n:]: ax.set_visible(False)
+    for ax, it in zip(axes.flat, its):
+        _ax_style(ax)
+        ax.yaxis.set_major_formatter(_fmt_k())
+        unit = it.get("unit") or ""
+        conv = (lambda v: v / 100) if unit == "백만엔" else (lambda v: v)  # 백만엔 → 억엔
+        ul = "억엔" if unit == "백만엔" else unit
+        bars = [("전기 실적", it.get("last"), CH["LIGHT"]), ("이전 예상", it.get("prev"), CH["BAR"]), ("이번 예상", it.get("new"), CH["HI"])]
+        bars = [(l, conv(v), c) for l, v, c in bars if v is not None]
+        xs = list(range(len(bars)))
+        ax.bar(xs, [b[1] for b in bars], color=[b[2] for b in bars], width=0.6, zorder=3)
+        hi = it.get("new_hi")
+        if hi is not None:  # 범위 예상: 하단~상단을 선으로
+            ax.plot([xs[-1], xs[-1]], [conv(it["new"]), conv(hi)], color=CH["INK"], lw=2, zorder=4)
+        nf = lambda v: f"{v:,.0f}" if abs(v) >= 100 else f"{v:,.1f}"
+        for x, (l, v, c) in zip(xs, bars):
+            txt = nf(v) + (f"~{nf(conv(hi))}" if (hi is not None and l == "이번 예상") else "")
+            ax.text(x, max(v, conv(hi)) if (hi is not None and l == "이번 예상") else v, txt, ha="center", va="bottom" if v >= 0 else "top", fontsize=8, color=CH["INK2"], zorder=5)
+        ax.set_xticks(xs); ax.set_xticklabels([b[0] for b in bars], fontsize=8, color=CH["INK2"])
+        base = it.get("prev") if it.get("prev") is not None else it.get("last")
+        it = dict(it, new=(it["new"] + hi) / 2 if hi is not None else it["new"])  # 범위 예상은 중간값으로 변화율
+        ch = f" ({pct(it['new'], base):+.1f}%)" if base and unit != "%" and pct(it["new"], base) is not None else (f" ({it['new'] - base:+.1f}%p)" if base is not None and unit == "%" else "")
+        ax.set_title(f"{it.get('label', '')} ({ul}){ch}", loc="left", fontsize=9, color=CH["INK2"])
+        lo = min(0, *[b[1] for b in bars]); top = max([b[1] for b in bars] + [conv(hi)] if hi is not None else [b[1] for b in bars])
+        ax.set_ylim(lo * 1.15, top * 1.18 if top > 0 else 1)
+    _title(fig, row, head)
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    return _save(fig, row, "fc")
+
+def res_chart(row, kq, single, end, ordlab="경상익"):
+    """결산단신: 최근 분기 단독 매출·영업익 추이(이번 분기 강조)"""
+    qs = [(k[0], k[1], k[2], k[3]) for k in kq if k[1] < end.replace(day=1) and k[2] is not None][-7:]
+    if single and single.get("rev") is not None:
+        qs.append((None, end, single["rev"] / 1e6, (single.get("op") / 1e6) if single.get("op") is not None else None))
+    if len(qs) < 3: return None
+    plt = _plt()
+    fig, axes = plt.subplots(2, 1, figsize=(8, 5.2), dpi=150, sharex=True)
+    fig.patch.set_facecolor(CH["SURF"])
+    xs = list(range(len(qs))); labs = [f"{str(q[1].year)[2:]}.{q[1].month:02d}" for q in qs]
+    for ax, idx, lab in ((axes[0], 2, "분기 매출(억엔)"), (axes[1], 3, "분기 영업이익(억엔)")):
+        _ax_style(ax)
+        vals = [(q[idx] / 100 if q[idx] is not None else None) for q in qs]
+        cols = [CH["HI"] if (i == len(qs) - 1 and single) else CH["BAR"] for i in xs]
+        ax.bar([x for x, v in zip(xs, vals) if v is not None], [v for v in vals if v is not None],
+               color=[c for c, v in zip(cols, vals) if v is not None], width=0.62, zorder=3)
+        for x, v in zip(xs, vals):
+            if v is None: continue
+            yoy = ""
+            if x >= 4 and vals[x - 4] not in (None, 0) and vals[x - 4] > 0 and (qs[x][1].year - qs[x - 4][1].year == 1):
+                yoy = f"\n{(v / vals[x - 4] - 1) * 100:+.0f}%"
+            ax.text(x, v, f"{v:,.0f}" + yoy, ha="center", va="bottom" if v >= 0 else "top", fontsize=7.5, color=CH["INK2"], linespacing=1.0)
+        ax.axhline(0, color=CH["INK2"], lw=0.6)
+        top = max([v for v in vals if v is not None] + [0]); ax.set_ylim(min([v for v in vals if v is not None] + [0]) * 1.2, top * 1.3 if top > 0 else 1)
+        ax.set_title(lab + " · 숫자 아래 %는 전년 동기 대비", loc="left", fontsize=9, color=CH["INK2"])
+        ax.yaxis.set_major_formatter(_fmt_k())
+    axes[1].set_xticks(xs); axes[1].set_xticklabels(labs, fontsize=8, color=CH["INK2"])
+    _title(fig, row, "분기 실적 추이" + (" (파란 막대 = 이번 분기)" if single else ""))
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    return _save(fig, row, "res")
+
+FC_PROMPT = """너는 일본 주식 애널리스트다. 아래는 '실적 예상(업적 예상) 발표·수정' 적시공시 원문이다(표 모양 유지 텍스트). 공시일: {date}
+
+할 일: 표의 수치를 뽑아라.
+- kind: "수정"(이전 예상 A가 있고 바뀜) 또는 "신규"(처음 발표·범위 발표).
+- period: 대상 기간을 한국어로(예: "FY3/27 연간", "FY12/26 연간", "FY3/27 상반기 누적"). 회계연도 표기는 FY결산월/연도2자리.
+- scope: "연결" 또는 "개별". basis: Non-GAAP·IFRS 등 기준이 표에 명시되면 짧게, 아니면 "".
+- items: 표의 열(지표)마다 하나. label은 한국어(매출액·영업이익·경상이익·순이익(지배주주)·EPS·EBITDA·매출총이익률·영업이익률 등).
+  key: rev(매출)/op(영업이익)/ord(경상·세전이익)/ni(순이익)/eps/null.
+  unit: 금액은 "백만엔"(천엔·억엔이면 백만엔으로 환산), 비율은 "%", 주당 금액은 "엔".
+  prev = 이전 예상(A), new = 이번 예상(B, 범위면 하단), new_hi = 범위 상단(없으면 null), last = 참고 전기 실적. 없거나 "－"면 null. 숫자만(쉼표·부호 문자 제거, 마이너스는 음수).
+- reason: 수정·발표 사유를 한국어 한 문장(80자 이내, 원문에 있는 내용만, 고유명사 한글). 없으면 "".
+- 여러 기간 표가 있으면 연간(통기) 표를 우선.
+- 실적 예상 수치가 없는 공시면 ok=false.
+출력 JSON만: {{"ok": true, "kind": "수정", "period": "FY3/27 연간", "scope": "연결", "basis": "", "items": [{{"label": "매출액", "key": "rev", "unit": "백만엔", "prev": 1030000, "new": 1060000, "new_hi": null, "last": 982804}}], "reason": "..."}}
+
+원문:
+{text}
+"""
+def _num(v):
+    try: return float(str(v).replace(",", ""))
+    except (TypeError, ValueError): return None
+def body_forecast_pdf(row, st):
+    """XBRL이 없는 실적 예상 발표·수정 공시: 원문 표를 AI로 읽어 숫자 + 차트"""
+    raw = pdf_layout(row["pdf"], pages=2)
+    if len(re.findall(r"\d", raw)) < 10: return None
+    cap = st.setdefault("mon_ai", {"d": row["d"], "n": 0})
+    if cap.get("d") != row["d"]: cap.update(d=row["d"], n=0)
+    if not os.environ.get("GEMINI_API_KEY") or cap["n"] >= MON_AI_CAP: return None
+    cap["n"] += 1
+    t = re.sub(r"[ \u3000]{3,}", "   ", raw); t = re.sub(r"\n\s*\n+", "\n", t)
+    j = gemini_json(FC_PROMPT.format(date=f"{row['d'][:4]}-{row['d'][4:6]}-{row['d'][6:]}", text=t[:7000]), timeout=90, models=MON_MODELS)
+    if not (j and j.get("ok") and j.get("items")): return None
+    items = []
+    for it in j["items"][:8]:
+        d = {k: _num(it.get(k)) for k in ("prev", "new", "new_hi", "last")}
+        if d["new"] is None and d["prev"] is None: continue
+        d.update(label=str(it.get("label") or "")[:14], key=it.get("key"), unit=str(it.get("unit") or "")[:4])
+        items.append(d)
+    if not items: return None
+    kind = "수정" if j.get("kind") == "수정" else "발표"
+    head = f"실적 전망 {kind} · {j.get('period') or ''}".strip() + (f" · {j.get('scope')}" if j.get("scope") else "") + (f" · {j['basis']}" if j.get("basis") else "")
+    def fmt(v, u, hi=None):
+        if v is None: return "—"
+        if u == "백만엔": s_ = oku(v * 1e6) + ("~" + oku(hi * 1e6) if hi is not None else "")
+        elif u == "%": s_ = f"{v:.1f}%" + (f"~{hi:.1f}%" if hi is not None else "")
+        else: s_ = f"{v:,.2f}엔" + (f"~{hi:,.2f}엔" if hi is not None else "")
+        return s_
+    lines = [f"<b>[{esc(head)}]</b>"]
+    rows_hl = {}
+    for it in items:
+        u = it["unit"]
+        if it["prev"] is not None and it["new"] is not None:
+            c = (f"{it['new'] - it['prev']:+.1f}%p" if u == "%" else (f"{pct(it['new'], it['prev']):+.1f}%" if it["prev"] else ""))
+            ln = f"{esc(it['label'])} : {fmt(it['prev'], u)} → {fmt(it['new'], u, it['new_hi'])}" + (f" ({c})" if c else "")
+        else:
+            ln = f"{esc(it['label'])} : {fmt(it['new'], u, it['new_hi'])}"
+        if it["last"] is not None and it["new"] is not None:
+            mid = it["new"] if it["new_hi"] is None else (it["new"] + it["new_hi"]) / 2
+            c2 = f"{mid - it['last']:+.1f}%p" if u == "%" else (f"{pct(mid, it['last']):+.1f}%" if it["last"] > 0 else "")
+            ln += f" / 전기 {fmt(it['last'], u)}" + (f" 대비 {c2}" if c2 else "")
+        lines.append(ln)
+        if it.get("key") in ("rev", "op", "ord", "ni") and u == "백만엔" and it["new"] is not None:
+            rows_hl[it["key"]] = (it["prev"] * 1e6 if it["prev"] is not None else None, it["new"] * 1e6)
+    if j.get("reason"): lines.append(f"사유 : {esc(str(j['reason'])[:120])}")
+    lines.append("<i>※ 원문 표를 AI로 읽은 값 — 중요 수치는 원문 확인</i>")
+    if kind == "수정" and rows_hl:
+        for m in ("rev", "op", "ord", "ni", "eps"): rows_hl.setdefault(m, (None, None))
+        HL.update(kind="rev", fy=j.get("period") or "", per="", rows=rows_hl)
+    try:
+        HL["chart"] = fc_chart(row, items, head)
+    except Exception as e:
+        log("fc chart error", row.get("code"), e)
     return "\n".join(lines)
 
 def body_dividend(row):
@@ -720,8 +897,11 @@ MON_PROMPT = """너는 일본 소매·외식 기업 월차 공시를 읽는 애�
 - 사업이 여럿이면 회사 전체 합계, 합계가 없으면 가장 큰 주력 사업(국내 직영 등). metric은 지표 이름(보통 "매출", 발전량·수주 등이면 그 이름).
 - ym은 "YYYY-MM". 연도는 제목·공시일로 판단(예: 2026년 9월 공시의 4~9월 = 2026-04~2026-09, 회계연도가 해를 넘기면 주의).
 - cum: 회계연도 누계(累計·上期 등)가 있으면 {{"label":"상반기 누계" 같은 한국어, "all":.., "ex":..}}, 없으면 null.
+- amt: 그 달 매출 금액(전사 기준)이 표에 있으면 백만엔 단위 숫자로(천엔·억엔이면 환산), 없으면 null. 증감률을 금액으로 착각하지 말 것.
+- stores: 그 달 월말 점포수(직영 기준 합계, 표에 있으면), 없으면 null. 출점·퇴점 수가 아니라 월말 잔고.
+- prev: 표에 '前年' 열(작년 같은 달의 전년 동월 대비)이 있으면 그 값을 작년 달(ym에서 12개월 전)로 [{{"ym": "2025-09", "all": .., "ex": ..}}]. 이번 회계연도 표 아래 하반기 '前年' 값도 포함. 없으면 [].
 - 월차 매출 성격이 아니면(암호자산 보유 현황, 수치 없는 안내 등) ok=false.
-출력 JSON만: {{"ok": true, "metric": "매출", "scope": "국내 직영점 등 대상 한국어 짧게(없으면 빈 문자열)", "months": [{{"ym": "2026-09", "all": 11.8, "ex": 8.3, "cust": 6.0, "price": 2.2}}], "cum": null}}
+출력 JSON만: {{"ok": true, "metric": "매출", "scope": "국내 직영점 등 대상 한국어 짧게(없으면 빈 문자열)", "months": [{{"ym": "2026-09", "all": 11.8, "ex": 8.3, "cust": 6.0, "price": 2.2, "amt": null, "stores": 2140}}], "prev": [{{"ym": "2025-09", "all": 4.7, "ex": 1.8}}], "cum": null}}
 
 원문:
 {text}
@@ -731,6 +911,12 @@ def _f(v):
     try:
         v = float(v)
         return v if -100 < v < 1000 else None
+    except (TypeError, ValueError):
+        return None
+def _fp(v):
+    try:
+        v = float(str(v).replace(",", ""))
+        return v if 0 < v < 1e9 else None
     except (TypeError, ValueError):
         return None
 def _w(s): return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
@@ -764,26 +950,96 @@ def mon_extract(row, st=None):
         k = (ref.year - int(ym[:4])) * 12 + ref.month - int(ym[5:])
         if not 0 <= k <= 14: continue  # 공시일 기준 미래·너무 오래된 달 제외
         v = {c: _f(m.get(c)) for c, _ in MON_COLS}
-        if any(x is not None for x in v.values()): months[ym] = v
+        if any(x is not None for x in v.values()):
+            v["amt"], v["stores"] = _fp(m.get("amt")), _fp(m.get("stores"))
+            months[ym] = v
     if not months: return None
+    prev = {}
+    for m in j.get("prev") or []:  # 표의 '前年' 열 = 작년 같은 달의 전년비(차트 과거 구간용)
+        ym = str(m.get("ym") or "")
+        if not re.fullmatch(r"\d{4}-\d{2}", ym) or ym in months: continue
+        k = (ref.year - int(ym[:4])) * 12 + ref.month - int(ym[5:])
+        if not 1 <= k <= 26: continue
+        v = {"all": _f(m.get("all")), "ex": _f(m.get("ex"))}
+        if any(x is not None for x in v.values()): prev[ym] = v
     cum = j.get("cum") if isinstance(j.get("cum"), dict) else None
     src = "ai"
     if det:  # 규칙 파서와 최신 달 값 교차 확인
         last = max(months); a, b = months[last], det.get(last) or {}
         diff = [c for c in ("all", "ex") if a.get(c) is not None and b.get(c) is not None and abs(a[c] - b[c]) > 0.15]
         src = "mismatch" if diff else ("ai+rule" if any(b.get(c) is not None for c in ("all", "ex")) else "ai")
-        if diff:  # 값이 다르면 표 자동 인식값(매출)을 쓰고 객수·객단가·누계는 뺌 — 점검 결과 매출은 규칙 인식이 더 정확했음
+        if diff:  # 값이 다르면 표 자동 인식값(매출)을 쓰고 객수·객단가·누계·前年 열은 뺌 — 점검 결과 매출은 규칙 인식이 더 정확했음
             months = {k: {"all": v.get("all"), "ex": v.get("ex"), "cust": None, "price": None} for k, v in det.items()}
-            cum = None
-    return {"metric": str(j.get("metric") or "매출")[:8], "scope": str(j.get("scope") or "")[:30], "months": months, "cum": cum, "src": src}
+            cum = None; prev = {}
+    return {"metric": str(j.get("metric") or "매출")[:8], "scope": str(j.get("scope") or "")[:30], "months": months, "prev": prev, "cum": cum, "src": src}
+
+def mon_chart(row, hist, met, scope):
+    """월차 차트 PNG: 위 = 절대 규모(월 매출 금액, 없으면 월말 점포수), 아래 = 전년 동월 대비(전체·기존점)"""
+    ks = sorted(hist)[-18:]
+    yo = [k for k in ks if hist[k].get("all") is not None or hist[k].get("ex") is not None]
+    if len(yo) < 4: return None
+    ks = ks[ks.index(yo[0]):]
+    import matplotlib; matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    try:
+        import koreanize_matplotlib  # noqa: F401  (한글 글꼴)
+    except Exception:
+        pass
+    absk, absl = None, None
+    for key, lab in (("amt", f"월 {met} (백만엔)"), ("stores", "월말 점포수")):
+        if sum(1 for k in ks if hist[k].get(key)) >= 3: absk, absl = key, lab; break
+    INK, INK2, MUT, GRID, SURF = "#0b0b0b", "#52514e", "#8a8983", "#e6e5e0", "#fcfcfb"
+    C_ALL, C_EX = "#2a78d6", "#eb6834"
+    n = 2 if absk else 1
+    fig, axes = plt.subplots(n, 1, figsize=(8, 5.4 if n == 2 else 3.4), dpi=150, sharex=True,
+                             gridspec_kw={"height_ratios": [1, 1.25]} if n == 2 else None)
+    axes = list(axes) if n == 2 else [axes]
+    fig.patch.set_facecolor(SURF)
+    x = list(range(len(ks))); labs = [f"{k[2:4]}/{k[5:]}" for k in ks]
+    for ax in axes:
+        ax.set_facecolor(SURF); ax.grid(axis="y", color=GRID, lw=0.7, zorder=0)
+        for sp in ax.spines.values(): sp.set_visible(False)
+        ax.tick_params(length=0, colors=MUT, labelsize=8)
+    if absk:
+        ax = axes[0]; vals = [hist[k].get(absk) for k in ks]
+        px = [i for i, v in zip(x, vals) if v]; py = [v for v in vals if v]
+        if absk == "stores":  # 점포수는 변화가 작아 막대(0부터) 대신 선으로 추이를 보이게
+            ax.plot(px, py, color="#7d8b99", lw=2, marker="o", ms=4, zorder=3)
+            lo, hi = min(py), max(py); pad = max((hi - lo) * 0.3, 1)
+            ax.set_ylim(lo - pad, hi + pad * 1.5)
+        else:
+            ax.bar(px, py, width=0.62, color="#7d8b99", zorder=3)
+        last = max(px)
+        ax.text(last, vals[last], f"{vals[last]:,.0f}", ha="center", va="bottom", fontsize=8, color=INK2)
+        ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:,.0f}"))
+        ax.set_title(absl, loc="left", fontsize=9, color=INK2)
+    ax = axes[-1]
+    for c, lab, col in (("all", "전체", C_ALL), ("ex", "기존점", C_EX)):
+        pts = [(i, hist[k][c]) for i, k in zip(x, ks) if hist[k].get(c) is not None]
+        if len(pts) < 2: continue
+        ax.plot([p[0] for p in pts], [p[1] for p in pts], color=col, lw=2, marker="o", ms=4, label=lab, zorder=3)
+        ax.text(pts[-1][0] + 0.15, pts[-1][1], f"{lab} {pts[-1][1]:+.1f}%", va="center", fontsize=8, color=INK2)
+    ax.axhline(0, color=INK2, lw=0.8, zorder=2)
+    ax.set_title(f"{met} 전년 동월 대비(%)", loc="left", fontsize=9, color=INK2)
+    ax.legend(loc="upper left", frameon=False, fontsize=8, ncol=2)
+    ax.set_xticks(x); ax.set_xticklabels(labs, fontsize=8, color=INK2)
+    ax.set_xlim(-0.6, len(ks) - 0.2 + 1.2)
+    name = row.get("_name") or row.get("code")
+    fig.suptitle(f"{name}({row.get('code')}) 월차" + (f" · {scope}" if scope else ""), x=0.02, ha="left", fontsize=11, fontweight="bold", color=INK)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    path = os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), f"mon_{row.get('code')}_{row.get('d')}.png")
+    fig.savefig(path, facecolor=SURF); plt.close(fig)
+    return path
 
 def body_monthly(row, st):
     r = mon_extract(row, st)
     if not r: return None
     code = row["code"]
     h = st.setdefault("monh", {}).setdefault(code, {})
+    for k, v in (r.get("prev") or {}).items():  # 작년 달: 이미 받은 값이 있으면 그대로
+        if k not in h: h[k] = v
     h.update(r["months"]); h["_t"] = time.time()
-    for k in sorted(k for k in h if k[:1].isdigit())[:-13]: h.pop(k)  # 최근 13개월만 보관
+    for k in sorted(k for k in h if k[:1].isdigit())[:-24]: h.pop(k)  # 최근 24개월만 보관(차트용)
     if len(st["monh"]) > 1500:
         for c in sorted(st["monh"], key=lambda c: st["monh"][c].get("_t", 0))[:200]: st["monh"].pop(c)
     hist = {k: v for k, v in h.items() if k[:1].isdigit()}
@@ -812,6 +1068,10 @@ def body_monthly(row, st):
         if len(vals) >= 2: trend = f" | {'기존점' if tc == 'ex' else '전체'} 추이 {int(ks[0][5:])}~{mm}월 " + "→".join(vals)
     note = {"rule": "※ AI 미사용 — 표 자동 인식값(매출만), 원문 확인 권장", "mismatch": "⚠ AI 판독값과 표 자동 인식값이 달라 표 인식값(매출)만 표시 — 원문 확인 권장"}.get(r.get("src"))
     if note: s += f"\n<i>{note}</i>"
+    try:
+        HL["chart"] = mon_chart(row, hist, met, r.get("scope") or "")
+    except Exception as e:
+        log("mon chart error", code, e)
     HL.update(kind="mon", mon=line + trend + (" ⚠원문 확인" if r.get("src") == "mismatch" else ""))
     return s
 
@@ -827,6 +1087,7 @@ def build(row, st, names, quotes, trmap):
     body = None
     title = row["title"]
     HL.clear()
+    row["_name"] = name_ko
     try:
         if row.get("xbrl"):
             if "決算短信" in title and "訂正" not in title: body = body_results(row, st)
@@ -838,6 +1099,8 @@ def build(row, st, names, quotes, trmap):
             body = body_tob(row)
         elif re.search(MON_RE, title) and "訂正" not in title:
             body = body_monthly(row, st)
+        elif re.search(r"業績予想|業績見通し|予想(値)?の修正|業績予想の修正", title) and not re.search(r"訂正|配当予想(の修正)?に関する", title):
+            body = body_forecast_pdf(row, st)
     except Exception as e:
         log("body error", code, title[:30], e)
     try:
@@ -1517,6 +1780,20 @@ def tg_send(text):
             log("telegram error", e); time.sleep(3)
     return False
 
+def tg_photo(path, caption=""):
+    if DRY: print(f"[chart] {path}"); return True
+    try:
+        import uuid
+        b = uuid.uuid4().hex
+        parts = [f"--{b}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{CHANNEL}\r\n".encode()]
+        if caption: parts.append(f"--{b}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption}\r\n".encode())
+        parts.append(f"--{b}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"chart.png\"\r\nContent-Type: image/png\r\n\r\n".encode()
+                     + open(path, "rb").read() + f"\r\n--{b}--\r\n".encode())
+        http(f"https://api.telegram.org/bot{TOKEN}/sendPhoto", data=b"".join(parts), headers={"content-type": f"multipart/form-data; boundary={b}"}, timeout=60)
+        return True
+    except Exception as e:
+        log("photo error", e); return False
+
 # ───────────────────────── 메인 ─────────────────────────
 def esc(s): return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -1553,6 +1830,7 @@ def mon_test(ids):
         except Exception as e: print("규칙 파서 오류", e)
         try: print("=" * 60, "\n" + i, "\n" + str(body_monthly(row, st)), "\n요약:", HL.get("mon"), flush=True)
         except Exception: traceback.print_exc()
+        if HL.get("chart") and os.environ.get("MON_TEST_SEND") and TOKEN and CHANNEL: tg_photo(HL["chart"], f"[월차 차트 점검] {i}")
         st.pop("monh", None); HL.clear()
 
 def main():
@@ -1613,6 +1891,8 @@ def main():
             wait = SEND_GAP - (time.time() - last_send)
             if wait > 0: time.sleep(wait)
             ok = tg_send(msg) if msg else True
+            if ok and msg and HL.get("chart"):  # 월차 차트는 본문 바로 뒤에 이미지로
+                tg_photo(HL["chart"])
             last_send = time.time()
             if ok or not msg:
                 st["queue"].remove(r)
