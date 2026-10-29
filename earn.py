@@ -32,6 +32,7 @@ RULES = {
     "R2_op_yoy": 10.0,        # R2 이익 성장: 분기 영업이익 YoY ≥ 10% 그리고 흑자
     "R3_accel_pp": 5.0,       # R3 성장 가속: 매출 또는 영업이익 YoY가 직전 분기보다 +5%p 이상(둘 다 플러스)
     "R4_turn_yoy": 20.0,      # R4 턴어라운드: 전년 동기 영업적자→흑자, 또는 2개 분기 연속 감익 뒤 영업이익 YoY ≥ 20%
+    "R5_rev_only_yoy": 15.0,  # R5 매출 고성장: 이익과 상관없이 분기 매출 YoY ≥ 15%
     "X5_min_cap_oku": 300.0,  # X5 시가총액 300억 엔 미만 제외
 }
 # X4 제외 업종(도쿄증권거래소 33업종)
@@ -209,6 +210,7 @@ def judge(series, i):
     r1 = rg is not None and rg >= RULES["R1_rev_yoy"]
     r2 = og is not None and og >= RULES["R2_op_yoy"] and (op or 0) > 0
     if r1 and r2: hit += ["매출 성장", "이익 성장"]
+    if rg is not None and rg >= RULES["R5_rev_only_yoy"] and not (r1 and r2): hit.append("매출 고성장")
     if rg is not None and og is not None and rg > 0 and og > 0 and (
             (rg1 is not None and rg - rg1 >= RULES["R3_accel_pp"]) or (og1 is not None and og - og1 >= RULES["R3_accel_pp"])):
         hit.append("성장 가속")
@@ -522,6 +524,7 @@ def card_text(a, ai, row):
     # 실적 유형
     tags = []
     if "매출 성장" in a["hit"]: tags.append("실적 호조")
+    if "매출 고성장" in a["hit"]: tags.append("매출 고성장")
     if "성장 가속" in a["hit"]: tags.append("성장 가속")
     if "턴어라운드" in a["hit"]: tags.append("턴어라운드")
     rv = a.get("rev")
@@ -1132,7 +1135,7 @@ def main():
         try:
             me = (tg("getMe").get("result") or {}).get("username", "")
             txt = ("📌 <b>실적 스크리닝 채널 사용법</b>\n\n"
-                   "이 채널에는 일본 상장사 결산단신 중 스크리닝 기준(매출 성장·이익 성장·성장 가속·턴어라운드, 시총 300억 엔 이상)을 통과한 종목 카드가 자동으로 올라옵니다.\n\n"
+                   "이 채널에는 일본 상장사 결산단신 중 스크리닝 기준(매출·이익 성장, 매출 고성장, 성장 가속, 턴어라운드, 시총 300억 엔 이상)을 통과한 종목 카드가 자동으로 올라옵니다.\n\n"
                    f"<b>내 종목만 따로 받기</b> — 봇 @{me} 과 1:1 대화를 열고(채널 구독자는 채널에 글을 쓸 수 없습니다)\n"
                    "• 종목 코드나 이름 보내기(예: 6857, 어드반테스트) → 최근 분기 실적 카드를 개인 대화로\n"
                    "• /add 6857 7203 → 관심 종목 등록. 결산단신이 나오면 스크리닝 통과 여부와 상관없이 개인 대화로 카드 발송\n"
