@@ -1214,7 +1214,9 @@ _JPS = {"t": 0, "d": {}}
 def jp_state():
     """공시봇 상태(컨센서스 cons·발표 예정일 sched·구독 watch) — 30분마다 새로 읽음"""
     if time.time() - _JPS["t"] > 1800:
-        try: _JPS["d"] = json.loads(http(JP_STATE_URL, timeout=30)); _JPS["t"] = time.time()
+        try:
+            import stcrypt   # 주인 ID·관심 종목은 암호화돼 있음(WATCH_KEY로 풂)
+            _JPS["d"] = stcrypt.reveal(json.loads(http(JP_STATE_URL, timeout=30))); _JPS["t"] = time.time()
         except Exception as e: log("jp state error", e)
     return _JPS["d"]
 WATCH_URL = os.environ.get("WATCH_URL", "https://jp-disclosure-bot.ssamgij.workers.dev/watchlist")
@@ -1227,6 +1229,7 @@ def sync_jp_stock(st):
     st["jps_date"] = d
     j = jp_state() or {}
     owner = j.get("owner")
+    if not isinstance(owner, int) or owner <= 0: owner = None   # 못 풀었으면(-1) 무시
     if owner and st.get("owner") is None: st["owner"] = owner  # 주인 = 두 봇에 같은 텔레그램 계정
     users_map, fetched = {}, False
     if WATCH_KEY:

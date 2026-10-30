@@ -108,10 +108,15 @@ def log(*a): print(now().strftime("%H:%M:%S"), *a, flush=True)
 
 # ───────────────────────── 상태 ─────────────────────────
 def load(name, default):
-    try: return json.load(open(os.path.join(STATE_DIR, name)))
+    try: d = json.load(open(os.path.join(STATE_DIR, name)))
     except Exception: return default
+    if name == "state.json" and isinstance(d, dict):  # 공개 저장소라 주인 ID·관심 종목은 암호화해 둠
+        import stcrypt; d = stcrypt.reveal(d)
+    return d
 def save(name, obj):
     os.makedirs(STATE_DIR, exist_ok=True)
+    if name == "state.json" and isinstance(obj, dict):
+        import stcrypt; obj = stcrypt.hide(obj)
     json.dump(obj, open(os.path.join(STATE_DIR, name), "w"), ensure_ascii=False, separators=(",", ":"))
 
 # ───────────────────────── 종목 목록(JPX) ─────────────────────────
