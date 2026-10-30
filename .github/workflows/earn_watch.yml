@@ -1,0 +1,39 @@
+name: 봇 상태 감시
+
+on:
+  schedule:
+    - cron: "17 * * * *"   # 매시 17분: 실적 스크리닝·공시 봇이 멈췄는지 확인
+  workflow_dispatch: {}
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 마지막 상태 저장 시각 확인 → 멈췄으면 주인에게 텔레그램 알림
+        env:
+          EARN_TOKEN: ${{ secrets.EARN_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import json, os, time, urllib.request, datetime as dt
+          repo = os.environ["REPO"]; tok = os.environ.get("EARN_TOKEN", "")
+          def get(u):
+              h = {"User-Agent": "watch"}
+              if "api.github.com" in u: h["Authorization"] = "Bearer " + os.environ["GH_TOKEN"]
+              return json.loads(urllib.request.urlopen(urllib.request.Request(u, headers=h), timeout=30).read())
+          owner = get(f"https://raw.githubusercontent.com/{repo}/state/state.json").get("owner")
+          down = []
+          for br, name in (("earn-state", "실적 스크리닝 봇"), ("state", "일본공시봇(JP_ALL)")):
+              c = get(f"https://api.github.com/repos/{repo}/commits/{br}")
+              t = dt.datetime.fromisoformat(c["commit"]["committer"]["date"].replace("Z", "+00:00"))
+              mins = (dt.datetime.now(dt.timezone.utc) - t).total_seconds() / 60
+              print(br, f"{mins:.0f}분 전 저장")
+              if 75 <= mins < 135 or 1440 <= mins < 1500: down.append(f"{name}: 마지막 실행 기록이 {mins / 60:.1f}시간 전입니다")
+          if down and owner and tok:
+              msg = "⚠️ 봇 상태 감시\n" + "\n".join(down) + "\nGitHub Actions 실행 상태를 확인해 주세요(예약 실행 지연·실패)."
+              urllib.request.urlopen(urllib.request.Request(f"https://api.telegram.org/bot{tok}/sendMessage",
+                  data=json.dumps({"chat_id": owner, "text": msg}).encode(), headers={"content-type": "application/json"}), timeout=30)
+              print("alert sent")
+          PY

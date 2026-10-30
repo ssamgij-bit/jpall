@@ -49,6 +49,7 @@ jobs:
           EARN_TOKEN: ${{ secrets.EARN_TOKEN }}
           EARN_CHANNEL: ${{ secrets.EARN_CHANNEL }}
           GEMINI_API_KEY: ${{ secrets.EARN_GEMINI_KEY || secrets.GEMINI_API_KEY }}   # 전용 키가 있으면 그것을 먼저 사용
+          GEMINI_API_KEY_2: ${{ secrets.EARN_GEMINI_KEY2 }}   # 리포트·IR·시장 반응용 보조 키(없으면 위 키를 같이 씀)
           TEST_DAY: ${{ github.event.inputs.test_day }}
           TEST_REPORT: ${{ github.event.inputs.test_report }}
           RUN_SECONDS: "1680"
