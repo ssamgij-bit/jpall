@@ -2,7 +2,7 @@ name: 봇 상태 감시
 
 on:
   schedule:
-    - cron: "17 * * * *"   # 매시 17분: 실적 스크리닝·공시 봇이 멈췄는지 확인
+    - cron: "17 * * * *"   # 매시 17분: 봇들이 멈췄는지 확인(실적 스크리닝·공시 채널·japan stock·뉴스 저장소 봇·맥의 네이버 프리미엄 봇)
   workflow_dispatch: {}
 
 jobs:
@@ -17,12 +17,16 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           python3 - <<'PY'
-          import json, os, time, urllib.request, datetime as dt
+          import json, os, time, urllib.request, urllib.error, datetime as dt
           repo = os.environ["REPO"]; tok = os.environ.get("EARN_TOKEN", "")
-          def get(u):
+          def get(u, auth=True):
               h = {"User-Agent": "watch"}
-              if "api.github.com" in u: h["Authorization"] = "Bearer " + os.environ["GH_TOKEN"]
-              return json.loads(urllib.request.urlopen(urllib.request.Request(u, headers=h), timeout=30).read())
+              if auth and "api.github.com" in u: h["Authorization"] = "Bearer " + os.environ["GH_TOKEN"]
+              try:
+                  return json.loads(urllib.request.urlopen(urllib.request.Request(u, headers=h), timeout=30).read())
+              except urllib.error.HTTPError as e:
+                  if auth and e.code in (401, 403, 404) and "api.github.com" in u: return get(u, False)   # 다른 저장소(공개)는 인증 없이
+                  raise
           owner = get(f"https://raw.githubusercontent.com/{repo}/state/state.json").get("owner")
           down = []
           for br, name in (("earn-state", "실적 스크리닝 봇"), ("state", "일본공시봇(JP_ALL)")):
@@ -31,6 +35,46 @@ jobs:
               mins = (dt.datetime.now(dt.timezone.utc) - t).total_seconds() / 60
               print(br, f"{mins:.0f}분 전 저장")
               if 75 <= mins < 135 or 1440 <= mins < 1500: down.append(f"{name}: 마지막 실행 기록이 {mins / 60:.1f}시간 전입니다")
+          now = dt.datetime.now(dt.timezone.utc)
+          kst_h = (now + dt.timedelta(hours=9)).hour
+          def first_hour(m): return 20 <= m < 80 or 1460 <= m < 1520   # 멈춘 직후 한 번, 하루 뒤 한 번만 알림
+          # japan stock 봇(Cloudflare, 2분마다): 마지막으로 끝까지 돈 시각
+          try:
+              h = get("https://jp-disclosure-bot.ssamgij.workers.dev/health")
+              m = (time.time() * 1000 - h.get("last_ok", 0)) / 60000
+              print("jp-disclosure-bot", f"{m:.0f}분 전 정상 실행")
+              if first_hour(m): down.append(f"japan stock 봇: 마지막 정상 실행이 {m:.0f}분 전입니다(Cloudflare 로그 확인 필요)")
+          except Exception as e:
+              print("jp-disclosure-bot health error", e)
+              if kst_h in (9, 13, 18): down.append(f"japan stock 봇: 상태 확인 실패({str(e)[:60]})")
+          # 맥에서 도는 네이버 프리미엄 봇: 5분마다 생존 신호. 맥이 잠들면 끊기므로 하루 세 번(09·13·18시)만 알림
+          try:
+              b = get("https://earn-gateway.ssamgij.workers.dev/beats").get("naver", 0)
+              m = (time.time() * 1000 - b) / 60000
+              print("naver beat", f"{m:.0f}분 전")
+              if m >= 20 and kst_h in (9, 13, 18): down.append(f"네이버 프리미엄 요약 봇(맥): 마지막 신호가 {m / 60:.1f}시간 전입니다(맥이 꺼졌거나 잠자기·봇 중단)")
+          except Exception as e:
+              print("beats error", e)
+          # 뉴스 저장소(jpnews) 봇들: 이어 달리기(약 6시간) 방식 → 마지막 실행이 실패했거나, 이어지지 않고 끊겼거나, 6.5시간 넘게 멈춰 있으면
+          NAMES = {"run.yml": "일본 뉴스 봇", "highs.yml": "신고가·상승률 봇", "community.yml": "일본 커뮤니티 봇", "morning.yml": "아침 브리핑", "weather.yml": "서울 날씨 알림"}
+          for f, name in NAMES.items():
+              try:
+                  r = (get(f"https://api.github.com/repos/{repo.split('/')[0]}/jpnews/actions/workflows/{f}/runs?per_page=1").get("workflow_runs") or [None])[0]
+                  if not r: continue
+                  ca = dt.datetime.fromisoformat(r["created_at"].replace("Z", "+00:00"))
+                  ua = dt.datetime.fromisoformat(r["updated_at"].replace("Z", "+00:00"))
+                  age = lambda t: (now - t).total_seconds() / 60
+                  why = None
+                  if r["status"] == "completed" and r["conclusion"] not in ("success", "skipped") and first_hour(age(ua)):
+                      why = f"마지막 실행이 실패({r['conclusion']})"
+                  elif r["status"] == "completed" and first_hour(age(ua) - 60):
+                      why = f"실행이 이어지지 않고 {age(ua) / 60:.1f}시간째 멈춤"
+                  elif r["status"] != "completed" and first_hour(age(ca) - 390):
+                      why = f"한 실행이 {age(ca) / 60:.1f}시간째 끝나지 않음"
+                  print(f, r["status"], r["conclusion"], f"{age(ca):.0f}분 전 시작")
+                  if why: down.append(f"{name}: {why}")
+              except Exception as e:
+                  print(f, "error", e)
           if down and owner and tok:
               msg = "⚠️ 봇 상태 감시\n" + "\n".join(down) + "\nGitHub Actions 실행 상태를 확인해 주세요(예약 실행 지연·실패)."
               urllib.request.urlopen(urllib.request.Request(f"https://api.telegram.org/bot{tok}/sendMessage",
