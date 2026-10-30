@@ -47,6 +47,15 @@ SECTOR_KO = {
     "証券・商品先物取引業": "증권", "保険業": "보험", "その他金融業": "기타금융", "不動産業": "부동산", "サービス業": "서비스",
 }
 
+def sector_norm(s):
+    """업종 이름을 도쿄증권거래소 33업종 공식 이름으로(가부탄은 '電気・ガス'처럼 '業'을 빼고 표기 → 번역·제외 업종 판정이 빠지던 문제)"""
+    s = nfkc(s or "").replace("、", "・").strip()
+    if s in SECTOR_KO: return s
+    for k in SECTOR_KO:
+        kk = nfkc(k).replace("、", "・")
+        if kk == s or kk.rstrip("業") == s.rstrip("業"): return k
+    return s
+
 def now(): return dt.datetime.now(JST)
 def log(*a): print(now().strftime("%H:%M:%S"), *a, flush=True)
 # 상태 파일은 공개 저장소에 올라가므로 사용자 정보(텔레그램 계정 번호·관심 종목·요청 기록)는 암호화해서 저장
@@ -119,7 +128,7 @@ def kb_finance(code):
     s = mget(f"https://s.kabutan.jp/stocks/{code}/finance/")
     out = {"q": [], "y": [], "sector": ""}
     g = re.search(r"業種\s*</span>\s*<a[^>]*>(.*?)</a>", s, re.S)
-    out["sector"] = nfkc(text_of(g.group(1))) if g else ""
+    out["sector"] = sector_norm(text_of(g.group(1))) if g else ""
     for tb in re.findall(r"<table.*?</table>", s, re.S):
         head = text_of(tb[:3000])
         rows = []
