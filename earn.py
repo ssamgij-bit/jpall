@@ -1346,14 +1346,14 @@ def handle_text(st, chat, text):
     elif re.search(r"[0-9A-Za-z가-힣ぁ-んァ-ン一-龥]", text) and (chat.get("type") == "private" or re.fullmatch(r"[0-9][0-9A-Za-z]{3}", text)):
         tg("sendMessage", {"chat_id": chat["id"], "text": f"'{text}'에 맞는 상장 종목을 찾지 못했습니다. 종목 코드로 보내 주세요."})
 
-def reuse_card(st, code, d, chat):
+def reuse_card(st, code, d, chat, force=False):
     """같은 종목·같은 결산일 카드가 있으면 chat(None=채널)으로 복사. 성공 True, 받는 사람이 봇 차단이면 False, 없으면 None"""
     cands = [(cid, c) for cid, c in st.get("cards", {}).items() if c.get("code") == code and c.get("d") == d and c.get("msg") and not c.get("deleted")]
     if not cands: return None
     cid, c = max(cands, key=lambda x: x[1].get("ts", 0))
     src = c.get("chat") or CHANNEL
     dest = chat or CHANNEL
-    if str(src) == str(dest): return True  # 이미 그 자리에 있음
+    if str(src) == str(dest) and not force: return True  # 이미 그 자리에 있음(요청이 아닌 자동 처리일 때만 건너뜀)
     LAST_ERR["d"] = ""
     r = tg("copyMessage", {"chat_id": dest, "from_chat_id": src, "message_id": c["msg"], "reply_markup": keyboard(cid, c)})
     if r.get("ok"):
@@ -1379,7 +1379,7 @@ def do_asks(st):
             personal = job.get("watch") or str(job["chat"]) not in (str(CHANNEL), str(st.get("owner")))
             # 개인 대화로 요청했으면(주인 포함) 이미 있는 카드는 그 대화로 복사. 예전엔 주인 요청이 채널 카드만 확인하고 아무것도 안 보냈음
             direct = personal or str(job["chat"]) != str(CHANNEL)
-            hit = reuse_card(st, code, row.get("d"), job["chat"] if direct else None)
+            hit = reuse_card(st, code, row.get("d"), job["chat"] if direct else None, force=True)   # 요청이면 같은 자리에 있어도 다시 보여 줌
             if hit:  # 같은 종목·같은 결산 카드가 이미 있으면 복사해서 보냄(AI 절약)
                 bump(st, "cache"); log("카드 재사용", code, job["chat"] if direct else "channel"); continue
             if hit is False:
