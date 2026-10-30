@@ -69,7 +69,7 @@ def find_qa(code, since_day, days=14):
 # ───────────────────────── 회사 IR 홈페이지·로그미 ─────────────────────────
 import urllib.parse
 SKIP_HOST = ("kabutan", "minkabu", "japannext", "apple.com", "hrmos", "google", "sbisec", "twitter", "x.com", "facebook", "youtube", "line.me")
-QA_LINK = re.compile(r"質疑応答|質疑|Q&A|Q＆A|QA|主な質問|書き起こし|書起こし|文字起こし|Transcript|説明会[^<]{0,12}(要旨|内容|概要|記録|動画)|スモールミーティング", re.I)
+QA_LINK = re.compile(r"質疑応答|質疑|Q&A|Q＆A|QA|主な質問|書き起こし|書起こし|文字起こし|スクリプト|Transcript|説明会[^<]{0,12}(要旨|内容|概要|記録|動画)|スモールミーティング", re.I)
 
 def company_site(code):
     s = E.mget(f"https://s.kabutan.jp/stocks/{code}/")
@@ -122,12 +122,47 @@ def doc_dates(kind, body):
            if 1 <= int(m) <= 12 and 1 <= int(d) <= 31]
     return out
 
+_XJ = {}   # 종목코드 → xj-storage 회사 ID(ASxxxxx) 또는 ""
+def xj_company(code, pages_html=()):
+    """IR 자료 목록을 자바스크립트로 불러오는 xj-storage(QUICK) 회사 ID 찾기 — 페이지 본문·불러오는 스크립트에서"""
+    if code in _XJ: return _XJ[code]
+    cid = ""
+    for body, base in pages_html:
+        m = re.search(r"xj-storage\.jp/xcontents/(AS\d{4,6})", body) or re.search(r"company\s*[:=]\s*['\"](AS\d{4,6})['\"]", body)
+        if m: cid = m.group(1); break
+        for src in re.findall(r'<script[^>]+src="([^"]*(?:xj|Xj|XJ)[^"]*\.js[^"]*)"', body)[:3]:
+            if "ProvideImage" in src: continue
+            try:
+                js = _get(urllib.parse.urljoin(base, src)).decode("utf-8", "ignore")
+                m = re.search(r"company\s*:\s*['\"](AS\d{4,6})['\"]", js)
+                if m: cid = m.group(1); break
+            except Exception:
+                pass
+        if cid: break
+    if cid or pages_html: _XJ[code] = cid
+    return cid
+
+def xj_docs(cid, since_day, pat):
+    """xj-storage 공개 목록(JSON)에서 이번 결산 이후 자료 → [(제목, url, 날짜)]"""
+    try:
+        d = json.loads(_get(f"https://www.xj-storage.jp/public-list/GetList.aspx?company={cid}&len=80&output=json").decode("utf-8", "ignore"))
+    except Exception as e:
+        E.log("xj list error", cid, e); return []
+    out = []
+    for it in d.get("items") or []:
+        t = E.nfkc(it.get("title") or ""); day = re.sub(r"\D", "", (it.get("publishDate") or ""))[:8]
+        if not day or day < since_day or not pat.search(t): continue
+        for f in it.get("files") or []:
+            u = f.get("url") or ""
+            if re.search(r"\.pdf($|\?)", u, re.I): out.append((t[:60], u, day)); break
+    return out
+
 def ir_site_docs(code, since_day, limit=2, pat=None):
     """회사 IR 홈페이지에서 이번 결산 이후의 질의응답·설명회 기록(pat 지정 시 그 자료) 링크 → [(이름, url, 날짜)]"""
     pat = pat or QA_LINK
     home = company_site(code)
     if not home: return []
-    seen, pages, hits = set(), [home], []
+    seen, pages, hits, bodies = set(), [home], [], []
     host = urllib.parse.urlparse(home).netloc
     for depth in range(2):
         nxt = []
@@ -136,6 +171,7 @@ def ir_site_docs(code, since_day, limit=2, pat=None):
             seen.add(p)
             try: body = E.nfkc(_get(p).decode("utf-8", "ignore"))
             except Exception: continue
+            bodies.append((body, p))
             for u, t, d in _links(p, body):
                 h = urllib.parse.urlparse(u).netloc
                 if pat.search(t) or pat.search(urllib.parse.unquote(u)):
@@ -147,6 +183,12 @@ def ir_site_docs(code, since_day, limit=2, pat=None):
                         re.search(r"IR|投資家|株主|ライブラリ|資料|ニュース|news|library", t + u, re.I):
                     nxt.append(u)
         pages = list(dict.fromkeys(nxt))
+    # 목록을 자바스크립트로 그리는 IR 페이지(xj-storage): 공개 목록에서 직접 찾음(PDF 직링크·게시일 확실 → 앞에 둠)
+    cid = xj_company(code, bodies)
+    if cid:
+        xj = xj_docs(cid, since_day, pat)
+        if xj: E.log("xj-storage", code, cid, len(xj))
+        hits = [(t, u, d or "99999999") for t, u, d in xj] + hits
     out, urls = [], set()
     # 날짜가 있는 것(최신 순) → PDF 직링크 → 나머지(목록 페이지 등)
     for t, u, d in sorted(hits, key=lambda x: (x[2] or "0", bool(re.search(r"\.pdf($|\?)", x[1], re.I))), reverse=True):

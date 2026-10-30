@@ -996,6 +996,12 @@ def _ir_build(cp):
     import earn_ir
     return earn_ir.build(cp)
 
+def _ir_refresh(cp):
+    """예전 요약에 Q&A가 없던 카드: 회사 IR 홈페이지 등에 질의응답이 새로 올라왔으면 다시 만들고, 없으면 예전 요약"""
+    import earn_ir
+    if not earn_ir.other_qa(cp): return "cached"
+    return earn_ir.build(cp, qa_rows=[])
+
 def do_reports(st):
     AI_OUT.update(st.get("ai_out") or {})
     try:
@@ -1021,7 +1027,12 @@ def _start_jobs(st):
         cid, dest, reply = _job(q[0], st)
         card = st.get("cards", {}).get(cid)
         if not card: q.pop(0); continue
-        if card.get("ir_texts"):  # 이미 만든 요약은 바로
+        if card.get("ir_texts") and card.get("qa_watch") and time.time() - card.get("qa_site_ts", 0) > 3600 and not _running("ir", cid) \
+                and len([x for x in JOBS if x["kind"] in ("rep", "ir")]) < MAX_HEAVY:  # Q&A 없던 요약 → 그사이 올라왔는지 확인(1시간에 한 번)
+            q.pop(0); card["qa_site_ts"] = time.time()
+            _submit("ir", _ir_refresh, _copy.deepcopy(card), key2=True, cid=cid, waiters=[(dest, reply)]); log("IR Q&A 다시 확인", card["code"], dest)
+            continue
+        if card.get("ir_texts") and not _running("ir", cid):  # 이미 만든 요약은 바로
             q.pop(0)
             try:
                 send_texts(card, card["ir_texts"], dest, reply)
@@ -1106,10 +1117,14 @@ class _DONE:
     def ir(st, j, ok, res):
         card = st.get("cards", {}).get(j["cid"])
         if not card: return
-        texts, has_qa = res if ok == "ok" else (None, False)
-        if texts:
-            card["ir_texts"] = texts
-            if not has_qa: card["qa_watch"] = time.time(); card.setdefault("qa_to", [])
+        if ok == "ok" and res == "cached":
+            texts, has_qa = card.get("ir_texts"), False
+        else:
+            texts, has_qa = res if ok == "ok" else (None, False)
+            if texts:
+                card["ir_texts"] = texts
+                if not has_qa: card["qa_watch"] = time.time(); card.setdefault("qa_to", [])
+                else: card.pop("qa_watch", None); log("IR 요약에 Q&A 포함", card["code"])
         for dest, reply in j["waiters"]:
             if not texts:
                 with _key2(): out = ai_out_until()
