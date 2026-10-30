@@ -29,6 +29,18 @@ jobs:
                   importlib.import_module(m); print("import ok", m)
           for f in glob.glob(".github/workflows/*.yml"):
               yaml.safe_load(open(f)); print("yaml ok", f)
+          # 같은 파일 안에서 전역 이름(변수·함수)을 두 번 정의하면 뒤의 것이 앞의 것을 덮어씀 → 실패 처리(예: _JPS 충돌로 결산 판별이 멈췄던 일)
+          import ast
+          dup = []
+          for f in sorted(glob.glob("*.py")):
+              seen = {}
+              for n in ast.parse(open(f).read()).body:
+                  names = [x.id for x in n.targets if isinstance(x, ast.Name)] if isinstance(n, ast.Assign) else \
+                          [n.name] if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) else []
+                  for x in names: seen.setdefault(x, []).append(n.lineno)
+              dup += [f"{f}: {k} (줄 {v})" for k, v in seen.items() if len(v) > 1]
+          if dup: sys.exit("전역 이름 중복 정의:\n" + "\n".join(dup))
+          print("no duplicate globals")
           PY
       - name: IR 페이지 브라우저 열기 시험(실패해도 배포는 막지 않음)
         continue-on-error: true
