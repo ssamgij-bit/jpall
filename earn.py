@@ -746,10 +746,34 @@ def update_reactions(st):
             log("reaction updated", c["code"], f"{rx['close']:+.1f}%")
 
 # ───────────────────────── 버튼 처리 ─────────────────────────
+GATEWAY_URL = os.environ.get("GATEWAY_URL", "").rstrip("/")   # 즉시 응답 관문(Cloudflare Worker). 있으면 웹훅 방식
+GATEWAY_KEY = os.environ.get("GATEWAY_KEY", "")
+ALLOWED = ["callback_query", "my_chat_member", "channel_post", "message"]
+def gateway_setup(st):
+    """관문 주소가 있으면 텔레그램 웹훅을 관문으로, 없어지면 웹훅을 끄고 예전 방식(getUpdates)으로"""
+    if DRY or not TOKEN: return
+    if GATEWAY_URL and GATEWAY_KEY and st.get("hook") != GATEWAY_URL:
+        r = tg("setWebhook", {"url": GATEWAY_URL + "/tg", "secret_token": GATEWAY_KEY, "allowed_updates": ALLOWED, "drop_pending_updates": False})
+        if r.get("ok"): st["hook"] = GATEWAY_URL; log("webhook set", GATEWAY_URL)
+    elif not GATEWAY_URL and st.get("hook"):
+        if tg("deleteWebhook", {}).get("ok"): st.pop("hook", None); log("webhook removed")
+
+def fetch_updates(st, wait):
+    if GATEWAY_URL and st.get("hook"):
+        try:
+            res = json.loads(http(GATEWAY_URL + "/updates", timeout=20, headers={"x-key": GATEWAY_KEY}))
+        except Exception as e:
+            log("gateway error", e); res = []
+        if not res and wait: time.sleep(min(wait, 6))   # 관문이 즉시 답하므로 6초마다만 확인
+        return res
+    return tg("getUpdates", {"offset": st.get("off", 0), "timeout": wait, "allowed_updates": ALLOWED}, timeout=wait + 20).get("result") or []
+
 def poll_buttons(st, wait=0):
     if DRY or not TOKEN: time.sleep(wait); return
-    res = tg("getUpdates", {"offset": st.get("off", 0), "timeout": wait, "allowed_updates": ["callback_query", "my_chat_member", "channel_post", "message"]},
-             timeout=wait + 20).get("result") or []
+    res = fetch_updates(st, wait)
+    if GATEWAY_URL and st.get("hook") and res:
+        try: http(GATEWAY_URL + "/updates", timeout=20, data=json.dumps([u["update_id"] for u in res]).encode(), headers={"x-key": GATEWAY_KEY, "content-type": "application/json"})
+        except Exception as e: log("gateway ack error", e)
     for u in res:
         st["off"] = u["update_id"] + 1
         mcm = u.get("my_chat_member") or {}
@@ -772,19 +796,22 @@ def poll_buttons(st, wait=0):
             if card: card["deleted"] = True; card["rx"] = card.get("rx") or "deleted"
             log("deleted", cid)
         elif act in ("rep", "ir"):
+            acked = u.get("_acked")   # 관문(Cloudflare)이 이미 답한 버튼
+            if acked == "link": continue   # 시작 화면을 연 사람: /start 로 다시 들어옴
             if not card:
-                tg("answerCallbackQuery", {"callback_query_id": cq["id"], "text": "카드 정보가 만료됐습니다."}); continue
+                if not acked: tg("answerCallbackQuery", {"callback_query_id": cq["id"], "text": "카드 정보가 만료됐습니다."})
+                continue
             uid = (cq.get("from") or {}).get("id")
             mchat = (msg.get("chat") or {})
             if mchat.get("type") == "private":
                 dest, reply = mchat["id"], msg.get("message_id")
             else:  # 채널 카드: 결과는 누른 사람 개인 대화로
                 dest, reply = uid, None
-                if not tg("sendChatAction", {"chat_id": uid, "action": "typing"}).get("ok"):  # 봇과 대화를 시작하지 않은 사람 → 시작 링크
+                if not acked and not tg("sendChatAction", {"chat_id": uid, "action": "typing"}).get("ok"):  # 봇과 대화를 시작하지 않은 사람 → 시작 링크
                     me = bot_name(st)
                     tg("answerCallbackQuery", {"callback_query_id": cq["id"], "url": f"https://t.me/{me}?start={act}_{cid}"}); continue
             enqueue_out(st, act, cid, dest, reply)
-            tg("answerCallbackQuery", {"callback_query_id": cq["id"], "text": ("리포트" if act == "rep" else "IR·Q&A 요약") + "를 개인 대화로 보내드립니다(처음 만들 땐 1~3분)."})
+            if not acked: tg("answerCallbackQuery", {"callback_query_id": cq["id"], "text": ("리포트" if act == "rep" else "IR·Q&A 요약") + "를 개인 대화로 보내드립니다(처음 만들 땐 1~3분)."})
 
 def bot_name(st):
     if not st.get("me"):
@@ -1525,6 +1552,8 @@ def main():
                 tg("editMessageReplyMarkup", {"chat_id": c.get("chat") or CHANNEL, "message_id": c["msg"], "reply_markup": keyboard(cid, c)}); time.sleep(0.5)
         st["kb_v2"] = True; save(st)
     try: sync_jp_stock(st)
+    except Exception: traceback.print_exc()
+    try: gateway_setup(st)
     except Exception: traceback.print_exc()
     last_scan = 0
     while time.time() - t0 < RUN_SECONDS:
