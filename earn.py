@@ -50,7 +50,7 @@ SECTOR_KO = {
 def now(): return dt.datetime.now(JST)
 def log(*a): print(now().strftime("%H:%M:%S"), *a, flush=True)
 # 상태 파일은 공개 저장소에 올라가므로 사용자 정보(텔레그램 계정 번호·관심 종목·요청 기록)는 암호화해서 저장
-PRIVATE_KEYS = ("owner", "subs", "watch_sent", "ask_q", "ask_recent", "jps_codes", "users", "blocked", "rep_q", "ir_q", "pending_start")
+PRIVATE_KEYS = ("owner", "subs", "watch_sent", "ask_q", "ask_recent", "jps_codes", "users", "blocked", "rep_q", "ir_q", "pending_start", "prefs", "alerts")
 def _skey():
     import hashlib
     return hashlib.sha256(("earn-state-v1:" + (os.environ.get("STATE_KEY") or TOKEN or "")).encode()).digest()
@@ -554,6 +554,8 @@ def card_text(a, ai, row):
     per = ""
     if a.get("cap") and fc.get("ni") and fc["ni"] > 0:
         per = f" · PER <b>{a['cap'] * 1e8 / fc['ni']:.1f}배</b> ({fy_label_end(r.get('fc_end'))} 순이익 예상 기준)"
+    v = a.get("val") or {}
+    if v.get("pbr"): per += f" · PBR <b>{v['pbr']:.2f}배</b>"
     L.append(f"시총 <b>{a['cap']:,.0f}억 엔</b>{per}" if a.get("cap") else "시총 —")
     if a.get("ondemand"):
         L.append("요청 분석 · 스크리닝 " + (("통과: " + " · ".join(a["hit"])) if a.get("pass") else ("미통과" + (f"({a['why']})" if a.get("why") else ""))))
@@ -586,6 +588,9 @@ def card_text(a, ai, row):
              f"({yoy_txt(m['rev_yoy'], m['rev_st'])}/{yoy_txt(m['op_yoy'], m['op_st'])}/{yoy_txt(m['ni_yoy'], m['ni_st'])})")
     if py:
         L.append(f" 전년 동기 {oku(py.get('rev'))}/{oku(py.get('op'))}/{oku(py.get('ni'))}")
+    if v.get("cons_rev") and q.get("rev"):
+        cr = v["cons_rev"] / 1e6
+        L.append(f" 매출 컨센서스 {oku(cr)} 대비 <b>{(q['rev'] / cr - 1) * 100:+.1f}%</b> (Yahoo 애널리스트 {v.get('cons_n') or '?'}명 평균)")
     if not g_line and fc.get("op") and r["q"] < 4:
         g_line = f"{fy_label_end(r.get('fc_end'))} 영업이익 예상 {oku(fc['op'] / 1e6)}"
     elif not g_line and fc.get("op") and r["q"] == 4:
@@ -874,8 +879,19 @@ def qa_followup(st, day, rows):
         except Exception:
             traceback.print_exc()
 
+class _key2:
+    """리포트·IR·시장 반응은 보조 Gemini 키(GEMINI_API_KEY_2)가 있으면 그 키로 — 카드용 한도와 분리"""
+    def __enter__(self):
+        self.k = os.environ.get("GEMINI_API_KEY")
+        if os.environ.get("GEMINI_API_KEY_2"): os.environ["GEMINI_API_KEY"] = os.environ["GEMINI_API_KEY_2"]
+    def __exit__(self, *a):
+        if self.k is not None: os.environ["GEMINI_API_KEY"] = self.k
+
 def do_reports(st):
     do_asks(st)
+    with _key2(): _do_reports(st)
+
+def _do_reports(st):
     do_ir(st)
     q = st.get("rep_q") or []
     while q:
@@ -953,7 +969,7 @@ def resolve(q):
 
 def label_of(code):
     for c, jp, en, ko in name_index():
-        if c == code: return f"{en or ko or jp}({c})"
+        if c == code: return f"{ko or en or jp}({c})"
     return code
 
 def analyze_code(code):
@@ -1013,12 +1029,13 @@ def analyze_code(code):
 HELP_TXT = ("일본 실적 스크리닝 봇 사용법\n"
             "• 종목 코드(예: 6857)나 이름(예: 어드반테스트, 화낙)을 보내면 최근 분기 실적 카드를 이 대화로 보내드립니다.\n"
             "• /add 6857 7203 — 관심 종목 등록: 결산단신이 나오면 스크리닝 통과 여부와 상관없이 카드를 이 대화로 보내드립니다.\n"
-            "• /del 6857 — 관심 종목 삭제 · /list — 내 관심 종목 보기\n"
+            "• /del 6857 — 관심 종목 삭제 · /list — 내 관심 종목과 다음 실적 발표일\n"
+            "• /alert on — 채널 통과 카드를 개인 대화로도 받기, /mincap 1000 · /exsector 은행 · /onlyrule 매출 고성장 으로 내 조건만 · /myrules 확인\n"
             "• 카드의 📄 리포트·🗣 IR·Q&A 버튼으로 상세 자료도 받을 수 있습니다.\n"
             "스크리닝 기준을 통과한 종목은 지금처럼 채널에 올라갑니다.")
 
 
-GUIDE_VER = 3  # 공지 문구를 바꾸면 올림 → 고정 공지를 새 내용으로 수정
+GUIDE_VER = 4  # 공지 문구를 바꾸면 올림 → 고정 공지를 새 내용으로 수정
 def guide_text(me):
     R = RULES
     sec = ", ".join(sorted(dict.fromkeys(SECTOR_KO.get(x, x) for x in EXCL_SECTORS)))
@@ -1038,12 +1055,42 @@ def guide_text(me):
             f"<b>내 종목만 따로 받기</b> — 봇 @{me} 과 1:1 대화를 열고(채널 구독자는 채널에 글을 쓸 수 없습니다)\n"
             "• 종목 코드나 이름 보내기(예: 6857, 어드반테스트) → 최근 분기 실적 카드를 개인 대화로(규칙 통과 여부 표시)\n"
             "• /add 6857 7203 → 관심 종목 등록. 결산단신이 나오면 규칙 통과 여부와 상관없이 개인 대화로 카드 발송\n"
-            "• /del 6857 삭제 · /list 목록 · /start 사용법\n\n"
+            "• /del 6857 삭제 · /list 목록(다음 실적 발표일 포함) · /start 사용법\n"
+            "• /alert on → 이 채널 카드를 개인 대화로도. /mincap 1000(시총 하한) · /exsector 은행 건설(업종 제외) · /onlyrule 매출 고성장(규칙 선택)으로 내 조건에 맞는 것만 · /myrules 확인\n\n"
+            "매주 토요일 15시: 이번 주 통과 종목과 규칙별 성과(다음 날·1주·1개월 TOPIX 대비)를 이 채널에 올립니다.\n\n"
             "카드의 📄 리포트(사업부·지역별 상세 분석, note·야후 게시판·증권사 레이팅 등 시장 반응), 🗣 IR·Q&A(설명회 질의응답 요약) 버튼은 누구나 누를 수 있고, 결과는 누른 사람의 개인 대화로 갑니다(봇과 대화를 시작하지 않았다면 시작 화면이 열립니다).\n"
             "<i>투자 자문이 아닌 공시 정리입니다.</i>")
 
+def pref_cmd(st, chat, text):
+    """개인별 규칙: /alert on|off · /mincap 1000 · /exsector 은행 건설 (/exsector 로 초기화) · /onlyrule 매출 고성장 · /myrules"""
+    m = re.match(r"^/(alert|mincap|exsector|onlyrule|myrules)\b\s*(.*)$", text.strip(), re.I)
+    if not m: return False
+    cmd, arg = m.group(1).lower(), m.group(2).strip()
+    pr = st.setdefault("prefs", {}).setdefault(str(chat["id"]), {})
+    rules = ["매출 성장", "매출 고성장", "성장 가속", "턴어라운드"]
+    if cmd == "alert":
+        pr["alert"] = arg.lower() not in ("off", "끄기", "0")
+    elif cmd == "mincap":
+        try: pr["mincap"] = float(re.sub(r"[^\d.]", "", arg) or 0)
+        except ValueError: pass
+    elif cmd == "exsector":
+        known = set(SECTOR_KO.values())
+        pr["ex"] = [x for x in re.split(r"[,\s]+", arg) if x in known]
+    elif cmd == "onlyrule":
+        pr["rules"] = [r for r in rules if r.replace(" ", "") in arg.replace(" ", "") or (r == "매출 성장" and "이익" in arg)]
+    if not any(pr.get(k) for k in ("alert", "mincap", "ex", "rules")): st["prefs"].pop(str(chat["id"]), None)
+    tg("sendMessage", {"chat_id": chat["id"], "text":
+        "내 알림 규칙\n"
+        f"• 채널 통과 카드 개인 알림: {'켜짐' if pr.get('alert') else '꺼짐'} (/alert on · /alert off)\n"
+        f"• 최소 시총: {pr.get('mincap') or 0:,.0f}억 엔 (/mincap 1000)\n"
+        f"• 제외 업종: {', '.join(pr.get('ex') or []) or '없음'} (/exsector 은행 건설 · /exsector 로 초기화)\n"
+        f"• 규칙: {', '.join(pr.get('rules') or []) or '전체'} (/onlyrule 매출 고성장 성장 가속 · /onlyrule 로 초기화)\n"
+        f"업종 이름 예: {', '.join(sorted(set(SECTOR_KO.values()))[:12])} …"})
+    return True
+
 def user_cmd(st, chat, text):
     """개인 대화 명령: /add /del /list (사용자마다 관심 종목 따로 보관)"""
+    if pref_cmd(st, chat, text): return True
     m = re.match(r"^/(add|del|list|추가|삭제|목록)\b(.*)$", text.strip(), re.I)
     if not m: return False
     cmd, rest = m.group(1).lower(), m.group(2)
@@ -1063,22 +1110,31 @@ def user_cmd(st, chat, text):
         for c in gone: mine.remove(c)
         msg = (f"삭제: {', '.join(label_of(c) for c in gone)}" if gone else "목록에 없는 종목입니다.") + f"\n(관심 종목 {len(mine)}개)"
     else:
-        msg = f"관심 종목 {len(mine)}개\n" + ("\n".join(label_of(c) for c in mine) if mine else "(없음) /add 6857 처럼 추가하세요.")
+        sched = (jp_state().get("sched") or {})
+        def nxt(c):
+            d = (sched.get(c) or [None])[0]
+            return f" · 다음 실적 {int(d[5:7])}/{int(d[8:10])}" if d else ""
+        msg = f"관심 종목 {len(mine)}개\n" + ("\n".join(label_of(c) + nxt(c) for c in sorted(mine, key=lambda c: (sched.get(c) or ["9999"])[0])) if mine else "(없음) /add 6857 처럼 추가하세요.")
     if not mine: subs.pop(uid, None)
     tg("sendMessage", {"chat_id": chat["id"], "text": msg})
     return True
 
 JP_STATE_URL = "https://raw.githubusercontent.com/ssamgij-bit/jpall/state/state.json"
+_JPS = {"t": 0, "d": {}}
+def jp_state():
+    """공시봇 상태(컨센서스 cons·발표 예정일 sched·구독 watch) — 30분마다 새로 읽음"""
+    if time.time() - _JPS["t"] > 1800:
+        try: _JPS["d"] = json.loads(http(JP_STATE_URL, timeout=30)); _JPS["t"] = time.time()
+        except Exception as e: log("jp state error", e)
+    return _JPS["d"]
 def sync_jp_stock(st):
     """japan stock 봇(@JP_stock_yh_bot) 구독 목록 → 이 봇 관심 종목(주인). 공시 채널 봇(JP_ALL)이 하루 한 번 받아 둔 목록을 읽음.
     직접 /add 한 종목은 그대로 두고, japan stock 봇에서 빠진 종목만 같이 뺌"""
     d = now().strftime("%Y%m%d")
     if st.get("jps_date") == d: return
     st["jps_date"] = d
-    try:
-        j = json.loads(http(JP_STATE_URL, timeout=30))
-    except Exception as e:
-        log("jp stock sync error", e); return
+    j = jp_state()
+    if not j: return
     owner = j.get("owner")
     if owner and st.get("owner") is None: st["owner"] = owner  # 주인 = 두 봇에 같은 텔레그램 계정
     if not owner or str(owner) != str(st.get("owner")): return
@@ -1282,6 +1338,20 @@ def process_day(st, day, test=False):
         time.sleep(3.5)
     return passed
 
+def valuation(code):
+    """PBR(Yahoo 시세) + 분기 매출 컨센서스(공시봇이 발표 전에 받아 둔 Yahoo 애널리스트 평균)"""
+    out = {}
+    try:
+        import jpall
+        q = jpall.yf_quotes([code]).get(code) or {}
+        if q.get("priceToBook") and 0 < q["priceToBook"] < 200: out["pbr"] = float(q["priceToBook"])
+    except Exception as e:
+        log("pbr error", e)
+    c = (jp_state().get("cons") or {}).get(code) or {}
+    if c.get("rev") and time.time() - c.get("ts", 0) < 86400 * 8:
+        out["cons_rev"] = c["rev"]; out["cons_n"] = c.get("rev_n")
+    return out
+
 def make_card(st, cid, a, row, chat=None):
     """분석 결과 → Gemini 요약 → 카드(차트+글) 게시 → 상태에 저장. 게시 실패면 None"""
     if True:
@@ -1289,6 +1359,8 @@ def make_card(st, cid, a, row, chat=None):
         m = metrics(a["series"], len(a["series"]) - 1)
         nums = (f"이번 분기 매출 {oku(m['q'].get('rev'))}엔({yoy_txt(m['rev_yoy'], m['rev_st'])}), 영업이익 {oku(m['q'].get('op'))}엔"
                 f"({yoy_txt(m['op_yoy'], m['op_st'])}), 순이익 {oku(m['q'].get('ni'))}엔({yoy_txt(m['ni_yoy'], m['ni_st'])})")
+        try: a["val"] = valuation(a["code"])
+        except Exception as e: log("valuation error", e)
         mat_pdf, mat_url, mat_src = find_mat_pdf(a, row)
         ai = ai_card({"name": a["name"], "code": a["code"], "sector": a["sector"], "profile": a.get("profile", ""), "nums": nums, "qual": a.get("qual", "")}, mat_pdf)
         if ai is not None and mat_pdf: ai["_src"] = mat_src
@@ -1298,6 +1370,9 @@ def make_card(st, cid, a, row, chat=None):
         card_chart(chart_name, a["series"], fem, buf)
         msg = post_card(st, cid, cap, buf.getvalue(), chat)
         if msg is None and not DRY: return None
+        if not chat and a.get("pass") and not a.get("ondemand"):  # 채널 통과 카드: 성과 추적 + 개인 알림
+            st.setdefault("perf_log", []).append({"cid": cid, "code": a["code"], "name": name_of(a["code"], a["name"], ai), "d": row["d"],
+                                                 "t": row.get("t") or "15:30", "hit": a["hit"], "cap": a.get("cap"), "sector": a.get("sector")})
         st.setdefault("cards", {})[cid] = {
             "code": a["code"], "name": a["name"], "name_ko": name_of(a["code"], a["name"], ai), "d": row["d"], "t": row.get("t") or "15:30", "msg": msg,
             "caption": cap, "ts": time.time(), "sector": a["sector"], "cap": a.get("cap"), "pdf": row.get("pdf"), "xbrl": row.get("xbrl"),
@@ -1306,11 +1381,103 @@ def make_card(st, cid, a, row, chat=None):
             "ai": ai, "profile": a.get("profile", "")[:600], "qual": a.get("qual", "")[:8000], "chat": str(chat or CHANNEL)}
         return msg
 
+def fanout_personal(st):
+    """개인별 규칙(/alert on, /mincap, /exsector)을 켠 사용자에게 새 채널 카드 중 조건에 맞는 것만 개인 대화로 복사"""
+    prefs = st.get("prefs") or {}
+    if not prefs: return
+    done = st.setdefault("fan_done", [])
+    for p in st.get("perf_log", [])[-50:]:
+        c = st.get("cards", {}).get(p["cid"])
+        if p["cid"] in done or not c or not c.get("msg"): continue
+        done.append(p["cid"])
+        for uid, pr in prefs.items():
+            if not pr.get("alert"): continue
+            if pr.get("mincap") and (p.get("cap") or 0) < pr["mincap"]: continue
+            if SECTOR_KO.get(p.get("sector"), p.get("sector")) in (pr.get("ex") or []): continue
+            if pr.get("rules") and not set(pr["rules"]) & set(p.get("hit") or []): continue
+            r = tg("copyMessage", {"chat_id": uid, "from_chat_id": CHANNEL, "message_id": c["msg"], "reply_markup": keyboard(p["cid"], c)})
+            if not r.get("ok") and BLOCK_RE.search(LAST_ERR["d"] or ""): drop_user(st, uid); pr["alert"] = False
+            bump(st, "fan"); time.sleep(0.2)
+    st["fan_done"] = done[-300:]
+
+def perf_update(st):
+    """채널 통과 카드의 1주(5거래일)·1개월(20거래일) 수익률과 TOPIX 대비 초과수익(발표 전 종가 기준) — 하루 한 번(16시 이후)"""
+    d = now().strftime("%Y%m%d")
+    if st.get("perf_date") == d or now().hour < 16: return
+    st["perf_date"] = d
+    if not st.get("perf_seeded"):  # 처음 한 번: 이미 채널에 나간 통과 카드도 성과 추적에 넣음
+        have = {p["cid"] for p in st.get("perf_log", [])}
+        for cid, c in st.get("cards", {}).items():
+            if cid in have or cid.startswith("q") or not c.get("hit") or (c.get("chat") and str(c["chat"]) != str(CHANNEL)): continue
+            st.setdefault("perf_log", []).append({"cid": cid, "code": c["code"], "name": c.get("name_ko") or c.get("name"), "d": c["d"],
+                                                 "t": c.get("t") or "15:30", "hit": c["hit"], "cap": c.get("cap"), "sector": c.get("sector")})
+        st["perf_seeded"] = True; st["fan_done"] = [p["cid"] for p in st.get("perf_log", [])]
+    tp = None
+    for p in st.get("perf_log", []):
+        if p.get("m1x") is not None: continue
+        try:
+            bars = naver_daily(f"{p['code']}.T", days=120)
+            if tp is None: tp = {b["d"]: b["c"] for b in naver_daily(".TOPX", days=150, index=True)}
+        except Exception as e:
+            log("perf error", p["code"], e); continue
+        ds = f"{p['d'][:4]}-{p['d'][4:6]}-{p['d'][6:]}"
+        intraday = p.get("t", "15:30") < "15:30"
+        k0 = next((i for i, b in enumerate(bars) if (b["d"] >= ds if intraday else b["d"] > ds)), None)
+        if not k0: continue
+        base = bars[k0 - 1]
+        for key, n in (("d1", 1), ("w1", 5), ("m1", 20)):
+            if p.get(key + "x") is not None or k0 + n - 1 >= len(bars): continue
+            e = bars[k0 + n - 1]
+            ret = (e["c"] / base["c"] - 1) * 100
+            mk = (tp.get(e["d"]) / tp.get(base["d"]) - 1) * 100 if tp.get(e["d"]) and tp.get(base["d"]) else 0.0
+            p[key] = round(ret, 2); p[key + "x"] = round(ret - mk, 2)
+        time.sleep(0.3)
+    cut = (now() - dt.timedelta(days=200)).strftime("%Y%m%d")
+    st["perf_log"] = [p for p in st.get("perf_log", []) if p["d"] >= cut]
+
+WEEKLY_DOW, WEEKLY_HOUR = 5, 15   # 토요일 15시
+def weekly_post(st):
+    """토요일: 이번 주 통과 종목(다음 날 주가 반응 순) + 규칙별 성과표(최근 120일)"""
+    n = now(); wk = n.strftime("%G-%V")
+    if n.weekday() != WEEKLY_DOW or n.hour < WEEKLY_HOUR or st.get("weekly_done") == wk: return
+    st["weekly_done"] = wk
+    week0 = (n - dt.timedelta(days=7)).strftime("%Y%m%d")
+    pl = st.get("perf_log", [])
+    wkp = sorted([p for p in pl if p["d"] > week0], key=lambda p: -(p.get("d1x") if p.get("d1x") is not None else -999))
+    L = [f"🗓 <b>이번 주 실적 스크리닝 정리</b> ({(n - dt.timedelta(days=6)).strftime('%m/%d')}~{n.strftime('%m/%d')})", f"통과 {len(wkp)}종목 · 다음 날 TOPIX 대비 주가 반응 순", ""]
+    for p in wkp[:25]:
+        rx = f"{p['d1x']:+.1f}%p" if p.get("d1x") is not None else "반응 대기"
+        L.append(f"• {esc(p.get('name') or p['code'])}({p['code']}) {rx} — {' · '.join(p.get('hit') or [])}")
+    if len(wkp) > 25: L.append(f"… 외 {len(wkp) - 25}종목")
+    L += ["", "<b>규칙별 성과</b>(최근 120일 통과 종목, 발표 전 종가 기준 TOPIX 대비 초과수익 평균 · 플러스 비율)"]
+    cut = (n - dt.timedelta(days=120)).strftime("%Y%m%d")
+    rules = ["매출 성장", "매출 고성장", "성장 가속", "턴어라운드"]
+    for r in rules + ["전체"]:
+        g = [p for p in pl if p["d"] >= cut and (r == "전체" or r in (p.get("hit") or []))]
+        def avg(k):
+            xs = [p[k] for p in g if p.get(k) is not None]
+            return (f"{sum(xs) / len(xs):+.1f}%p({sum(1 for x in xs if x > 0) / len(xs) * 100:.0f}%·{len(xs)}건)" if xs else "—")
+        lab = "매출·이익 성장" if r == "매출 성장" else r
+        L.append(f"• {lab} {len(g)}건 — 다음 날 {avg('d1x')} · 1주 {avg('w1x')} · 1개월 {avg('m1x')}")
+    L.append("<i>투자 자문이 아닌 기록 정리입니다. 표본이 적을 땐 참고만.</i>")
+    tg("sendMessage", {"chat_id": CHANNEL, "text": "\n".join(L), "parse_mode": "HTML", "disable_web_page_preview": True})
+    log("weekly posted", len(wkp))
+
+ERRS = {"n": 0}
+def alert_owner(st, text, key, every=6 * 3600):
+    """주인에게 장애 알림(같은 종류는 every초에 한 번)"""
+    al = st.setdefault("alerts", {})
+    if time.time() - al.get(key, 0) < every or not st.get("owner"): return
+    al[key] = time.time()
+    tg("sendMessage", {"chat_id": st["owner"], "text": "⚠️ 실적 스크리닝 봇: " + text})
+
 def cleanup(st):
     cut = (now() - dt.timedelta(days=5)).strftime("%Y%m%d")
     st["seen"] = {k: v for k, v in st.get("seen", {}).items() if v >= cut}
     old = time.time() - 86400 * 30
     st["cards"] = {k: v for k, v in st.get("cards", {}).items() if v.get("ts", 0) > old}
+    for c in st["cards"].values():  # 1주 지난 카드는 큰 원문 자료를 비워 상태 파일을 가볍게
+        if time.time() - c.get("ts", 0) > 86400 * 7: c.pop("qual", None)
     st["log"] = st.get("log", [])[-3000:]
 
 def main():
@@ -1369,9 +1536,14 @@ def main():
                 for back in (1, 0):
                     process_day(st, (now() - dt.timedelta(days=back)).strftime("%Y%m%d"))
                 update_reactions(st)
+                fanout_personal(st)
+                perf_update(st)
+                weekly_post(st)
                 cleanup(st); save(st)
-        except Exception:
+        except Exception as e:
             traceback.print_exc()
+            ERRS["n"] += 1
+            if ERRS["n"] >= 5: alert_owner(st, f"이번 실행에서 오류가 {ERRS['n']}번 났습니다. 마지막 오류: {str(e)[:200]}", "loop_err"); ERRS["n"] = 0
         poll_buttons(st, wait=25)
         save(st)
     save(st)
