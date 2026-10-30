@@ -1,0 +1,53 @@
+name: 배포 전 점검
+
+on:
+  push:
+    branches: [main]
+    paths: ["**.py", ".github/workflows/**"]
+  workflow_dispatch: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 필요한 패키지
+        run: pip install -q -r requirements.txt pyyaml
+      - name: 문법 검사 + 불러오기 시험(봇 토큰 없이)
+        id: test
+        run: |
+          python -m py_compile *.py
+          python - <<'PY'
+          import importlib, sys, os, yaml, glob
+          sys.path.insert(0, os.getcwd())
+          for m in ("jpall", "xbrl", "jp2ko", "earn", "earn_report", "earn_ir", "earn_opinion", "holdings", "stcrypt"):
+              if os.path.exists(m + ".py"):
+                  importlib.import_module(m); print("import ok", m)
+          for f in glob.glob(".github/workflows/*.yml"):
+              yaml.safe_load(open(f)); print("yaml ok", f)
+          PY
+      - name: 실패하면 주인에게 텔레그램 알림
+        if: failure()
+        env:
+          EARN_TOKEN: ${{ secrets.EARN_TOKEN }}
+          WATCH_KEY: ${{ secrets.WATCH_KEY }}
+          SHA: ${{ github.sha }}
+          MSG: ${{ github.event.head_commit.message }}
+          URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python - <<'PY'
+          import json, os, sys, urllib.request
+          sys.path.insert(0, os.getcwd())
+          import stcrypt
+          st = json.loads(urllib.request.urlopen("https://raw.githubusercontent.com/" + os.environ["GITHUB_REPOSITORY"] + "/state/state.json", timeout=30).read())
+          owner = stcrypt.reveal(st).get("owner")
+          if isinstance(owner, int) and owner > 0 and os.environ.get("EARN_TOKEN"):
+              text = f"⚠️ 배포 전 점검 실패\n커밋 {os.environ['SHA'][:7]}: {(os.environ.get('MSG') or '').splitlines()[0][:80]}\n다음 봇 실행에서 오류가 날 수 있습니다. 로그: {os.environ['URL']}"
+              urllib.request.urlopen(urllib.request.Request(f"https://api.telegram.org/bot{os.environ['EARN_TOKEN']}/sendMessage",
+                  data=json.dumps({"chat_id": owner, "text": text}).encode(), headers={"content-type": "application/json"}), timeout=30)
+              print("alert sent")
+          PY

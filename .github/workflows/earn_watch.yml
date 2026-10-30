@@ -10,9 +10,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - uses: actions/checkout@v4   # 암호화된 주인 ID를 풀 stcrypt.py
       - name: 마지막 상태 저장 시각 확인 → 멈췄으면 주인에게 텔레그램 알림
         env:
           EARN_TOKEN: ${{ secrets.EARN_TOKEN }}
+          WATCH_KEY: ${{ secrets.WATCH_KEY }}
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
@@ -27,7 +29,10 @@ jobs:
               except urllib.error.HTTPError as e:
                   if auth and e.code in (401, 403, 404) and "api.github.com" in u: return get(u, False)   # 다른 저장소(공개)는 인증 없이
                   raise
-          owner = get(f"https://raw.githubusercontent.com/{repo}/state/state.json").get("owner")
+          import sys; sys.path.insert(0, os.getcwd())
+          import stcrypt
+          owner = stcrypt.reveal(get(f"https://raw.githubusercontent.com/{repo}/state/state.json")).get("owner")
+          if not isinstance(owner, int) or owner <= 0: owner = None
           down = []
           for br, name in (("earn-state", "실적 스크리닝 봇"), ("state", "일본공시봇(JP_ALL)")):
               c = get(f"https://api.github.com/repos/{repo}/commits/{br}")
