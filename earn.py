@@ -746,24 +746,39 @@ def update_reactions(st):
             log("reaction updated", c["code"], f"{rx['close']:+.1f}%")
 
 # ───────────────────────── 버튼 처리 ─────────────────────────
-GATEWAY_URL = os.environ.get("GATEWAY_URL", "").rstrip("/")   # 즉시 응답 관문(Cloudflare Worker). 있으면 웹훅 방식
-GATEWAY_KEY = os.environ.get("GATEWAY_KEY", "")
+GATEWAY_URL = os.environ.get("GATEWAY_URL", "").strip().rstrip("/")   # 즉시 응답 관문(Cloudflare Worker). "off" 면 예전 방식
+if GATEWAY_URL.lower() in ("off", "none", "0"): GATEWAY_URL = ""
+def _gw_key():
+    import hashlib
+    return os.environ.get("GATEWAY_KEY") or hashlib.sha256(("earn-gateway-v1:" + TOKEN).encode()).hexdigest()
+GATEWAY_KEY = _gw_key() if TOKEN else ""
 ALLOWED = ["callback_query", "my_chat_member", "channel_post", "message"]
+GW_ERRS = [0]
+def gateway_off(st, why):
+    if st.get("hook") and tg("deleteWebhook", {}).get("ok"):
+        st.pop("hook", None); log("webhook removed:", why)
 def gateway_setup(st):
-    """관문 주소가 있으면 텔레그램 웹훅을 관문으로, 없어지면 웹훅을 끄고 예전 방식(getUpdates)으로"""
+    """관문에 봇 토큰·키를 등록(관문은 getMe 로 진짜 봇인지 확인)하고 텔레그램 웹훅을 관문으로. 실패하면 예전 방식(getUpdates)"""
     if DRY or not TOKEN: return
-    if GATEWAY_URL and GATEWAY_KEY and st.get("hook") != GATEWAY_URL:
+    if not GATEWAY_URL: return gateway_off(st, "no gateway")
+    try:
+        r = http(GATEWAY_URL + "/setup", timeout=20, data=json.dumps({"token": TOKEN, "key": GATEWAY_KEY}).encode(), headers={"content-type": "application/json"}).decode()
+        if r.strip() != "ok": raise ValueError(r[:80])
+    except Exception as e:
+        log("gateway setup error", e); return gateway_off(st, "setup failed")
+    if st.get("hook") != GATEWAY_URL:
         r = tg("setWebhook", {"url": GATEWAY_URL + "/tg", "secret_token": GATEWAY_KEY, "allowed_updates": ALLOWED, "drop_pending_updates": False})
         if r.get("ok"): st["hook"] = GATEWAY_URL; log("webhook set", GATEWAY_URL)
-    elif not GATEWAY_URL and st.get("hook"):
-        if tg("deleteWebhook", {}).get("ok"): st.pop("hook", None); log("webhook removed")
+        else: log("setWebhook failed", r)
 
 def fetch_updates(st, wait):
     if GATEWAY_URL and st.get("hook"):
         try:
             res = json.loads(http(GATEWAY_URL + "/updates", timeout=20, headers={"x-key": GATEWAY_KEY}))
+            GW_ERRS[0] = 0
         except Exception as e:
-            log("gateway error", e); res = []
+            log("gateway error", e); res = []; GW_ERRS[0] += 1
+            if GW_ERRS[0] >= 5: gateway_off(st, "gateway unreachable")   # 관문이 계속 안 되면 예전 방식으로(다음 실행 때 다시 시도)
         if not res and wait: time.sleep(min(wait, 6))   # 관문이 즉시 답하므로 6초마다만 확인
         return res
     return tg("getUpdates", {"offset": st.get("off", 0), "timeout": wait, "allowed_updates": ALLOWED}, timeout=wait + 20).get("result") or []
