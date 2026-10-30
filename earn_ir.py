@@ -73,7 +73,7 @@ def find_qa(code, since_day, days=14):
 # ───────────────────────── 회사 IR 홈페이지·로그미 ─────────────────────────
 import urllib.parse
 SKIP_HOST = ("kabutan", "minkabu", "japannext", "apple.com", "hrmos", "google", "sbisec", "twitter", "x.com", "facebook", "youtube", "line.me")
-QA_LINK = re.compile(r"質疑応答|質疑|Q&A|Q＆A|QA|主な質問|書き起こし|書起こし|文字起こし|スクリプト|Transcript|説明会[^<]{0,12}(要旨|内容|概要|記録|動画)|スモールミーティング", re.I)
+QA_LINK = re.compile(r"質疑応答|質疑|Q&A|Q＆A|(?<![A-Za-z])QA(?![A-Za-z])|主な質問|書き起こし|書起こし|文字起こし|スクリプト|Transcript|説明会[^<]{0,12}(要旨|内容|概要|記録)|スモールミーティング", re.I)
 
 def company_site(code):
     s = E.mget(f"https://s.kabutan.jp/stocks/{code}/")
@@ -215,10 +215,13 @@ def ir_site_docs(code, since_day, limit=2, pat=None, period=None):
         for u, t, d in _links(p, body):
             h = urllib.parse.urlparse(u).netloc
             if pat.search(t) or pat.search(urllib.parse.unquote(u)):
-                if re.search(r"\.(mp4|mp3|m4a|wav)($|\?)|vimeo\.com|youtube\.com|youtu\.be", u, re.I): continue  # 음성·영상
+                lm = re.search(r"finance\.logmi\.jp/(?:articles/)?(\d+)", u)
+                if lm and not d:  # 회사 홈페이지의 로그미 기사 링크: 날짜가 안 적혀 있으면 로그미 최신 목록으로 확인
+                    d = logmi_date(int(lm.group(1)))
+                    if d == "old": continue  # 최신 목록(약 6주)보다 오래된 기사 = 지난 분기
                 if d and d < since_day: continue
                 if not d and stale_years(t + " " + urllib.parse.unquote(u), since_day): continue  # 날짜 없이 옛 연도만 보이는 자료(예: 2024년 설명회)
-                if NOISE.search(t): continue  # 채용 Q&A·FAQ 등
+                if _bad(t, u, d): continue  # 영상만·채용·FAQ·행사 안내 등
                 if not d and period and period_score(t + " " + urllib.parse.unquote(u), period) < 0: continue  # 다른 회계연도 자료
                 hits.append((t[:60] or "질의응답 자료", u, d))
             elif depth == 0 and h == host and IR_PAGE.search(u) and IR_TEXT.search(t + u):
@@ -241,7 +244,7 @@ def ir_site_docs(code, since_day, limit=2, pat=None, period=None):
     if cid:
         xj = xj_docs(cid, since_day, pat)
         if xj: E.log("xj-storage", code, cid, len(xj))
-        hits = xj + hits
+        hits = [x for x in xj if not _bad(*x)] + hits
     if not any(d and d >= since_day for _, _, d in hits) and irpages:
         # 이번 결산 이후 날짜가 확인된 자료가 없음 → 자바스크립트로 그리는 목록일 수 있으니 브라우저로 열어 봄(자료실·설명회 페이지 우선)
         cand = sorted(dict.fromkeys(irpages), key=lambda u: -len(re.findall(r"library|presentation|event|setsumei|kessan|material|siryo|shiryo|briefing|meeting", u, re.I)))
@@ -261,9 +264,32 @@ def ir_site_docs(code, since_day, limit=2, pat=None, period=None):
     for x in ranked:
         t, u, d = x
         if best > 0 and rank(x)[0] == 0 and len(out) >= 1: continue  # 확실한 자료가 있으면 불확실한 것으로 채우지 않음
-        if u in urls: continue
-        urls.add(u); out.append((t, u, d))
+        fk = urllib.parse.unquote(u).rstrip("/").split("/")[-1].lower()
+        if u in urls or fk in urls: continue   # 같은 파일(주소만 조금 다른 링크) 중복
+        urls.update((u, fk)); out.append((t, u, d))
+    if out: E.log("ir site picks", code, " / ".join(f"{t[:25]}({d or '날짜 없음'})" for t, u, d in out[:limit]))
     return out[:limit]
+
+TEXTISH = re.compile(r"書き起こし|書起こし|文字起こし|スクリプト|質疑|Q&A|Q＆A|Transcript|要旨|記録|ログミー|logmi", re.I)
+def _bad(t, u, d):
+    """질의응답·설명회 기록이 아닌 링크: 영상만, 채용·FAQ·제품 Q&A, 제목 없는 링크, 행사 개최 안내, (날짜 없는) 주주총회"""
+    tu = t + " " + urllib.parse.unquote(u)
+    if re.search(r"\.(mp4|mp3|m4a|wav)($|\?)|vimeo\.com|youtube\.com|youtu\.be", u, re.I): return True
+    if re.search(r"動画|映像|配信|ムービー", t) and not TEXTISH.search(tu): return True
+    if NOISE.search(t) or (not d and re.search(r"recruit|saiyo|/faq|/qa/?$|/q/", u, re.I)): return True
+    if not d and (not t.strip() or re.fullmatch(r"\s*(Q&A|Q＆A|QA|質疑応答|よくあるご?質問)\s*", t, re.I)): return True
+    if re.search(r"開催(の|に関する)?(お知らせ|ご案内)|開催について|開催予定", t) and not re.search(r"書き起こし|書起こし|文字起こし|スクリプト|要旨|記録|公開", t): return True
+    if not d and "株主総会" in t: return True
+    return False
+
+def logmi_date(aid):
+    """로그미 기사 번호 → 최신 목록에 있으면 개최일(YYYYMMDD), 목록의 가장 오래된 기사보다 번호가 작으면 "old", 모르면 None"""
+    try: items = logmi_index()
+    except Exception: return None
+    ids = {int(re.search(r"(\d+)$", it["url"]).group(1)): it["d"] for it in items}
+    if not ids: return None
+    if aid in ids: return ids[aid]
+    return "old" if aid < min(ids) else None
 
 NOISE = re.compile(r"採用|リクルート|新卒|よくある|FAQ|製品|商品|サービスについて|お客様")
 def period_score(txt, period):
