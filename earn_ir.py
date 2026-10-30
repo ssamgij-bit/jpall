@@ -32,6 +32,9 @@ IR_PROMPT = """첨부 PDF는 일본 상장사 {name}({code})의 이번 결산 �
 SLOW = {}  # 모델 → 다시 시도할 시각(응답 지연·과부하일 때)
 def gemini_pdfs(prompt, pdfs):
     import jpall; key = jpall.gem_key()
+    bad = [p for p in pdfs if not (p and b"%PDF" in p[:1024])]
+    if bad: E.log("not-pdf docs dropped", len(bad))
+    pdfs = [p for p in pdfs if p and b"%PDF" in p[:1024]]   # PDF가 아닌 파일(웹페이지)을 PDF로 보내면 모든 모델이 400 오류
     if not key or not pdfs: return None
     import aicache
     ck = aicache.key(prompt, pdfs); hit = aicache.get(ck)
@@ -347,7 +350,7 @@ def logmi_docs(code, since_day, limit=1):
 def fetch_doc(url, depth=0, pat=None):
     """→ ('pdf', bytes) 또는 ('text', 본문 문자열). 안내 글만 있는 페이지면 그 안의 PDF를 따라감"""
     b = _get(url, timeout=60)
-    if b[:4] == b"%PDF" or url.lower().endswith(".pdf"): return "pdf", b
+    if b"%PDF" in b[:1024]: return "pdf", b   # 주소가 .pdf여도 실제로는 안내·오류 웹페이지일 수 있어 파일 머리로 판별
     raw = b.decode("utf-8", "ignore")
     if depth == 0:
         pdfs = [(u, t) for u, t, d in _links(url, E.nfkc(raw)) if re.search(r"\.pdf($|\?)", u, re.I)]
@@ -363,6 +366,11 @@ def fetch_doc(url, depth=0, pat=None):
     t = re.sub(r"<(script|style|nav|footer|header)\b.*?</\1>", " ", t, flags=re.S | re.I)
     t = E.nfkc(re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", t)))).strip()
     return "text", t[:30000]
+
+def get_pdf(url, pat=None):
+    """주소 → PDF 바이트. 웹페이지(예: IR 행사 안내 페이지)면 그 안의 결산 설명 자료 PDF를 따라감. PDF를 못 얻으면 None"""
+    kind, body = fetch_doc(url, pat=pat or MAT_LINK)
+    return body if kind == "pdf" else None
 
 def other_qa(card):
     """TDnet 밖(회사 IR 홈페이지, 로그미)의 질의응답·설명회 기록 → [(이름, 종류, 내용, url)]"""
@@ -396,7 +404,10 @@ def build(card, qa_rows=None):
     docs, names = [], []
     for url, lab in ((card.get("mat"), "결산 설명 자료"), (card.get("pdf"), "결산단신")):
         if url:
-            try: docs.append(http(url, timeout=60)); names.append(lab)
+            try:
+                b = get_pdf(url)   # 설명 자료 주소가 웹페이지인 경우(회사 IR 홈페이지)가 있어 PDF로 따라감
+                if b: docs.append(b); names.append(lab)
+                else: E.log("ir pdf skip(not pdf)", url)
             except Exception as e: E.log("ir pdf error", e)
     if not card.get("mat"):  # TDnet에 설명 자료가 없으면 회사 IR 홈페이지에서
         try:

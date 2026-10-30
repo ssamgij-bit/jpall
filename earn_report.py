@@ -32,7 +32,9 @@ def esc(s): return html.escape(str(s if s is not None else ""), quote=False)
 SLOW = {}  # 모델 → 다시 시도할 시각(응답 지연·과부하일 때)
 def gemini_pdf(prompt, pdfs, max_tokens=12000):
     import jpall; key = jpall.gem_key()
-    pdfs = [p for p in pdfs if p]
+    bad = [p for p in pdfs if p and b"%PDF" not in p[:1024]]
+    if bad: E.log("not-pdf docs dropped", len(bad))
+    pdfs = [p for p in pdfs if p and b"%PDF" in p[:1024]]   # PDF가 아닌 파일(웹페이지)을 PDF로 보내면 모든 모델이 400 오류
     if not key or not pdfs: return None
     import aicache
     ck = aicache.key(prompt + f"|{max_tokens}", pdfs); hit = aicache.get(ck)
@@ -387,7 +389,7 @@ def build(card):
         except Exception as e:
             E.log("ir site material error", e)
     elif mat_url:
-        try: mat_pdf = http(mat_url, timeout=60)
+        try: mat_pdf = earn_ir.get_pdf(mat_url)   # 회사 IR 홈페이지 주소면 페이지 속 PDF로 따라감
         except Exception as e: E.log("material download error", e)
     tan_pdf = None
     if card.get("pdf"):
