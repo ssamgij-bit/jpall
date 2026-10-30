@@ -50,7 +50,7 @@ SECTOR_KO = {
 def now(): return dt.datetime.now(JST)
 def log(*a): print(now().strftime("%H:%M:%S"), *a, flush=True)
 # 상태 파일은 공개 저장소에 올라가므로 사용자 정보(텔레그램 계정 번호·관심 종목·요청 기록)는 암호화해서 저장
-PRIVATE_KEYS = ("owner", "subs", "watch_sent", "ask_q", "ask_recent", "jps_codes", "jps_map", "users", "blocked", "rep_q", "ir_q", "pending_start", "prefs", "alerts")
+PRIVATE_KEYS = ("owner", "subs", "watch_sent", "ask_q", "ask_recent", "jps_codes", "jps_map", "users", "blocked", "rep_q", "ir_q", "pending_start", "prefs", "alerts", "ai_wait")
 def _skey():
     import hashlib
     return hashlib.sha256(("earn-state-v1:" + (os.environ.get("STATE_KEY") or TOKEN or "")).encode()).digest()
@@ -871,12 +871,16 @@ def do_ir(st):
         if not card: continue
         try:
             texts = card.get("ir_texts")  # 이미 만든 요약은 다시 만들지 않고 보냄(AI 절약)
+            if not texts and ai_out_until():
+                defer_ai(st, "ir", cid, dest, reply, ai_out_until()); continue
             if not texts:
                 import earn_ir
                 texts, has_qa = earn_ir.build(card)
                 if texts:
                     card["ir_texts"] = texts
                     if not has_qa: card["qa_watch"] = time.time(); card.setdefault("qa_to", [])
+            if not texts and ai_out_until():
+                defer_ai(st, "ir", cid, dest, reply, ai_out_until()); continue
             if not texts:
                 tg("sendMessage", {"chat_id": dest, "text": f"IR·Q&A 요약 생성 실패({card['code']}). AI 한도일 수 있으니 잠시 뒤 다시 눌러 주세요.", **({"reply_to_message_id": reply} if reply else {})}); continue
             send_texts(card, texts, dest, reply)
@@ -921,6 +925,40 @@ def qa_followup(st, day, rows):
         except Exception:
             traceback.print_exc()
 
+# ── AI 무료 한도: 429(한도 초과)가 난 모델은 2시간 쉬고, 모든 모델이 막히면 리포트·IR을 미뤘다가 풀리면 자동으로 만듦
+import jpall as _jp
+AI_OUT = _jp.__dict__.setdefault("EARN_AI_OUT", {})   # "키 해시:모델" → 다시 써 볼 시각. earn_report·earn_ir 가 따로 불러온 earn 과도 같은 기록을 쓰도록 jpall 모듈에 둠
+def _kh():
+    import hashlib
+    return hashlib.sha256((os.environ.get("GEMINI_API_KEY") or "").encode()).hexdigest()[:8]
+def ai_skip(model): return AI_OUT.get(_kh() + ":" + model, 0) > time.time()
+def ai_429(model):
+    AI_OUT[_kh() + ":" + model] = time.time() + 2 * 3600
+    log("gemini 429 → 2시간 쉼", model)
+def ai_out_until():
+    from jpall import GEMINI_MODELS
+    ts = [AI_OUT.get(_kh() + ":" + m, 0) for m in GEMINI_MODELS]
+    return min(ts) if ts and min(ts) > time.time() else 0
+
+def defer_ai(st, act, cid, dest, reply, until):
+    w = st.setdefault("ai_wait", [])
+    if any(x["act"] == act and x["cid"] == cid and str(x["chat"]) == str(dest) for x in w): return
+    w.append({"act": act, "cid": cid, "chat": dest, "reply": reply, "ts": time.time()})
+    t = dt.datetime.fromtimestamp(until, JST).strftime("%H:%M")
+    what = "리포트" if act == "rep" else "IR·Q&A 요약"
+    tg("sendMessage", {"chat_id": dest, "text": f"오늘 AI 무료 한도가 끝나 {what}를 바로 만들 수 없습니다. {t}(한국 시간) 이후 다시 시도해 자동으로 보내드립니다.",
+                       **({"reply_to_message_id": reply, "allow_sending_without_reply": True} if reply else {})})
+    log("ai deferred", act, cid)
+
+def release_ai(st):
+    w = st.get("ai_wait") or []
+    w[:] = [x for x in w if time.time() - x.get("ts", 0) < 2 * 86400]
+    if not w or ai_out_until(): return
+    for x in w:
+        q = st.setdefault("rep_q" if x["act"] == "rep" else "ir_q", [])
+        q.append({"cid": x["cid"], "chat": x["chat"], "reply": x.get("reply")})
+    log("ai waits released", len(w)); w.clear()
+
 class _key2:
     """리포트·IR·시장 반응은 보조 Gemini 키(GEMINI_API_KEY_2)가 있으면 그 키로 — 카드용 한도와 분리"""
     def __enter__(self):
@@ -931,7 +969,13 @@ class _key2:
 
 def do_reports(st):
     do_asks(st)
-    with _key2(): _do_reports(st)
+    AI_OUT.update(st.get("ai_out") or {})
+    try:
+        with _key2():
+            release_ai(st)
+            _do_reports(st)
+    finally:
+        st["ai_out"] = {k: v for k, v in AI_OUT.items() if v > time.time()}
 
 def _do_reports(st):
     do_ir(st)
@@ -946,9 +990,13 @@ def _do_reports(st):
             if card.get("rep_file"):  # 이미 만든 리포트는 텔레그램 파일을 그대로 다시 보냄(AI 절약)
                 r = tg("sendDocument", {"chat_id": dest, "caption": cap, "document": card["rep_file"], **rp})
                 if r.get("ok"): continue
+            if ai_out_until():
+                defer_ai(st, "rep", cid, dest, reply, ai_out_until()); continue
             import earn_report
             fn, blob = earn_report.build(card)
             ok_ai = card.pop("_ai_ok", True)
+            if not ok_ai and ai_out_until():  # 만드는 도중 한도가 끝남 → AI 빠진 리포트 대신 풀린 뒤 다시
+                defer_ai(st, "rep", cid, dest, reply, ai_out_until()); continue
             if not ok_ai: cap += "\n⚠️ AI 분석(결론·사업부·IR 핵심 데이터·Q&A)은 구글 서버 혼잡으로 빠졌습니다. 잠시 뒤 📄 리포트를 다시 누르면 새로 만듭니다."
             res = tg("sendDocument", {"chat_id": dest, "caption": cap, **rp}, files={"document": (fn, blob, "text/html")}, timeout=90)
             if res.get("ok") and ok_ai:
