@@ -1368,9 +1368,11 @@ def do_asks(st):
         try:
             a, row = analyze_code(code)
             personal = job.get("watch") or str(job["chat"]) not in (str(CHANNEL), str(st.get("owner")))
-            hit = reuse_card(st, code, row.get("d"), job["chat"] if personal else None)
+            # 개인 대화로 요청했으면(주인 포함) 이미 있는 카드는 그 대화로 복사. 예전엔 주인 요청이 채널 카드만 확인하고 아무것도 안 보냈음
+            direct = personal or str(job["chat"]) != str(CHANNEL)
+            hit = reuse_card(st, code, row.get("d"), job["chat"] if direct else None)
             if hit:  # 같은 종목·같은 결산 카드가 이미 있으면 복사해서 보냄(AI 절약)
-                bump(st, "cache"); log("카드 재사용", code, job["chat"] if personal else "channel"); continue
+                bump(st, "cache"); log("카드 재사용", code, job["chat"] if direct else "channel"); continue
             if hit is False:
                 drop_user(st, job["chat"]); continue
             cid = f"q{code}{int(time.time()) % 100000000}"
