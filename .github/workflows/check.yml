@@ -34,7 +34,15 @@ jobs:
         continue-on-error: true
         run: |
           pip install -q playwright
-          python -c "import earn_ir as I; r = I.render_pages(['https://www.shiftinc.jp/ir/library/lib02/'], 1); print('rendered', len(r), len(r[0][0]) if r else 0, 'スクリプト' in (r[0][0] if r else ''))"
+          python - <<'PY'
+          import earn_ir as I, urllib.request
+          urls = ['https://www.shiftinc.jp/ir/library/lib02/', 'https://www.example.com/']
+          for u in urls:
+              try: print('plain', u, len(I._get(u)))
+              except Exception as e: print('plain error', u, e)
+          for h, u in I.render_pages(urls, 2):
+              print('rendered', u, len(h), 'スクリプト' in h, repr(h[:300]))
+          PY
       - name: 실패하면 주인에게 텔레그램 알림
         if: failure()
         env:
