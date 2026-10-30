@@ -54,6 +54,9 @@ def sector_norm(s):
     for k in SECTOR_KO:
         kk = nfkc(k).replace("、", "・")
         if kk == s or kk.rstrip("業") == s.rstrip("業"): return k
+    for k in SECTOR_KO:   # 가부탄 줄임 표기: '証券・商品'(証券・商品先物取引業), '倉庫・運輸'(倉庫・運輸関連業), 'ガラス・土石'(ガラス・土石製品) 등
+        kk = nfkc(k).replace("、", "・")
+        if len(s) >= 4 and kk.startswith(s.rstrip("業")): return k
     return s
 
 def now(): return dt.datetime.now(JST)
