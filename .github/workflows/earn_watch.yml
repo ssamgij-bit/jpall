@@ -79,12 +79,17 @@ jobs:
                   ua = dt.datetime.fromisoformat(r["updated_at"].replace("Z", "+00:00"))
                   age = lambda t: (now - t).total_seconds() / 60
                   why = None
+                  # 새 실행이 없어도 되는 시간: 자주 도는 봇 6.5시간, 하루 한 번 도는 봇 26시간(평일만 도는 봇은 주말 건너 74시간)
+                  lim = {"run.yml": 390, "community.yml": 390}.get(f, 1560)
+                  if f in ("highs.yml", "morning.yml") and (now + dt.timedelta(hours=9)).weekday() in (5, 6, 0): lim = 4440
                   if r["status"] == "completed" and r["conclusion"] not in ("success", "skipped"):
                       why = f"마지막 실행이 실패({r['conclusion']})"
-                  elif r["status"] == "completed" and age(ua) >= 390:   # 예약 실행이 6시간마다 있으므로 6.5시간 넘게 새 실행이 없으면
+                  elif r["status"] == "completed" and age(ua) >= lim:
                       why = f"{age(ua) / 60:.1f}시간째 새 실행이 없음"
-                  elif r["status"] != "completed" and age(ca) >= 390:
-                      why = f"한 실행이 {age(ca) / 60:.1f}시간째 끝나지 않음"
+                  elif r["status"] == "in_progress" and age(ua) >= 390:   # 작업 시작(대기 끝) 뒤 6.5시간: GitHub 실행은 6시간이 최대라 멈춘 것
+                      why = f"한 실행이 {age(ua) / 60:.1f}시간째 끝나지 않음"
+                  elif r["status"] != "completed" and age(ca) >= 720:
+                      why = f"실행이 {age(ca) / 60:.1f}시간째 대기 중(시작 못 함)"
                   print(f, r["status"], r["conclusion"], f"{age(ca):.0f}분 전 시작")
                   flag(f, f"{name}: {why}", bool(why))
               except Exception as e:
