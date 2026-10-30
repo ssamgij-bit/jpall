@@ -844,7 +844,7 @@ def poll_buttons(st, wait=0):
                 if not acked and not tg("sendChatAction", {"chat_id": uid, "action": "typing"}).get("ok"):  # 봇과 대화를 시작하지 않은 사람 → 시작 링크
                     me = bot_name(st)
                     tg("answerCallbackQuery", {"callback_query_id": cq["id"], "url": f"https://t.me/{me}?start={act}_{cid}"}); continue
-            enqueue_out(st, act, cid, dest, reply)
+            enqueue_out(st, act, cid, dest, reply); log("버튼", act, (card or {}).get("code"), dest, "관문 응답" if acked else "")
             if not acked: tg("answerCallbackQuery", {"callback_query_id": cq["id"], "text": ("리포트" if act == "rep" else "IR·Q&A 요약") + "를 개인 대화로 보내드립니다(처음 만들 땐 1~3분)."})
 
 def bot_name(st):
@@ -1034,7 +1034,7 @@ def _start_jobs(st):
         if out: q.pop(0); defer_ai(st, "ir", cid, dest, reply, out); continue
         if len([x for x in JOBS if x["kind"] in ("rep", "ir")]) >= MAX_HEAVY: break
         q.pop(0)
-        _submit("ir", _ir_build, _copy.deepcopy(card), key2=True, cid=cid, waiters=[(dest, reply)])
+        _submit("ir", _ir_build, _copy.deepcopy(card), key2=True, cid=cid, waiters=[(dest, reply)]); log("IR 요약 시작", card["code"], dest)
     # 3) 리포트
     q = st.get("rep_q") or []
     while q:
@@ -1045,6 +1045,7 @@ def _start_jobs(st):
         cap = f"📄 {card.get('name_ko') or card['name']}({card['code']}) 리포트 — 파일을 열어 보세요"
         if card.get("rep_file"):  # 이미 만든 리포트는 텔레그램 파일을 그대로 다시 보냄
             r = tg("sendDocument", {"chat_id": dest, "caption": cap, "document": card["rep_file"], **rp})
+            log("리포트 재전송", card["code"], dest, "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:80]}")
             if r.get("ok"): q.pop(0); continue
         same = _running("rep", cid)
         if same: q.pop(0); same[0]["waiters"].append((dest, reply)); continue
@@ -1052,7 +1053,7 @@ def _start_jobs(st):
         if out: q.pop(0); defer_ai(st, "rep", cid, dest, reply, out); continue
         if len([x for x in JOBS if x["kind"] in ("rep", "ir")]) >= MAX_HEAVY: break
         q.pop(0)
-        _submit("rep", _rep_build, _copy.deepcopy(card), key2=True, cid=cid, waiters=[(dest, reply)])
+        _submit("rep", _rep_build, _copy.deepcopy(card), key2=True, cid=cid, waiters=[(dest, reply)]); log("리포트 만들기 시작", card["code"], dest)
 
 def _collect(st, wait=0):
     """끝난 작업의 결과를 메인 스레드에서 반영(게시·상태 저장)"""
@@ -1137,6 +1138,7 @@ class _DONE:
                 r = tg("sendDocument", {"chat_id": dest, "caption": cap, "document": card["rep_file"], **rp})
                 if r.get("ok"): continue
             r = tg("sendDocument", {"chat_id": dest, "caption": cap, **rp}, files={"document": (fn, blob, "text/html")}, timeout=90)
+            log("리포트 보냄", card["code"], dest, "AI 포함" if ok_ai else "AI 빠짐", "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:80]}")
             if r.get("ok") and ok_ai:
                 card["rep_file"] = ((r.get("result") or {}).get("document") or {}).get("file_id")
 
