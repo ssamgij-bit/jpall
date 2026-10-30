@@ -50,6 +50,7 @@ jobs:
           EARN_CHANNEL: ${{ secrets.EARN_CHANNEL }}
           GEMINI_API_KEY: ${{ secrets.EARN_GEMINI_KEY || secrets.GEMINI_API_KEY }}   # 전용 키가 있으면 그것을 먼저 사용
           GEMINI_API_KEY_2: ${{ secrets.EARN_GEMINI_KEY2 }}   # 리포트·IR·시장 반응용 보조 키(없으면 위 키를 같이 씀)
+          WATCH_KEY: ${{ secrets.WATCH_KEY }}   # japan stock 봇 사용자별 구독 목록 읽기(연동)
           GATEWAY_URL: ${{ secrets.EARN_GATEWAY_URL || 'https://earn-gateway.ssamgij.workers.dev' }}   # 즉시 응답 관문(Cloudflare Worker). 비밀값 EARN_GATEWAY_URL=off 면 예전 방식
           TEST_DAY: ${{ github.event.inputs.test_day }}
           TEST_REPORT: ${{ github.event.inputs.test_report }}
