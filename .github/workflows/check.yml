@@ -30,6 +30,11 @@ jobs:
           for f in glob.glob(".github/workflows/*.yml"):
               yaml.safe_load(open(f)); print("yaml ok", f)
           PY
+      - name: IR 페이지 브라우저 열기 시험(실패해도 배포는 막지 않음)
+        continue-on-error: true
+        run: |
+          pip install -q playwright
+          python -c "import earn_ir as I; r = I.render_pages(['https://www.shiftinc.jp/ir/library/lib02/'], 1); print('rendered', len(r), len(r[0][0]) if r else 0, 'スクリプト' in (r[0][0] if r else ''))"
       - name: 실패하면 주인에게 텔레그램 알림
         if: failure()
         env:

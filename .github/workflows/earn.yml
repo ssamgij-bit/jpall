@@ -34,7 +34,7 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - run: pip install -r requirements.txt matplotlib koreanize-matplotlib   # 한글 글꼴(나눔고딕)은 koreanize-matplotlib에 포함
+      - run: pip install -r requirements.txt matplotlib koreanize-matplotlib playwright   # playwright: 자바스크립트로 목록을 그리는 IR 페이지를 실행 환경의 크롬으로 열어 봄   # 한글 글꼴(나눔고딕)은 koreanize-matplotlib에 포함
 
       - name: PDF 도구(pdftotext)
         run: which pdftotext || (sudo apt-get update -qq && sudo apt-get install -y -qq poppler-utils)
