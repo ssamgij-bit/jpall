@@ -1118,7 +1118,7 @@ def mon_chart(row, hist, met, scope):
     """월차 차트 PNG: 위 = 절대 규모(월 매출 금액, 없으면 월말 점포수), 아래 = 전년 동월 대비(전체·기존점)"""
     ks = sorted(hist)[-18:]
     yo = [k for k in ks if hist[k].get("all") is not None or hist[k].get("ex") is not None]
-    if len(yo) < 4: return None
+    if not yo: return None  # 전년 동월 대비 값이 한 달이라도 있으면 그림(적으면 막대, 6개월 이상이면 선)
     ks = ks[ks.index(yo[0]):]
     plt = _plt()
     import matplotlib
@@ -1151,16 +1151,29 @@ def mon_chart(row, hist, met, scope):
         ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:,.0f}"))
         ax.set_title(absl, loc="left", fontsize=9, color=INK2)
     ax = axes[-1]
-    for c, lab, col in (("all", "전체", C_ALL), ("ex", "기존점", C_EX)):
-        pts = [(i, hist[k][c]) for i, k in zip(x, ks) if hist[k].get(c) is not None]
-        if len(pts) < 2: continue
-        ax.plot([p[0] for p in pts], [p[1] for p in pts], color=col, lw=2, marker="o", ms=4, label=lab, zorder=3)
-        ax.text(pts[-1][0] + 0.15, pts[-1][1], f"{lab} {pts[-1][1]:+.1f}%", va="center", fontsize=8, color=INK2)
+    series = [(c, lab, col, [(i, hist[k][c]) for i, k in zip(x, ks) if hist[k].get(c) is not None])
+              for c, lab, col in (("all", "전체", C_ALL), ("ex", "기존점", C_EX))]
+    series = [z for z in series if z[3]]
+    if len(yo) < 6:  # 몇 달 안 되면 막대(전체·기존점 나란히) + 값 표시
+        w = 0.36 if len(series) == 2 else 0.55
+        for j, (c, lab, col, pts) in enumerate(series):
+            off = (j - (len(series) - 1) / 2) * w
+            xs = [p[0] + off for p in pts]; ys = [p[1] for p in pts]
+            ax.bar(xs, ys, width=w * 0.92, color=col, label=lab, zorder=3)
+            for xx, yy in zip(xs, ys):
+                ax.text(xx, yy, f"{yy:+.1f}", ha="center", va="bottom" if yy >= 0 else "top", fontsize=7.5, color=INK2)
+        lo = min([0] + [p[1] for z in series for p in z[3]]); hi = max([0] + [p[1] for z in series for p in z[3]])
+        pad = max((hi - lo) * 0.18, 1.0); ax.set_ylim(lo - pad, hi + pad)
+    else:
+        for c, lab, col, pts in series:
+            if len(pts) < 2: continue
+            ax.plot([p[0] for p in pts], [p[1] for p in pts], color=col, lw=2, marker="o", ms=4, label=lab, zorder=3)
+            ax.text(pts[-1][0] + 0.15, pts[-1][1], f"{lab} {pts[-1][1]:+.1f}%", va="center", fontsize=8, color=INK2)
     ax.axhline(0, color=INK2, lw=0.8, zorder=2)
     ax.set_title(f"{met} 전년 동월 대비(%)", loc="left", fontsize=9, color=INK2)
     ax.legend(loc="upper left", frameon=False, fontsize=8, ncol=2)
     ax.set_xticks(x); ax.set_xticklabels(labs, fontsize=8, color=INK2)
-    ax.set_xlim(-0.6, len(ks) - 0.2 + 1.2)
+    ax.set_xlim(-0.6, len(ks) - 0.4 if len(yo) < 6 else len(ks) - 0.2 + 1.2)
     name = row.get("_name") or row.get("code")
     fig.suptitle(f"{name}({row.get('code')}) 월차" + (f" · {scope}" if scope else ""), x=0.02, ha="left", fontsize=11, fontweight="bold", color=INK)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
