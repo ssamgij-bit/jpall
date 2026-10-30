@@ -1110,7 +1110,7 @@ JPS_SYS = """당신은 한국 자산운용사 애널리스트를 돕는 리서�
 [공시] 제목: {title}
 본문:
 {body}"""
-_JPS = {"t": 0, "run": None}
+_JPSUM = {"t": 0, "run": None}   # (이름 주의: _JPS 는 아래 japan stock 상태 캐시가 씀)
 def _jps_job(key):
     from jpall import pdf_text, MON_MODELS
     try:
@@ -1147,9 +1147,9 @@ def _jps_job(key):
 def jp_summaries():
     """1분마다: japan stock 봇의 요약 대기 공시를 가져와 작업 스레드에서 요약(메인 루프는 막지 않음)"""
     key = os.environ.get("WATCH_KEY")
-    if not key or time.time() - _JPS["t"] < 60 or (_JPS["run"] and not _JPS["run"].done()): return
-    _JPS["t"] = time.time()
-    _JPS["run"] = POOL.submit(_jps_job, key)
+    if not key or time.time() - _JPSUM["t"] < 60 or (_JPSUM["run"] and not _JPSUM["run"].done()): return
+    _JPSUM["t"] = time.time()
+    _JPSUM["run"] = POOL.submit(_jps_job, key)
 
 def do_reports(st):
     AI_OUT.update(st.get("ai_out") or {})
@@ -1962,7 +1962,8 @@ def main():
         try:
             poll_buttons(st, wait=0)
             do_reports(st)
-            jp_summaries()
+            try: jp_summaries()   # 부가 기능: 실패해도 아래 결산 판별을 막지 않음
+            except Exception: traceback.print_exc()
             if time.time() - last_scan > 90:
                 last_scan = time.time()
                 for back in (1, 0):
