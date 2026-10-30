@@ -50,7 +50,7 @@ SECTOR_KO = {
 def now(): return dt.datetime.now(JST)
 def log(*a): print(now().strftime("%H:%M:%S"), *a, flush=True)
 # 상태 파일은 공개 저장소에 올라가므로 사용자 정보(텔레그램 계정 번호·관심 종목·요청 기록)는 암호화해서 저장
-PRIVATE_KEYS = ("owner", "subs", "watch_sent", "ask_q", "ask_recent", "jps_codes", "users", "blocked", "rep_q", "ir_q", "pending_start", "prefs", "alerts")
+PRIVATE_KEYS = ("owner", "subs", "watch_sent", "ask_q", "ask_recent", "jps_codes", "jps_map", "users", "blocked", "rep_q", "ir_q", "pending_start", "prefs", "alerts")
 def _skey():
     import hashlib
     return hashlib.sha256(("earn-state-v1:" + (os.environ.get("STATE_KEY") or TOKEN or "")).encode()).digest()
@@ -1169,26 +1169,45 @@ def jp_state():
         try: _JPS["d"] = json.loads(http(JP_STATE_URL, timeout=30)); _JPS["t"] = time.time()
         except Exception as e: log("jp state error", e)
     return _JPS["d"]
+WATCH_URL = os.environ.get("WATCH_URL", "https://jp-disclosure-bot.ssamgij.workers.dev/watchlist")
+WATCH_KEY = os.environ.get("WATCH_KEY", "")
 def sync_jp_stock(st):
-    """japan stock 봇(@JP_stock_yh_bot) 구독 목록 → 이 봇 관심 종목(주인). 공시 채널 봇(JP_ALL)이 하루 한 번 받아 둔 목록을 읽음.
-    직접 /add 한 종목은 그대로 두고, japan stock 봇에서 빠진 종목만 같이 뺌"""
+    """japan stock 봇(@JP_stock_yh_bot) 사용자별 구독 목록 → 이 봇의 같은 사람 관심 종목(하루 한 번).
+    두 봇 모두와 대화를 시작한 사람만 연동. 직접 /add 한 종목은 그대로 두고, japan stock 봇에서 빠진 종목만 같이 뺌"""
     d = now().strftime("%Y%m%d")
     if st.get("jps_date") == d: return
     st["jps_date"] = d
-    j = jp_state()
-    if not j: return
+    j = jp_state() or {}
     owner = j.get("owner")
     if owner and st.get("owner") is None: st["owner"] = owner  # 주인 = 두 봇에 같은 텔레그램 계정
-    if not owner or str(owner) != str(st.get("owner")): return
-    codes = sorted((j.get("watch") or {}).keys())
-    subs = st.setdefault("subs", {}); uid = str(owner)
-    old = set(st.get("jps_codes") or [])
-    mine = [c for c in subs.get(uid, []) if c not in old or c in codes]
-    mine += [c for c in codes if c not in mine]
-    if mine: subs[uid] = mine
-    else: subs.pop(uid, None)
-    st["jps_codes"] = codes
-    log("jp stock watchlist synced", len(codes))
+    users_map, fetched = {}, False
+    if WATCH_KEY:
+        try:
+            w = json.loads(http(WATCH_URL, timeout=20, headers={"x-watch-key": WATCH_KEY}))
+            users_map = {str(k): sorted(v) for k, v in (w.get("users") or {}).items()}
+            fetched = "users" in w
+        except Exception as e:
+            log("jp stock watchlist error", e); st.pop("jps_date", None); return   # 다음 실행 때 다시
+    if not WATCH_KEY and owner and str(owner) == str(st.get("owner")):  # 예전 방식: 공시 채널 봇이 받아 둔 주인 목록
+        users_map = {str(owner): sorted((j.get("watch") or {}).keys())}
+    jm = st.setdefault("jps_map", {})
+    if "jps_codes" in st:
+        old = st.pop("jps_codes")
+        if st.get("owner"): jm.setdefault(str(st["owner"]), old)
+    known = set(st.get("users") or {}) | set(st.get("subs") or {}) | ({str(st["owner"])} if st.get("owner") else set())
+    subs = st.setdefault("subs", {}); n = 0
+    for uid in (set(users_map) | set(jm)) if fetched else set(users_map):
+        if uid not in known: continue
+        codes = users_map.get(uid) or []
+        old = set(jm.get(uid) or [])
+        mine = [c for c in subs.get(uid, []) if c not in old or c in codes]
+        mine += [c for c in codes if c not in mine]
+        if mine: subs[uid] = mine
+        else: subs.pop(uid, None)
+        if codes: jm[uid] = codes
+        else: jm.pop(uid, None)
+        n += 1
+    log("jp stock watchlist synced", n, "users", sum(len(v) for v in users_map.values()), "codes")
 
 def notify_watchers(st, rows):
     """관심 종목으로 등록한 사용자에게 결산단신 카드를 개인 대화로(스크리닝 통과 여부 무관)"""
@@ -1229,7 +1248,9 @@ def handle_text(st, chat, text):
     if chat.get("type") == "channel" and str(chat.get("id")) != str(CHANNEL): return
     if chat.get("type") == "private":
         if st.get("owner") is None: st["owner"] = chat["id"]
-        us = st.setdefault("users", {}); us[str(chat["id"])] = now().strftime("%Y%m%d")
+        us = st.setdefault("users", {})
+        if str(chat["id"]) not in us: st.pop("jps_date", None)   # 새 사용자 → japan stock 봇 구독 목록 바로 연동
+        us[str(chat["id"])] = now().strftime("%Y%m%d")
         st.get("blocked", {}).pop(str(chat["id"]), None)
         m = re.match(r"^/start\s+(rep|ir)_(\S+)$", text)
         if m:  # 채널 카드 버튼 → 시작 링크로 들어온 경우
