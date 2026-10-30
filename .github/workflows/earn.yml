@@ -79,3 +79,6 @@ jobs:
           n=$(gh run list -R "${{ github.repository }}" --workflow earn.yml --limit 20 --json status,databaseId \
                -q '[.[] | select((.status=="queued" or .status=="in_progress" or .status=="pending" or .status=="waiting") and .databaseId != ${{ github.run_id }})] | length')
           if [ "${n:-0}" = "0" ]; then gh workflow run earn.yml -R "${{ github.repository }}" --ref main && echo "다음 실행 요청"; else echo "다른 실행 $n개 있음 → 건너뜀"; fi
+          # 상태 감시(earn_watch)의 예약 실행이 밀리면(1시간 넘게 실행 없음) 여기서 대신 실행
+          last=$(gh run list -R "${{ github.repository }}" --workflow earn_watch.yml --limit 1 --json createdAt -q '.[0].createdAt' 2>/dev/null || true)
+          if [ -z "$last" ] || [ $(( $(date +%s) - $(date -d "$last" +%s) )) -gt 3300 ]; then gh workflow run earn_watch.yml -R "${{ github.repository }}" --ref main && echo "상태 감시 실행 요청" || true; fi
