@@ -35,6 +35,9 @@ def gemini_pdf(prompt, pdfs, max_tokens=12000):
     bad = [p for p in pdfs if p and b"%PDF" not in p[:1024]]
     if bad: E.log("not-pdf docs dropped", len(bad))
     pdfs = [p for p in pdfs if p and b"%PDF" in p[:1024]]   # PDF가 아닌 파일(웹페이지)을 PDF로 보내면 모든 모델이 400 오류
+    if not pdfs:
+        import jpall as _j
+        if getattr(_j.AI_TL, "fails", None) is not None: _j.AI_TL.fails.append("nodoc")
     if not key or not pdfs: return None
     import aicache
     ck = aicache.key(prompt + f"|{max_tokens}", pdfs); hit = aicache.get(ck)
@@ -53,10 +56,11 @@ def gemini_pdf(prompt, pdfs, max_tokens=12000):
             aicache.put(ck, out)
             return out
         except Exception as e:
-            E.log("gemini pdf error", model, str(e)[:150])
-            if "429" in str(e): E.ai_429(model)
-            if "timed out" in str(e) or "503" in str(e): SLOW[model] = time.time() + 1200  # 응답 지연·과부하 → 20분간 건너뜀
-            if "429" in str(e) or "503" in str(e) or "timed out" in str(e): time.sleep(8)
+            kind = E.ai_err(e, model, "pdf")   # 키 이름·구글 응답 사유까지 기록, 실패 사유 분류
+            if kind == "quota": E.ai_429(model)
+            if kind == "busy": SLOW[model] = time.time() + 1200  # 응답 지연·과부하 → 20분간 건너뜀
+            if kind in ("quota", "busy"): time.sleep(8)
+            if kind in ("bad", "key"): break   # 자료·키 문제는 모델을 바꿔도 같음 → 한도 낭비 없이 중단
     return None
 
 def tr_google(texts):

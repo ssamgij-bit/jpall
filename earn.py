@@ -932,7 +932,57 @@ def _kh():
 def ai_skip(model): return AI_OUT.get(_kh() + ":" + model, 0) > time.time()
 def ai_429(model):
     AI_OUT[_kh() + ":" + model] = time.time() + 2 * 3600
-    log("gemini 429 → 2시간 쉼", model)
+    log("gemini 429 → 2시간 쉼", model, key_label())
+
+def key_label():
+    """지금 이 스레드가 쓰는 Gemini 키 이름(값은 기록하지 않음)"""
+    import jpall
+    k = jpall.gem_key() or ""
+    for n, lab in (("GEMINI_API_KEY_3", "보조 키2"), ("GEMINI_API_KEY_2", "보조 키1"), ("GEMINI_API_KEY", "기본 키")):
+        if k and os.environ.get(n) == k: return lab
+    return "키 미상"
+
+BAD_KEYS = {}   # 거부된 키 이름 → 구글 응답 일부(이번 실행 동안). 주인에게 하루 한 번 알림
+def ai_err(e, model, where):
+    """Gemini 오류를 기록·분류 → quota(한도) / busy(서버 혼잡·응답 없음) / bad(자료 문제) / key(키 거부) / other.
+    분류는 이 작업 스레드의 실패 사유(jpall.AI_TL.fails)에 쌓아 실패 안내에 씀"""
+    import jpall
+    from jpall import GEMINI_MODELS
+    body = ""
+    try: body = e.read()[:400].decode("utf-8", "ignore") if hasattr(e, "read") else ""
+    except Exception: pass
+    s, lab = str(e), key_label()
+    if "429" in s: kind = "quota"
+    elif re.search(r"timed out|50[0234]|reset|closed", s): kind = "busy"
+    elif re.search(r"API_KEY_INVALID|API key not valid|API key expired", body) or "403" in s: kind = "key"
+    elif "400" in s: kind = "bad"
+    else: kind = "other"
+    log(f"gemini {where} error", model, lab, s[:80], re.sub(r"\s+", " ", body)[:160])
+    if getattr(jpall.AI_TL, "fails", None) is None: jpall.AI_TL.fails = []
+    jpall.AI_TL.fails.append(kind)
+    if kind == "key" and lab not in BAD_KEYS:
+        BAD_KEYS[lab] = re.sub(r"\s+", " ", body)[:120] or s[:80]
+        for m in GEMINI_MODELS: AI_OUT[_kh() + ":" + m] = time.time() + 6 * 3600   # 거부된 키는 6시간 쉼 → 다른 보조 키로
+    return kind
+
+def ai_reset():
+    import jpall
+    jpall.AI_TL.fails = []
+
+def ai_fail_reason():
+    import jpall
+    f = getattr(jpall.AI_TL, "fails", None) or []
+    for k in ("nodoc", "key", "bad", "busy", "quota"):
+        if k in f: return k
+    return f[-1] if f else None
+
+FAIL = {}   # 종목코드 → 마지막 리포트·IR 실패 사유(작업 스레드에서 기록, 안내 문구에 씀)
+FAIL_TXT = {"quota": "AI 무료 한도가 찼습니다. 한도가 풀리면 다시 눌러 주세요.",
+            "busy": "구글 AI 서버가 붐벼 응답이 없었습니다. 몇 분 뒤 다시 눌러 주세요.",
+            "bad": "결산 자료(PDF)를 AI가 읽지 못했습니다(자료 형식 문제). 기록해 두었습니다.",
+            "key": "AI 키가 거부됐습니다(키 확인 필요). 주인에게 알렸습니다.",
+            "nodoc": "요약할 결산 자료를 찾지 못했습니다(TDnet·회사 IR 홈페이지 모두 없음).",
+            None: "원인을 특정하지 못했습니다. 잠시 뒤 다시 눌러 주세요."}
 def ai_out_until(heavy=False):
     """모든 모델이 한도 초과면 가장 먼저 풀리는 시각(아니면 0).
     heavy(리포트·IR: PDF 여러 개를 읽는 큰 요청): 쓸 수 있는 모델이 1개만 남아도 미룸 — 마지막 남은 가벼운 모델은 큰 PDF에서 거의 실패하거나 품질이 낮고, 시도할수록 한도만 더 씀"""
@@ -979,6 +1029,7 @@ class _key2:
                 jpall.AI_TL.key = k
                 if not ai_out_until(heavy=True): pick = k; break
             jpall.AI_TL.key = pick
+            if pick != ks[0]: log("보조 키 전환", key_label())   # 첫 보조 키가 한도·거부로 쉬는 중
     def __exit__(self, *a):
         import jpall
         jpall.AI_TL.key = self.k
@@ -1008,24 +1059,37 @@ def _merge(card, cp):
 
 def _rep_build(cp):
     import earn_report
+    ai_reset()
     fn, blob = earn_report.build(cp)
-    return fn, blob, cp.pop("_ai_ok", True)
+    ok_ai = cp.pop("_ai_ok", True)
+    if not ok_ai: FAIL[cp["code"]] = ai_fail_reason()
+    log("리포트 AI", cp["code"], key_label(), "성공" if ok_ai else f"실패({ai_fail_reason()})")
+    return fn, blob, ok_ai
 
 def _ir_build(cp):
     import earn_ir
-    return earn_ir.build(cp)
+    ai_reset()
+    r = earn_ir.build(cp)
+    if not r or not r[0]: FAIL[cp["code"]] = ai_fail_reason()
+    log("IR AI", cp["code"], key_label(), "성공" if r and r[0] else f"실패({ai_fail_reason()})")
+    return r
 
 def _ir_refresh(cp):
     """예전 요약에 Q&A가 없던 카드: 회사 IR 홈페이지 등에 질의응답이 새로 올라왔으면 다시 만들고, 없으면 예전 요약"""
     import earn_ir
     if not earn_ir.other_qa(cp): return "cached"
-    return earn_ir.build(cp, qa_rows=[])
+    ai_reset()
+    r = earn_ir.build(cp, qa_rows=[])
+    if not r or not r[0]: FAIL[cp["code"]] = ai_fail_reason()
+    return r
 
 def do_reports(st):
     AI_OUT.update(st.get("ai_out") or {})
     try:
         with _key2(): release_ai(st)
         _collect(st)
+        for lab, why in list(BAD_KEYS.items()):   # 거부된 Gemini 키(잘못 붙여넣음·만료·삭제) → 하루 한 번 알림
+            alert_owner(st, f"Gemini {lab}가 구글에서 거부됐습니다({why[:80]}). GitHub 비밀값의 키를 확인해 주세요.", "badkey:" + lab, every=86400)
         _start_jobs(st)
     finally:
         st["ai_out"] = {k: v for k, v in AI_OUT.items() if v > time.time()}
@@ -1148,7 +1212,8 @@ class _DONE:
             if not texts:
                 with _key2(): out = ai_out_until(heavy=True)
                 if out: defer_ai(st, "ir", j["cid"], dest, reply, out); continue
-                tg("sendMessage", {"chat_id": dest, "text": f"IR·Q&A 요약 생성 실패({card['code']}). AI 한도일 수 있으니 잠시 뒤 다시 눌러 주세요.", **({"reply_to_message_id": reply} if reply else {})}); continue
+                why = FAIL_TXT.get(FAIL.get(card["code"]), FAIL_TXT[None]) if ok == "ok" else "처리 중 오류가 났습니다(기록해 두었습니다). 잠시 뒤 다시 눌러 주세요."
+                tg("sendMessage", {"chat_id": dest, "text": f"IR·Q&A 요약 생성 실패({card['code']}). {why}", **({"reply_to_message_id": reply} if reply else {})}); continue
             try:
                 send_texts(card, texts, dest, reply)
                 if card.get("qa_watch") and str(dest) not in [str(x) for x in card.setdefault("qa_to", [])]: card["qa_to"].append(dest)
@@ -1161,13 +1226,13 @@ class _DONE:
         for dest, reply in j["waiters"]:
             rp = {"reply_to_message_id": reply, "allow_sending_without_reply": True} if reply else {}
             if ok != "ok":
-                tg("sendMessage", {"chat_id": dest, "text": f"리포트 생성 실패({card['code']}). 잠시 뒤 다시 눌러 주세요.", **rp}); continue
+                tg("sendMessage", {"chat_id": dest, "text": f"리포트 생성 실패({card['code']}). 처리 중 오류가 났습니다(기록해 두었습니다). 잠시 뒤 다시 눌러 주세요.", **rp}); continue
             fn, blob, ok_ai = res
             if not ok_ai:
                 with _key2(): out = ai_out_until(heavy=True)
                 if out: defer_ai(st, "rep", j["cid"], dest, reply, out); continue   # 만드는 도중 한도가 끝남 → 풀린 뒤 다시
             cap = f"📄 {card.get('name_ko') or card['name']}({card['code']}) 리포트 — 파일을 열어 보세요"
-            if not ok_ai: cap += "\n⚠️ AI 분석(결론·사업부·IR 핵심 데이터·Q&A)은 구글 서버 혼잡으로 빠졌습니다. 잠시 뒤 📄 리포트를 다시 누르면 새로 만듭니다."
+            if not ok_ai: cap += "\n⚠️ AI 분석(결론·사업부·IR 핵심 데이터·Q&A)이 빠졌습니다. " + FAIL_TXT.get(FAIL.get(card["code"]), FAIL_TXT[None]) + " 📄 리포트를 다시 누르면 새로 만듭니다."
             if card.get("rep_file"):
                 r = tg("sendDocument", {"chat_id": dest, "caption": cap, "document": card["rep_file"], **rp})
                 if r.get("ok"): continue
