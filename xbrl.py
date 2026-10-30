@@ -120,7 +120,10 @@ def summarize_revision(facts, ctx):
             row = {m: (pick(facts, m, prev), pick(facts, m, curr)) for m in ["rev", "op", "ord", "ni", "eps"]}
             if any(b is not None for a, b in row.values()):
                 cid = next((c for c in ctx if c.startswith(f"{per}_{scope}_CurrentMember_")), None)
-                out = {"per": per, "scope": "연결" if scope == "ConsolidatedMember" else "개별", "rows": row,
+                pper = per.replace("Current", "Prior")  # 전기(전년 같은 기간) 실적
+                lastp = lambda c, pper=pper, scope=scope: c.startswith(f"{pper}_{scope}") and c.endswith("ResultMember")
+                last = {m: pick(facts, m, lastp) for m in ["rev", "op", "ord", "ni", "eps"]}
+                out = {"per": per, "scope": "연결" if scope == "ConsolidatedMember" else "개별", "rows": row, "last": last,
                        "end": ctx.get(cid, (None, None))[1] if cid else None}
                 return out
     return None

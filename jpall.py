@@ -296,6 +296,26 @@ def kabutan_fc(s):
         v = [f(c) for c in cells[1:6]] + [None] * 5
         return {"end": dt.date(int(m.group(1)), int(m.group(2)), 28), "rev": v[0], "op": v[1], "ord": v[2], "ni": v[3], "eps": v[4]}
     return None
+def kabutan_lastfy(s, before=None):
+    """가부탄 연간 실적표의 가장 최근 확정 실적(予 아닌 행) → {end, rev, op, ord, ni, eps} (백만엔·엔). before(날짜) 이전 결산만"""
+    i = s.find("fin_year_result_d")
+    if i < 0: return None
+    seg = s[i:s.find("</table>", i)]
+    best = None
+    for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", seg, re.S):
+        cells = [nfkc(re.sub(r"<[^>]+>", "", c)).replace("&nbsp;", " ").replace("\xa0", " ").strip() for c in re.findall(r"<t[hd][^>]*>(.*?)</t[hd]>", tr, re.S)]
+        if not cells or "予" in cells[0]: continue
+        m = re.search(r"(\d{4})\.(\d{2})", cells[0])
+        if not m: continue
+        end = dt.date(int(m.group(1)), int(m.group(2)), 28)
+        if before and end >= before: continue
+        def f(x):
+            try: return float(x.replace(",", "").replace("+", ""))
+            except Exception: return None
+        v = [f(c) for c in cells[1:6]] + [None] * 5
+        if best is None or end > best["end"]:
+            best = {"end": end, "rev": v[0], "op": v[1], "ord": v[2], "ni": v[3], "eps": v[4]}
+    return best
 def kabutan_quarters(code, s=None):
     """[(시작일, 종료일, 매출, 영업익, 경상익, 순이익, EPS)] 백만엔 단위, 오래된 순"""
     try:
@@ -432,11 +452,18 @@ def body_results(row, st):
     fc = r.get("fc")
     if fc and any(fc.get(m) for m in ["rev", "op", "ni"]):
         fyl = fy_label(r.get("fc_end"))
+        lastfy = None
+        if q < 4:  # 진행 중인 회계연도 가이던스 → 전기 실적(가부탄 연간표) 대비 성장률
+            try:
+                lastfy = kabutan_lastfy(kabutan_html(row["code"]), before=dt.date.fromisoformat(r["fc_end"]) - dt.timedelta(days=200) if r.get("fc_end") else start)
+            except Exception as e:
+                log("lastfy error", row["code"], e)
         parts = []
         for m, lab in [("rev", "매출"), ("op", "영업익"), ("ord", ordlab), ("ni", "순이익")]:
             if fc.get(m) is None: continue
-            c = chg_txt(fc[m], r.get(m)) if q == 4 else ""
-            parts.append(f"{lab} {oku(fc[m])}" + (f"({c})" if c else ""))
+            if q == 4: c = chg_txt(fc[m], r.get(m))
+            else: c = chg_txt(fc[m], lastfy[m] * 1e6) if lastfy and lastfy.get(m) is not None else ""
+            parts.append(f"{lab} {oku(fc[m])}" + (f"(전기 대비 {c})" if c else ""))
         HL.update(fc=fc, fc_fy=fyl, op_cum=r.get("op"), ord_cum=r.get("ord"), q=q, kind="res")
         if lines[-1]: lines.append("")
         lines.append(f"<b>회사 가이던스({fyl}{', ' + r['fc_kind'] if r.get('fc_kind') else ''})</b> : " + " / ".join(parts))
@@ -466,6 +493,14 @@ def body_results(row, st):
         log("res chart error", row.get("code"), e)
     return "\n".join(lines)
 
+def growth_txt(last, a, b):
+    """전기(또는 전년 동기) 실적 대비 성장률: 수정 전 → 수정 후. 예) '+5.3% → +26.3%'"""
+    if last is None or b is None or last == 0: return ""
+    f = lambda v: (chg_txt(v, last) or "") if v is not None else ""
+    ga, gb = f(a), f(b)
+    if not gb: return ""
+    return f"{ga} → {gb}" if ga else gb
+
 def body_revision(row):
     kind, facts, ctx = X.open_zip(http(row["xbrl"], timeout=40))
     if kind != "rvfc": return None
@@ -479,16 +514,23 @@ def body_revision(row):
     except Exception: pass
     lines = [f"<b>[실적 전망 수정 · {fy} {per} · {r['scope']}]</b>"]
     HL.update(kind="rev", fy=fy, per=per, rows=r["rows"])
+    last = r.get("last") or {}
+    plab = "전기" if r["per"] == "CurrentYearDuration" else "전년 동기"
     for m, lab in [("rev", "매출액"), ("op", "영업익"), ("ord", "경상익"), ("ni", "순이익")]:
         a, b = r["rows"][m]
         if b is None: continue
         c = chg_txt(b, a)
         lines.append(f"{lab} : {oku(a)} → {oku(b)}" + (f" ({c})" if c else ""))
+        g = growth_txt(last.get(m), a, b)
+        if g: lines.append(f"   └ {plab} {oku(last.get(m))} 대비 {g}")
     a, b = r["rows"]["eps"]
-    if b is not None: lines.append(f"EPS : {a if a is not None else '—'}엔 → {b:,.2f}엔")
+    if b is not None:
+        lines.append(f"EPS : {a if a is not None else '—'}엔 → {b:,.2f}엔")
+        g = growth_txt(last.get("eps"), a, b)
+        if g: lines.append(f"   └ {plab} {last['eps']:,.2f}엔 대비 {g}")
     try:
         items = [{"label": lab, "unit": "백만엔", "prev": (r["rows"][m][0] / 1e6 if r["rows"][m][0] is not None else None),
-                  "new": r["rows"][m][1] / 1e6, "new_hi": None, "last": None}
+                  "new": r["rows"][m][1] / 1e6, "new_hi": None, "last": (last[m] / 1e6 if last.get(m) is not None else None)}
                  for m, lab in [("rev", "매출액"), ("op", "영업이익"), ("ord", "경상이익"), ("ni", "순이익")] if r["rows"][m][1] is not None]
         HL["chart"] = fc_chart(row, items, f"실적 전망 수정 · {fy} {per} · {r['scope']}")
     except Exception as e:
@@ -665,8 +707,9 @@ def body_forecast_pdf(row, st):
             ln = f"{esc(it['label'])} : {fmt(it['new'], u, it['new_hi'])}"
         if it["last"] is not None and it["new"] is not None:
             mid = it["new"] if it["new_hi"] is None else (it["new"] + it["new_hi"]) / 2
-            c2 = f"{mid - it['last']:+.1f}%p" if u == "%" else (f"{pct(mid, it['last']):+.1f}%" if it["last"] > 0 else "")
-            ln += f" / 전기 {fmt(it['last'], u)}" + (f" 대비 {c2}" if c2 else "")
+            gr = lambda v: (f"{v - it['last']:+.1f}%p" if u == "%" else (f"{pct(v, it['last']):+.1f}%" if it["last"] > 0 else "")) if v is not None else ""
+            c1, c2 = gr(it["prev"]), gr(mid)
+            if c2: ln += f"\n   └ 전기 {fmt(it['last'], u)} 대비 " + (f"{c1} → {c2}" if c1 else c2)
         lines.append(ln)
         if it.get("key") in ("rev", "op", "ord", "ni") and u == "백만엔" and it["new"] is not None:
             rows_hl[it["key"]] = (it["prev"] * 1e6 if it["prev"] is not None else None, it["new"] * 1e6)
@@ -690,7 +733,10 @@ def body_dividend(row):
     HL.update(kind="div", prev=r["prev"], curr=r["curr"])
     s = f"<b>[배당 전망 수정 · 연간 주당배당]</b>\n{f(r['prev'])} → {f(r['curr'])}"
     if r["prev"] and r["curr"] is not None: s += f" ({pct(r['curr'], r['prev']):+.1f}%)"
-    if r["last"] is not None: s += f"\n전기 실적 : {f(r['last'])}"
+    if r["last"] is not None:
+        s += f"\n전기 실적 : {f(r['last'])}"
+        if r["last"] and r["curr"] is not None:
+            s += f" → 전기 대비 " + (f"{pct(r['prev'], r['last']):+.1f}% → " if r["prev"] else "") + f"{pct(r['curr'], r['last']):+.1f}%"
     return s
 
 def pdf_text(url):
@@ -698,7 +744,7 @@ def pdf_text(url):
     return nfkc(extract_text(io.BytesIO(http(url, timeout=40)), maxpages=3))
 
 DATE = r"(\d{4})年(\d{1,2})月(\d{1,2})日(?:\([^)]*\))?"
-def body_buyback(row):
+def body_buyback(row, q=None):
     t = re.sub(r"\s+", "", pdf_text(row["pdf"]))
     k = max(t.rfind("取得に係る事項の決定"), t.rfind("取得に関する事項の決定"))
     if k > 0: t = t[k:]  # 취득 종료 보고와 새 결정이 함께 있으면 새 결정 부분만
@@ -712,7 +758,8 @@ def body_buyback(row):
         parts.append(f"한도 {shares:,.0f}주" + (f"(자사주 제외 발행주식의 {ratio}%)" if ratio else ""))
     if amt:
         yen = float(amt[0].replace(",", "")) * {"": 1, "千": 1e3, "百万": 1e6, "億": 1e8}[amt[1]]
-        parts.append(f"{oku(yen)}엔")
+        mc = (q or {}).get("marketCap")
+        parts.append(f"{oku(yen)}엔" + (f"(시가총액의 {yen / mc * 100:.1f}%)" if mc else ""))
     HL.update(kind="bb", ratio=float(ratio) if ratio else None, yen=yen if amt else None)
     s = "<b>[자사주 취득 결정]</b>\n" + " / ".join(parts)
     if per: s += f"\n기간 : {per[0]}.{int(per[1]):02d}.{int(per[2]):02d}~{per[3]}.{int(per[4]):02d}.{int(per[5]):02d}"
@@ -1309,7 +1356,7 @@ def build(row, st, names, quotes, trmap, tasks=None):
             elif "配当予想" in title and "業績予想" not in title: body = body_dividend(row)
             elif "予想" in title or "修正" in title: body = body_revision(row) or body_dividend(row)
         elif re.search(r"自己株式(の)?取得に係る事項の決定|自己株式取得に係る事項の決定|自己株式の取得及び", title):
-            body = body_buyback(row)
+            body = body_buyback(row, quotes.get(code))
         elif "ToSTNeT" in title and re.search(r"買付", title) and not re.search(r"結果|終了", title):
             body = body_tostnet(row)
         elif re.search(r"公開買付けの開始|公開買付けに関する意見表明|MBO", title) and not re.match(r"[(（](訂正|変更|経過開示)", title):
