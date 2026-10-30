@@ -893,13 +893,16 @@ def send_qa(card, texts):
 def qa_followup(st, day, rows):
     """IR 요약을 보냈는데 Q&A 자료가 없던 종목 → 14일 안에 TDnet에 질의응답이 올라오면 다시 요약해 보냄"""
     import earn_ir
+    site_checks = [0]
     for cid, card in st.get("cards", {}).items():
         w = card.get("qa_watch")
         if not w or card.get("deleted"): continue
         if time.time() - w > 86400 * 14: card.pop("qa_watch", None); continue
         hits = [r for r in rows if r["code"] == card["code"] and earn_ir.QA_RE.search(r["title"]) and r["id"] not in card.get("qa_seen", [])]
-        if not hits:  # TDnet에 없으면 6시간마다 회사 IR 홈페이지·로그미도 다시 확인
+        if not hits:  # TDnet에 없으면 6시간마다 회사 IR 홈페이지·로그미도 다시 확인(한 번에 2종목까지: 브라우저로 여는 확인은 시간이 걸림)
             if time.time() - card.get("qa_site_ts", 0) < 6 * 3600: continue
+            if site_checks[0] >= 2: continue
+            site_checks[0] += 1
             card["qa_site_ts"] = time.time()
             try:
                 if not earn_ir.other_qa(card): continue

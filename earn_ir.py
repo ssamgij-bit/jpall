@@ -11,7 +11,7 @@ import os, re, json, time, base64, html, datetime as dt
 import earn as E
 from jpall import http, GEMINI_MODELS
 
-QA_RE = re.compile(r"質疑応答|質疑|Q&A|Q＆A|主な質問|説明会.*(要旨|内容)|書き起こし|スモールミーティング")
+QA_RE = re.compile(r"質疑応答|質疑|Q&A|Q＆A|主な質問|説明会.*(要旨|内容|スクリプト|記録)|書き起こし|書起こし|文字起こし|スクリプト|Transcript|スモールミーティング", re.I)
 
 IR_PROMPT = """첨부 PDF는 일본 상장사 {name}({code})의 이번 결산 관련 공식 자료다(결산단신, 결산 설명 자료, 질의응답 요지 중 있는 것).
 한국 애널리스트용 '실적 발표 IR·경영진 Q&A 요약'을 한국어 JSON으로 써라.
@@ -157,61 +157,144 @@ def xj_docs(cid, since_day, pat):
             if re.search(r"\.pdf($|\?)", u, re.I): out.append((t[:60], u, day)); break
     return out
 
-def ir_site_docs(code, since_day, limit=2, pat=None):
-    """회사 IR 홈페이지에서 이번 결산 이후의 질의응답·설명회 기록(pat 지정 시 그 자료) 링크 → [(이름, url, 날짜)]"""
+IR_PAGE = re.compile(r"/ir|investor|kabunushi|stock|library|news|presentation|event|setsumei|kessan", re.I)
+IR_TEXT = re.compile(r"IR|投資家|株主|ライブラリ|資料|ニュース|news|library|説明会|決算|プレゼン|イベント", re.I)
+
+def render_pages(urls, limit=6):
+    """자바스크립트로 목록을 그리는 IR 페이지를 실제 브라우저(헤드리스 크롬)로 열어 완성된 HTML → [(html, url)]"""
+    try: from playwright.sync_api import sync_playwright
+    except Exception: return []
+    out = []
+    try:
+        with sync_playwright() as p:
+            try: b = p.chromium.launch(channel="chrome")   # GitHub 실행 환경에 이미 있는 크롬
+            except Exception: b = p.chromium.launch()
+            pg = b.new_page(user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 Safari/605.1.15", locale="ja-JP")
+            for u in urls[:limit]:
+                try: pg.goto(u, wait_until="networkidle", timeout=20000)
+                except Exception: pass
+                try: out.append((E.nfkc(pg.content()), pg.url))
+                except Exception: pass
+            b.close()
+    except Exception as e:
+        E.log("render error", e)
+    return out
+
+def ir_site_docs(code, since_day, limit=2, pat=None, period=None):
+    """회사 IR 홈페이지에서 이번 결산 이후의 질의응답·설명회 기록(pat 지정 시 그 자료) 링크 → [(이름, url, 날짜)]
+    ① 일반 페이지 2단계 탐색 ② IR 자료 서비스 목록(xj-storage) ③ 그래도 이번 결산 이후 자료가 없으면 실제 브라우저로 IR 페이지를 열어 다시 탐색"""
     pat = pat or QA_LINK
     home = company_site(code)
     if not home: return []
-    seen, pages, hits, bodies = set(), [home], [], []
+    seen, pages, hits, bodies, irpages = set(), [home], [], [], []
     host = urllib.parse.urlparse(home).netloc
+
+    def scan(p, body, depth):
+        nxt = []
+        for u, t, d in _links(p, body):
+            h = urllib.parse.urlparse(u).netloc
+            if pat.search(t) or pat.search(urllib.parse.unquote(u)):
+                if re.search(r"\.(mp4|mp3|m4a|wav)($|\?)|vimeo\.com|youtube\.com|youtu\.be", u, re.I): continue  # 음성·영상
+                if d and d < since_day: continue
+                if not d and stale_years(t + " " + urllib.parse.unquote(u), since_day): continue  # 날짜 없이 옛 연도만 보이는 자료(예: 2024년 설명회)
+                if NOISE.search(t): continue  # 채용 Q&A·FAQ 등
+                if not d and period and period_score(t + " " + urllib.parse.unquote(u), period) < 0: continue  # 다른 회계연도 자료
+                hits.append((t[:60] or "질의응답 자료", u, d))
+            elif depth == 0 and h == host and IR_PAGE.search(u) and IR_TEXT.search(t + u):
+                nxt.append(u)
+        return nxt
+
     for depth in range(2):
         nxt = []
-        for p in pages[:8]:
+        for p in pages[:10]:
             if p in seen: continue
             seen.add(p)
             try: body = E.nfkc(_get(p).decode("utf-8", "ignore"))
             except Exception: continue
             bodies.append((body, p))
-            for u, t, d in _links(p, body):
-                h = urllib.parse.urlparse(u).netloc
-                if pat.search(t) or pat.search(urllib.parse.unquote(u)):
-                    if re.search(r"\.(mp4|mp3|m4a|wav)($|\?)", u, re.I): continue  # 음성·영상
-                    if d and d < since_day: continue
-                    if not d and stale_years(t + " " + urllib.parse.unquote(u), since_day): continue  # 날짜 없이 옛 연도만 보이는 자료(예: 2024년 설명회)
-                    hits.append((t[:60] or "질의응답 자료", u, d))
-                elif depth == 0 and h == host and re.search(r"/ir|investor|kabunushi|stock|library|news", u, re.I) and \
-                        re.search(r"IR|投資家|株主|ライブラリ|資料|ニュース|news|library", t + u, re.I):
-                    nxt.append(u)
+            if depth: irpages.append(p)
+            nxt += scan(p, body, depth)
         pages = list(dict.fromkeys(nxt))
     # 목록을 자바스크립트로 그리는 IR 페이지(xj-storage): 공개 목록에서 직접 찾음(PDF 직링크·게시일 확실 → 앞에 둠)
     cid = xj_company(code, bodies)
     if cid:
         xj = xj_docs(cid, since_day, pat)
         if xj: E.log("xj-storage", code, cid, len(xj))
-        hits = [(t, u, d or "99999999") for t, u, d in xj] + hits
+        hits = xj + hits
+    if not any(d and d >= since_day for _, _, d in hits) and irpages:
+        # 이번 결산 이후 날짜가 확인된 자료가 없음 → 자바스크립트로 그리는 목록일 수 있으니 브라우저로 열어 봄(자료실·설명회 페이지 우선)
+        cand = sorted(dict.fromkeys(irpages), key=lambda u: -len(re.findall(r"library|presentation|event|setsumei|kessan|material|siryo|shiryo|briefing|meeting", u, re.I)))
+        n0 = len(hits)
+        for body, p in render_pages(cand, limit=6):
+            scan(p, body, 1)
+        if len(hits) > n0: E.log("rendered IR pages", code, len(hits) - n0)
     out, urls = [], set()
-    # 날짜가 있는 것(최신 순) → PDF 직링크 → 나머지(목록 페이지 등)
-    for t, u, d in sorted(hits, key=lambda x: (x[2] or "0", bool(re.search(r"\.pdf($|\?)", x[1], re.I))), reverse=True):
-        if not d and any(h[2] for h in hits if h[1] != u) and len(out) >= 1: continue  # 날짜 확인된 자료가 있으면 날짜 모르는 것은 뒤로(채우지 않음)
+    # 순서: 이번 결산 이후 날짜 확인 → 이번 회계연도·분기가 제목에 있는 것 → 이번 회계연도 → 나머지 / 같은 순위면 최신·PDF 직링크 먼저
+    def rank(x):
+        t, u, d = x
+        ps = period_score(t + " " + urllib.parse.unquote(u), period) if period else 0
+        return (3 if d and d >= since_day else max(ps, 0), d or "0", bool(re.search(r"\.pdf($|\?)", u, re.I)))
+    ranked = sorted(hits, key=rank, reverse=True)
+    best = rank(ranked[0])[0] if ranked else 0
+    for x in ranked:
+        t, u, d = x
+        if best > 0 and rank(x)[0] == 0 and len(out) >= 1: continue  # 확실한 자료가 있으면 불확실한 것으로 채우지 않음
         if u in urls: continue
         urls.add(u); out.append((t, u, d))
     return out[:limit]
 
+NOISE = re.compile(r"採用|リクルート|新卒|よくある|FAQ|製品|商品|サービスについて|お客様")
+def period_score(txt, period):
+    """제목·주소에 적힌 회계연도·분기가 이번 결산과 맞는지: 2=연도·분기 일치, 1=연도 일치, 0=정보 없음, -1=다른 연도"""
+    fy_y, fem, n = period
+    txt = E.nfkc(txt)
+    yrs = [(int(y), int(m)) for y, m in re.findall(r"(20\d\d)\s*年\s*(\d{1,2})\s*月期", txt)]
+    yrs += [(2000 + int(y), int(m)) for m, y in re.findall(r"FY\s*(\d{1,2})/(\d\d)", txt, re.I)]
+    yrs += [(int(y), fem) for y in re.findall(r"FY\s*(20\d\d)", txt, re.I)]
+    if not yrs: return 0
+    if (fy_y, fem) not in yrs and fy_y not in [y for y, _ in yrs]: return -1
+    qpat = r"通期|期末|第\s*4\s*四半期|4\s*Q|Q\s*4|年度決算|本決算|Full[- ]?Year" if n == 4 else \
+           rf"第\s*{n}\s*四半期|{n}\s*Q|Q\s*{n}" + (r"|中間" if n == 2 else "")
+    return 2 if re.search(qpat, txt, re.I) else 1
+
+def card_period(card):
+    """카드 → (회계연도 연도, 결산월, 분기) 예: 2026년 8월 결산 4분기 → (2026, 8, 4)"""
+    try:
+        fem = card.get("fem") or E.fy_end_month_of(card["r"])
+        end = (card.get("r") or {}).get("end") or card["series"][-1]["end"]
+        fy, n = E.fy_of(end[:7], fem)
+        return 2000 + int(fy.split("/")[1]), fem, n
+    except Exception:
+        return None
+
+_LOGMI = {"t": 0, "items": []}
+def logmi_index(pages=8):
+    """로그미 파이낸스 최신 설명회 기록 목록(약 6주치) — 사이트 검색이 종목으로 걸러지지 않아 최신 목록을 훑어 종목코드로 찾음(6시간 캐시)"""
+    if time.time() - _LOGMI["t"] < 6 * 3600 and _LOGMI["items"]: return _LOGMI["items"]
+    items = []
+    for pg in range(1, pages + 1):
+        try: s = E.nfkc(re.sub(r"<!--.*?-->", "", _get(f"https://finance.logmi.jp/search?page={pg}").decode("utf-8", "ignore"), flags=re.S))
+        except Exception as e: E.log("logmi error", e); break
+        n = 0
+        for m in re.finditer(r'<a[^>]+href="(/articles/\d+)"[^>]*>(.*?)</a>', s, re.S):
+            t = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", m.group(2)))).strip()
+            c = re.search(r"\(\s*([0-9][0-9A-Z]{3})\s*\)", t)
+            d = re.search(r"開催日\s*(20\d\d)/(\d{1,2})/(\d{1,2})", t)
+            if not c: continue
+            items.append({"code": c.group(1), "url": "https://finance.logmi.jp" + m.group(1), "t": t,
+                          "d": f"{d.group(1)}{int(d.group(2)):02d}{int(d.group(3)):02d}" if d else None, "qa": "質疑" in t})
+            n += 1
+        if not n: break
+    if items: _LOGMI.update(t=time.time(), items=items)
+    return items
+
 def logmi_docs(code, since_day, limit=1):
     """로그미 파이낸스의 같은 종목 결산 설명회 기록 기사"""
-    try:
-        s = E.nfkc(re.sub(r"<!--.*?-->", "", _get(f"https://finance.logmi.jp/search?q={code}").decode("utf-8", "ignore"), flags=re.S))
-    except Exception as e:
-        E.log("logmi error", e); return []
     out = []
-    for m in re.finditer(r'<a[^>]+href="(/articles/\d+)"[^>]*>(.*?)</a>', s, re.S):
-        t = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", m.group(2)))).strip()
-        if f"({code})" not in t: continue
-        d = re.search(r"開催日\s*(20\d\d)/(\d{1,2})/(\d{1,2})", t)
-        d = f"{d.group(1)}{int(d.group(2)):02d}{int(d.group(3)):02d}" if d else None
-        if d and d < since_day: continue
-        out.append(("로그미 파이낸스 설명회 기록" + (" (질의응답 포함)" if "質疑応答" in t else ""), "https://finance.logmi.jp" + m.group(1), d))
-    return out[:limit]
+    for it in logmi_index():
+        if it["code"] != code or (it["d"] and it["d"] < since_day): continue
+        out.append(("로그미 파이낸스 설명회 기록" + (" (질의응답 포함)" if it["qa"] else ""), it["url"], it["d"]))
+    return sorted(out, key=lambda x: ("질의응답" in x[0], x[2] or ""), reverse=True)[:limit]
 
 def fetch_doc(url, depth=0, pat=None):
     """→ ('pdf', bytes) 또는 ('text', 본문 문자열). 안내 글만 있는 페이지면 그 안의 PDF를 따라감"""
@@ -237,8 +320,9 @@ def other_qa(card):
     """TDnet 밖(회사 IR 홈페이지, 로그미)의 질의응답·설명회 기록 → [(이름, 종류, 내용, url)]"""
     since = card["d"]
     found = []
+    per = card_period(card)
     for fn in (ir_site_docs, logmi_docs):
-        try: found += fn(card["code"], since)
+        try: found += fn(card["code"], since, period=per) if fn is ir_site_docs else fn(card["code"], since)
         except Exception as e: E.log("qa source error", fn.__name__, e)
     out, sigs = [], set()
     for name, url, d in found:
@@ -268,7 +352,7 @@ def build(card, qa_rows=None):
             except Exception as e: E.log("ir pdf error", e)
     if not card.get("mat"):  # TDnet에 설명 자료가 없으면 회사 IR 홈페이지에서
         try:
-            for t, u, d in ir_site_docs(card["code"], card["d"], limit=4, pat=MAT_LINK):
+            for t, u, d in ir_site_docs(card["code"], card["d"], limit=4, pat=MAT_LINK, period=card_period(card)):
                 if QA_LINK.search(t): continue
                 kind, body = fetch_doc(u, pat=MAT_LINK)
                 if kind == "pdf" and len(body) < 12_000_000: docs.insert(0, body); names.insert(0, "결산 설명 자료(회사 IR 홈페이지)"); break
