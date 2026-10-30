@@ -24,7 +24,7 @@ jobs:
           python - <<'PY'
           import importlib, sys, os, yaml, glob
           sys.path.insert(0, os.getcwd())
-          for m in ("jpall", "xbrl", "jp2ko", "earn", "earn_report", "earn_ir", "earn_opinion", "holdings", "stcrypt"):
+          for m in ("jpall", "xbrl", "jp2ko", "earn", "earn_report", "earn_ir", "earn_opinion", "holdings", "stcrypt", "aicache"):
               if os.path.exists(m + ".py"):
                   importlib.import_module(m); print("import ok", m)
           for f in glob.glob(".github/workflows/*.yml"):
