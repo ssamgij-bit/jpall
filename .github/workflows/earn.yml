@@ -54,7 +54,7 @@ jobs:
           GATEWAY_URL: ${{ secrets.EARN_GATEWAY_URL || 'https://earn-gateway.ssamgij.workers.dev' }}   # 즉시 응답 관문(Cloudflare Worker). 비밀값 EARN_GATEWAY_URL=off 면 예전 방식
           TEST_DAY: ${{ github.event.inputs.test_day }}
           TEST_REPORT: ${{ github.event.inputs.test_report }}
-          RUN_SECONDS: "1680"
+          RUN_SECONDS: "900"   # 한 번 실행 15분: 코드 수정이 빨리 반영되도록
         run: python earn.py
 
       - name: 상태 저장(earn-state 브랜치에 덮어쓰기)
