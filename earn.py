@@ -1939,6 +1939,16 @@ def main():
             if c.get("msg") and not c.get("deleted"):
                 tg("editMessageReplyMarkup", {"chat_id": c.get("chat") or CHANNEL, "message_id": c["msg"], "reply_markup": keyboard(cid, c)}); time.sleep(0.5)
         st["kb_v2"] = True; save(st)
+    if not st.get("fix_excl_1030") and not DRY:  # 한 번: 업종 표기 차이로 제외 업종(전기·가스)인데 채널에 올라간 카드 4건 삭제 + 주간 성과 집계에서 제외
+        bad = {("9531", "20261029"), ("9536", "20261029"), ("9506", "20261030"), ("9513", "20261030")}
+        gone = set()
+        for cid, c in list(st.get("cards", {}).items()):
+            if (c.get("code"), c.get("d")) in bad and c.get("msg") and not c.get("deleted") and not c.get("chat"):
+                r = tg("deleteMessage", {"chat_id": CHANNEL, "message_id": c["msg"]})
+                c["deleted"] = True; c["rx"] = c.get("rx") or "deleted"; gone.add(cid)
+                log("제외 업종 카드 삭제", c["code"], "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:80]}")
+        st["perf_log"] = [p for p in st.get("perf_log", []) if (p.get("code"), p.get("d")) not in bad]
+        st["fix_excl_1030"] = True; save(st)
     try: sync_jp_stock(st)
     except Exception: traceback.print_exc()
     try: gateway_setup(st)
