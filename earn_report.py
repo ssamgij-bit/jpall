@@ -34,6 +34,9 @@ def gemini_pdf(prompt, pdfs, max_tokens=12000):
     import jpall; key = jpall.gem_key()
     pdfs = [p for p in pdfs if p]
     if not key or not pdfs: return None
+    import aicache
+    ck = aicache.key(prompt + f"|{max_tokens}", pdfs); hit = aicache.get(ck)
+    if hit: E.log("ai cache hit(리포트)"); return hit   # 같은 자료·같은 지시문 → 저장해 둔 결과(한도 절약)
     parts = [{"inline_data": {"mime_type": "application/pdf", "data": base64.b64encode(p).decode()}} for p in pdfs] + [{"text": prompt}]
     body = json.dumps({"contents": [{"parts": parts}],
                        "generationConfig": {"temperature": 0.2, "maxOutputTokens": max_tokens, "responseMimeType": "application/json"}}).encode()
@@ -45,6 +48,7 @@ def gemini_pdf(prompt, pdfs, max_tokens=12000):
             txt = "".join(p.get("text", "") for p in r["candidates"][0]["content"]["parts"])
             out = json.loads(re.sub(r"^```(json)?|```$", "", txt.strip()))
             if isinstance(out, list): out = out[0] if out and isinstance(out[0], dict) else None
+            aicache.put(ck, out)
             return out
         except Exception as e:
             E.log("gemini pdf error", model, str(e)[:150])

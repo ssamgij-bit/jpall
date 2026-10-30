@@ -33,6 +33,9 @@ SLOW = {}  # 모델 → 다시 시도할 시각(응답 지연·과부하일 때)
 def gemini_pdfs(prompt, pdfs):
     import jpall; key = jpall.gem_key()
     if not key or not pdfs: return None
+    import aicache
+    ck = aicache.key(prompt, pdfs); hit = aicache.get(ck)
+    if hit: E.log("ai cache hit(IR)"); return hit   # 같은 자료·같은 지시문 → 저장해 둔 결과(한도 절약)
     parts = [{"inline_data": {"mime_type": "application/pdf", "data": base64.b64encode(b).decode()}} for b in pdfs] + [{"text": prompt}]
     body = json.dumps({"contents": [{"parts": parts}],
                        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 12000, "responseMimeType": "application/json"}}).encode()
@@ -44,6 +47,7 @@ def gemini_pdfs(prompt, pdfs):
             txt = "".join(p.get("text", "") for p in r["candidates"][0]["content"]["parts"])
             out = json.loads(re.sub(r"^```(json)?|```$", "", txt.strip()))
             if isinstance(out, list): out = out[0] if out and isinstance(out[0], dict) else None
+            aicache.put(ck, out)
             return out
         except Exception as e:
             E.log("gemini ir error", model, str(e)[:150])
@@ -78,9 +82,26 @@ def company_site(code):
         if host and not any(k in host for k in SKIP_HOST): return u
     return None
 
+VIA_GW, NO_GW = set(), set()   # 관문으로 열리는 호스트 / 관문으로도 안 열리는 호스트
 def _get(url, timeout=25):
-    return http(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 Safari/605.1.15",
-                                                 "Accept-Language": "ja,en;q=0.8"})
+    """회사 페이지 열기. GitHub 실행 환경(해외 데이터센터)의 접속을 막는 사이트(403·응답 없음)는
+    즉시 응답 관문(Cloudflare Worker)의 /fetch 로 대신 열고, 그 호스트는 이번 실행 동안 계속 관문으로"""
+    h = urllib.parse.urlparse(url).netloc.lower()
+    if h not in VIA_GW:
+        try:
+            return http(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 Safari/605.1.15",
+                                                         "Accept-Language": "ja,en;q=0.8"})
+        except Exception as e:
+            code = getattr(e, "code", None)
+            blocked = code in (403, 451) or (code is None and re.search(r"timed out|reset|refused|closed|unreachable", str(e), re.I))
+            if not blocked or h in NO_GW or not (E.GATEWAY_URL and E.GATEWAY_KEY): raise
+            E.log("site blocked → gateway", h, str(e)[:60])
+    try:
+        b = http(E.GATEWAY_URL + "/fetch?u=" + urllib.parse.quote(url, safe=""), timeout=timeout + 20, headers={"x-key": E.GATEWAY_KEY})
+    except Exception as e:
+        NO_GW.add(h); VIA_GW.discard(h); E.log("gateway fetch error", h, str(e)[:60]); raise
+    if h not in VIA_GW: VIA_GW.add(h); E.log("gateway fetch ok", h)
+    return b
 
 def _links(base, page):
     out = []
@@ -225,6 +246,7 @@ def ir_site_docs(code, since_day, limit=2, pat=None, period=None):
         # 이번 결산 이후 날짜가 확인된 자료가 없음 → 자바스크립트로 그리는 목록일 수 있으니 브라우저로 열어 봄(자료실·설명회 페이지 우선)
         cand = sorted(dict.fromkeys(irpages), key=lambda u: -len(re.findall(r"library|presentation|event|setsumei|kessan|material|siryo|shiryo|briefing|meeting", u, re.I)))
         n0 = len(hits)
+        cand = [u for u in cand if urllib.parse.urlparse(u).netloc.lower() not in VIA_GW]   # 해외 접속을 막는 사이트는 브라우저로도 안 열림
         for body, p in render_pages(cand, limit=6):
             scan(p, body, 1)
         if len(hits) > n0: E.log("rendered IR pages", code, len(hits) - n0)

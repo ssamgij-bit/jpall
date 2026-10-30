@@ -933,10 +933,16 @@ def ai_skip(model): return AI_OUT.get(_kh() + ":" + model, 0) > time.time()
 def ai_429(model):
     AI_OUT[_kh() + ":" + model] = time.time() + 2 * 3600
     log("gemini 429 → 2시간 쉼", model)
-def ai_out_until():
+def ai_out_until(heavy=False):
+    """모든 모델이 한도 초과면 가장 먼저 풀리는 시각(아니면 0).
+    heavy(리포트·IR: PDF 여러 개를 읽는 큰 요청): 쓸 수 있는 모델이 1개만 남아도 미룸 — 마지막 남은 가벼운 모델은 큰 PDF에서 거의 실패하거나 품질이 낮고, 시도할수록 한도만 더 씀"""
     from jpall import GEMINI_MODELS
     ts = [AI_OUT.get(_kh() + ":" + m, 0) for m in GEMINI_MODELS]
-    return min(ts) if ts and min(ts) > time.time() else 0
+    out = sorted(t for t in ts if t > time.time())
+    if not ts or not out: return 0
+    if len(out) == len(ts): return out[0]
+    if heavy and len(ts) >= 2 and len(ts) - len(out) <= 1: return out[0]
+    return 0
 
 def defer_ai(st, act, cid, dest, reply, until):
     w = st.setdefault("ai_wait", [])
@@ -951,18 +957,28 @@ def defer_ai(st, act, cid, dest, reply, until):
 def release_ai(st):
     w = st.get("ai_wait") or []
     w[:] = [x for x in w if time.time() - x.get("ts", 0) < 2 * 86400]
-    if not w or ai_out_until(): return
+    if not w or ai_out_until(heavy=True): return
     for x in w:
         q = st.setdefault("rep_q" if x["act"] == "rep" else "ir_q", [])
         q.append({"cid": x["cid"], "chat": x["chat"], "reply": x.get("reply")})
     log("ai waits released", len(w)); w.clear()
 
+def _heavy_keys():
+    return [k for k in (os.environ.get("GEMINI_API_KEY_2"), os.environ.get("GEMINI_API_KEY_3")) if k]
+
 class _key2:
-    """리포트·IR·시장 반응은 보조 Gemini 키(GEMINI_API_KEY_2)가 있으면 그 키로 — 카드용 한도와 분리(이 스레드에만 적용)"""
+    """리포트·IR·시장 반응은 보조 Gemini 키(GEMINI_API_KEY_2, _3)로 — 카드용 한도와 분리(이 스레드에만 적용).
+    보조 키가 여럿이면 한도가 남은 키를 고름(앞의 키가 막히면 다음 키)"""
     def __enter__(self):
         import jpall
         self.k = getattr(jpall.AI_TL, "key", None)
-        if os.environ.get("GEMINI_API_KEY_2"): jpall.AI_TL.key = os.environ["GEMINI_API_KEY_2"]
+        ks = _heavy_keys()
+        if ks:
+            pick = ks[0]
+            for k in ks:
+                jpall.AI_TL.key = k
+                if not ai_out_until(heavy=True): pick = k; break
+            jpall.AI_TL.key = pick
     def __exit__(self, *a):
         import jpall
         jpall.AI_TL.key = self.k
@@ -1044,7 +1060,7 @@ def _start_jobs(st):
             continue
         same = _running("ir", cid)
         if same: q.pop(0); same[0]["waiters"].append((dest, reply)); continue   # 같은 카드 요약을 만드는 중이면 끝나면 같이 보냄
-        with _key2(): out = ai_out_until()
+        with _key2(): out = ai_out_until(heavy=True)
         if out: q.pop(0); defer_ai(st, "ir", cid, dest, reply, out); continue
         if len([x for x in JOBS if x["kind"] in ("rep", "ir")]) >= MAX_HEAVY: break
         q.pop(0)
@@ -1063,7 +1079,7 @@ def _start_jobs(st):
             if r.get("ok"): q.pop(0); continue
         same = _running("rep", cid)
         if same: q.pop(0); same[0]["waiters"].append((dest, reply)); continue
-        with _key2(): out = ai_out_until()
+        with _key2(): out = ai_out_until(heavy=True)
         if out: q.pop(0); defer_ai(st, "rep", cid, dest, reply, out); continue
         if len([x for x in JOBS if x["kind"] in ("rep", "ir")]) >= MAX_HEAVY: break
         q.pop(0)
@@ -1130,7 +1146,7 @@ class _DONE:
                 else: card.pop("qa_watch", None); log("IR 요약에 Q&A 포함", card["code"])
         for dest, reply in j["waiters"]:
             if not texts:
-                with _key2(): out = ai_out_until()
+                with _key2(): out = ai_out_until(heavy=True)
                 if out: defer_ai(st, "ir", j["cid"], dest, reply, out); continue
                 tg("sendMessage", {"chat_id": dest, "text": f"IR·Q&A 요약 생성 실패({card['code']}). AI 한도일 수 있으니 잠시 뒤 다시 눌러 주세요.", **({"reply_to_message_id": reply} if reply else {})}); continue
             try:
@@ -1148,7 +1164,7 @@ class _DONE:
                 tg("sendMessage", {"chat_id": dest, "text": f"리포트 생성 실패({card['code']}). 잠시 뒤 다시 눌러 주세요.", **rp}); continue
             fn, blob, ok_ai = res
             if not ok_ai:
-                with _key2(): out = ai_out_until()
+                with _key2(): out = ai_out_until(heavy=True)
                 if out: defer_ai(st, "rep", j["cid"], dest, reply, out); continue   # 만드는 도중 한도가 끝남 → 풀린 뒤 다시
             cap = f"📄 {card.get('name_ko') or card['name']}({card['code']}) 리포트 — 파일을 열어 보세요"
             if not ok_ai: cap += "\n⚠️ AI 분석(결론·사업부·IR 핵심 데이터·Q&A)은 구글 서버 혼잡으로 빠졌습니다. 잠시 뒤 📄 리포트를 다시 누르면 새로 만듭니다."
@@ -1797,6 +1813,7 @@ def main():
     except Exception: traceback.print_exc()
     try: gateway_setup(st)
     except Exception: traceback.print_exc()
+    import aicache; aicache.prune()   # 7일 지난 AI 결과 저장분 정리
     last_scan = 0
     while time.time() - t0 < RUN_SECONDS:
         try:
