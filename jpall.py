@@ -1598,8 +1598,13 @@ def reason_src(row, kind):
 
 GEMINI_MODELS = [m.strip() for m in os.environ.get("GEMINI_MODELS", "gemini-3.8-flash,gemini-3.7-flash,gemini-3.5-flash,gemini-3.1-flash-lite").split(",") if m.strip()]
 MON_MODELS = [m.strip() for m in os.environ.get("MON_MODELS", "gemini-3.1-flash-lite,gemini-3.5-flash,gemini-3.7-flash").split(",") if m.strip()]
+import threading as _th
+AI_TL = _th.local()   # 스레드별 Gemini 키(실적 봇: 리포트·IR 작업 스레드는 보조 키)
+def gem_key():
+    return getattr(AI_TL, "key", None) or os.environ.get("GEMINI_API_KEY")
+
 def gemini_json(prompt, timeout=150, models=None):
-    key = os.environ.get("GEMINI_API_KEY")
+    key = gem_key()
     if not key: return None
     for model in models or GEMINI_MODELS:
         t0 = time.time()

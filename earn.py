@@ -369,7 +369,26 @@ def qlabel(q, fy_end_month):
     return f"{fy} {n}Q", f"{m1}~{m2}월"
 
 # ───────────────────────── 차트(카드 이미지) ─────────────────────────
+class _SafePlt:
+    """pyplot 대신 쓰는 얇은 감싸개: 그림을 pyplot 전역 상태 없이 만들어 여러 작업 스레드가 동시에 그려도 안전"""
+    def __init__(self, plt): self._p = plt
+    def subplots(self, nrows=1, ncols=1, **kw):
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        fkw = {k: kw.pop(k) for k in ("figsize", "dpi", "facecolor") if k in kw}
+        fig = Figure(**fkw); FigureCanvasAgg(fig)
+        return fig, fig.subplots(nrows, ncols, **kw)
+    def close(self, *a): pass
+    def __getattr__(self, n): return getattr(self._p, n)
+
+import threading as _th
+_PLT = {"p": None}; _PLT_LOCK = _th.Lock()
 def _plt():
+    with _PLT_LOCK:
+        if _PLT["p"] is None: _PLT["p"] = _SafePlt(_plt_init())
+        return _PLT["p"]
+
+def _plt_init():
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -863,31 +882,6 @@ def send_texts(card, texts, dest=None, reply=None):
         ok = ok or bool(r.get("ok")); time.sleep(1)
     return ok
 
-def do_ir(st):
-    q = st.get("ir_q") or []
-    while q:
-        cid, dest, reply = _job(q.pop(0), st)
-        card = st.get("cards", {}).get(cid)
-        if not card: continue
-        try:
-            texts = card.get("ir_texts")  # 이미 만든 요약은 다시 만들지 않고 보냄(AI 절약)
-            if not texts and ai_out_until():
-                defer_ai(st, "ir", cid, dest, reply, ai_out_until()); continue
-            if not texts:
-                import earn_ir
-                texts, has_qa = earn_ir.build(card)
-                if texts:
-                    card["ir_texts"] = texts
-                    if not has_qa: card["qa_watch"] = time.time(); card.setdefault("qa_to", [])
-            if not texts and ai_out_until():
-                defer_ai(st, "ir", cid, dest, reply, ai_out_until()); continue
-            if not texts:
-                tg("sendMessage", {"chat_id": dest, "text": f"IR·Q&A 요약 생성 실패({card['code']}). AI 한도일 수 있으니 잠시 뒤 다시 눌러 주세요.", **({"reply_to_message_id": reply} if reply else {})}); continue
-            send_texts(card, texts, dest, reply)
-            if card.get("qa_watch") and str(dest) not in [str(x) for x in card.setdefault("qa_to", [])]: card["qa_to"].append(dest)
-        except Exception:
-            traceback.print_exc()
-
 def send_qa(card, texts):
     """Q&A가 뒤늦게 올라오면: IR 요약을 받아 간 사람들에게 다시 보내고, 이후 요청부터는 Q&A 포함본을 씀"""
     card["ir_texts"] = [texts[0].split("\n\n", 1)[-1]] + texts[1:]
@@ -930,7 +924,8 @@ import jpall as _jp
 AI_OUT = _jp.__dict__.setdefault("EARN_AI_OUT", {})   # "키 해시:모델" → 다시 써 볼 시각. earn_report·earn_ir 가 따로 불러온 earn 과도 같은 기록을 쓰도록 jpall 모듈에 둠
 def _kh():
     import hashlib
-    return hashlib.sha256((os.environ.get("GEMINI_API_KEY") or "").encode()).hexdigest()[:8]
+    import jpall
+    return hashlib.sha256((jpall.gem_key() or "").encode()).hexdigest()[:8]
 def ai_skip(model): return AI_OUT.get(_kh() + ":" + model, 0) > time.time()
 def ai_429(model):
     AI_OUT[_kh() + ":" + model] = time.time() + 2 * 3600
@@ -960,50 +955,202 @@ def release_ai(st):
     log("ai waits released", len(w)); w.clear()
 
 class _key2:
-    """리포트·IR·시장 반응은 보조 Gemini 키(GEMINI_API_KEY_2)가 있으면 그 키로 — 카드용 한도와 분리"""
+    """리포트·IR·시장 반응은 보조 Gemini 키(GEMINI_API_KEY_2)가 있으면 그 키로 — 카드용 한도와 분리(이 스레드에만 적용)"""
     def __enter__(self):
-        self.k = os.environ.get("GEMINI_API_KEY")
-        if os.environ.get("GEMINI_API_KEY_2"): os.environ["GEMINI_API_KEY"] = os.environ["GEMINI_API_KEY_2"]
+        import jpall
+        self.k = getattr(jpall.AI_TL, "key", None)
+        if os.environ.get("GEMINI_API_KEY_2"): jpall.AI_TL.key = os.environ["GEMINI_API_KEY_2"]
     def __exit__(self, *a):
-        if self.k is not None: os.environ["GEMINI_API_KEY"] = self.k
+        import jpall
+        jpall.AI_TL.key = self.k
+
+# ── 작업 스레드: 오래 걸리는 일(종목 분석·카드 준비·리포트·IR 요약)은 따로 돌리고, 메인 루프는 계속 요청·버튼을 받음
+import concurrent.futures as _cf, copy as _copy
+POOL = _cf.ThreadPoolExecutor(max_workers=5)
+JOBS = []   # {"kind", "fut", ...}
+MAX_ASK, MAX_HEAVY = 2, 3   # 종목 요청(카드)은 리포트·IR과 따로 2자리 → 리포트가 몰려도 종목 요청은 바로 처리
+
+def _bg(fn, *a, key2=False):
+    """작업 스레드에서 실행. 예외는 결과로 돌려줌"""
+    try:
+        if key2:
+            with _key2(): return ("ok", fn(*a))
+        return ("ok", fn(*a))
+    except Exception as e:
+        traceback.print_exc()
+        return ("err", e)
+
+def _submit(kind, fn, *a, key2=False, **meta):
+    JOBS.append({"kind": kind, "fut": POOL.submit(_bg, fn, *a, key2=key2), "t0": time.time(), **meta})
+
+def _merge(card, cp):
+    for k, v in cp.items():
+        if not k.startswith("_"): card[k] = v
+
+def _rep_build(cp):
+    import earn_report
+    fn, blob = earn_report.build(cp)
+    return fn, blob, cp.pop("_ai_ok", True)
+
+def _ir_build(cp):
+    import earn_ir
+    return earn_ir.build(cp)
 
 def do_reports(st):
-    do_asks(st)
     AI_OUT.update(st.get("ai_out") or {})
     try:
-        with _key2():
-            release_ai(st)
-            _do_reports(st)
+        with _key2(): release_ai(st)
+        _collect(st)
+        _start_jobs(st)
     finally:
         st["ai_out"] = {k: v for k, v in AI_OUT.items() if v > time.time()}
 
-def _do_reports(st):
-    do_ir(st)
+def _running(kind=None, cid=None):
+    return [j for j in JOBS if (kind is None or j["kind"] == kind) and (cid is None or j.get("cid") == cid)]
+
+def _start_jobs(st):
+    """대기열 → 작업 스레드(동시에 최대 MAX_JOBS개). 바로 끝나는 일(이미 만든 결과 재전송)은 여기서 처리"""
+    # 1) 종목 요청(카드)
+    q = st.get("ask_q") or []
+    while q and len([x for x in JOBS if x["kind"] in ("analyze", "card")]) < MAX_ASK:
+        job = q.pop(0)
+        _submit("analyze", analyze_code, job["code"], job=job)
+    # 2) IR·Q&A 요약
+    q = st.get("ir_q") or []
+    while q:
+        cid, dest, reply = _job(q[0], st)
+        card = st.get("cards", {}).get(cid)
+        if not card: q.pop(0); continue
+        if card.get("ir_texts"):  # 이미 만든 요약은 바로
+            q.pop(0)
+            try:
+                send_texts(card, card["ir_texts"], dest, reply)
+                if card.get("qa_watch") and str(dest) not in [str(x) for x in card.setdefault("qa_to", [])]: card["qa_to"].append(dest)
+            except Exception: traceback.print_exc()
+            continue
+        same = _running("ir", cid)
+        if same: q.pop(0); same[0]["waiters"].append((dest, reply)); continue   # 같은 카드 요약을 만드는 중이면 끝나면 같이 보냄
+        with _key2(): out = ai_out_until()
+        if out: q.pop(0); defer_ai(st, "ir", cid, dest, reply, out); continue
+        if len([x for x in JOBS if x["kind"] in ("rep", "ir")]) >= MAX_HEAVY: break
+        q.pop(0)
+        _submit("ir", _ir_build, _copy.deepcopy(card), key2=True, cid=cid, waiters=[(dest, reply)])
+    # 3) 리포트
     q = st.get("rep_q") or []
     while q:
-        cid, dest, reply = _job(q.pop(0), st)
+        cid, dest, reply = _job(q[0], st)
         card = st.get("cards", {}).get(cid)
-        if not card: continue
+        if not card: q.pop(0); continue
         rp = {"reply_to_message_id": reply, "allow_sending_without_reply": True} if reply else {}
+        cap = f"📄 {card.get('name_ko') or card['name']}({card['code']}) 리포트 — 파일을 열어 보세요"
+        if card.get("rep_file"):  # 이미 만든 리포트는 텔레그램 파일을 그대로 다시 보냄
+            r = tg("sendDocument", {"chat_id": dest, "caption": cap, "document": card["rep_file"], **rp})
+            if r.get("ok"): q.pop(0); continue
+        same = _running("rep", cid)
+        if same: q.pop(0); same[0]["waiters"].append((dest, reply)); continue
+        with _key2(): out = ai_out_until()
+        if out: q.pop(0); defer_ai(st, "rep", cid, dest, reply, out); continue
+        if len([x for x in JOBS if x["kind"] in ("rep", "ir")]) >= MAX_HEAVY: break
+        q.pop(0)
+        _submit("rep", _rep_build, _copy.deepcopy(card), key2=True, cid=cid, waiters=[(dest, reply)])
+
+def _collect(st, wait=0):
+    """끝난 작업의 결과를 메인 스레드에서 반영(게시·상태 저장)"""
+    if wait and JOBS: _cf.wait([j["fut"] for j in JOBS], timeout=wait)
+    for j in [j for j in JOBS if j["fut"].done()]:
+        JOBS.remove(j)
         try:
-            cap = f"📄 {card.get('name_ko') or card['name']}({card['code']}) 리포트 — 파일을 열어 보세요"
-            if card.get("rep_file"):  # 이미 만든 리포트는 텔레그램 파일을 그대로 다시 보냄(AI 절약)
-                r = tg("sendDocument", {"chat_id": dest, "caption": cap, "document": card["rep_file"], **rp})
-                if r.get("ok"): continue
-            if ai_out_until():
-                defer_ai(st, "rep", cid, dest, reply, ai_out_until()); continue
-            import earn_report
-            fn, blob = earn_report.build(card)
-            ok_ai = card.pop("_ai_ok", True)
-            if not ok_ai and ai_out_until():  # 만드는 도중 한도가 끝남 → AI 빠진 리포트 대신 풀린 뒤 다시
-                defer_ai(st, "rep", cid, dest, reply, ai_out_until()); continue
-            if not ok_ai: cap += "\n⚠️ AI 분석(결론·사업부·IR 핵심 데이터·Q&A)은 구글 서버 혼잡으로 빠졌습니다. 잠시 뒤 📄 리포트를 다시 누르면 새로 만듭니다."
-            res = tg("sendDocument", {"chat_id": dest, "caption": cap, **rp}, files={"document": (fn, blob, "text/html")}, timeout=90)
-            if res.get("ok") and ok_ai:
-                card["rep_file"] = ((res.get("result") or {}).get("document") or {}).get("file_id")
+            ok, res = j["fut"].result()
+            getattr(_DONE, j["kind"])(st, j, ok, res)
         except Exception:
             traceback.print_exc()
-            tg("sendMessage", {"chat_id": dest, "text": f"리포트 생성 실패({card['code']}). 잠시 뒤 다시 눌러 주세요.", **rp})
+
+class _DONE:
+    @staticmethod
+    def analyze(st, j, ok, res):
+        job = j["job"]; code = job["code"]
+        if ok != "ok":
+            tg("sendMessage", {"chat_id": job["chat"], "text": f"{label_of(code)} 분석 실패: {str(res)[:120]}"}); return
+        a, row = res
+        personal = job.get("watch") or str(job["chat"]) not in (str(CHANNEL), str(st.get("owner")))
+        direct = personal or str(job["chat"]) != str(CHANNEL)   # 개인 대화로 요청했으면(주인 포함) 그 대화로
+        hit = reuse_card(st, code, row.get("d"), job["chat"] if direct else None, force=True)   # 요청이면 같은 자리에 있어도 다시 보여 줌
+        if hit:
+            bump(st, "cache"); log("카드 재사용", code, job["chat"] if direct else "channel"); return
+        if hit is False:
+            drop_user(st, job["chat"]); return
+        _submit("card", prepare_card, a, row, job=job, a=a, row=row, personal=personal)
+
+    @staticmethod
+    def card(st, j, ok, res):
+        job, a, row, personal = j["job"], j["a"], j["row"], j["personal"]; code = job["code"]
+        if ok != "ok":
+            tg("sendMessage", {"chat_id": job["chat"], "text": f"{label_of(code)} 분석 실패: {str(res)[:120]}"}); return
+        cid = f"q{code}{int(time.time()) % 100000000}"
+        LAST_ERR["d"] = ""
+        msg = finish_card(st, cid, a, row, res, job["chat"] if personal else None)  # 다른 사용자 요청은 그 사람 개인 대화로
+        if msg is None and personal and BLOCK_RE.search(LAST_ERR["d"] or ""):
+            drop_user(st, job["chat"]); return
+        if msg is not None: bump(st, "cards")
+        if msg is not None and job.get("report"):
+            enqueue_out(st, "rep", cid, job["chat"] if personal else CHANNEL, msg)
+            if job.get("ir"): enqueue_out(st, "ir", cid, job["chat"] if personal else CHANNEL, msg)
+        if msg is None:
+            tg("sendMessage", {"chat_id": job["chat"], "text": f"{label_of(code)} 카드 게시에 실패했습니다."})
+        elif str(job["chat"]) != str(CHANNEL) and not personal:
+            tg("sendMessage", {"chat_id": job["chat"], "text": f"{label_of(code)} 카드를 채널에 올렸습니다."})
+        log("요청 분석", code, "통과" if a["pass"] else a["why"])
+
+    @staticmethod
+    def ir(st, j, ok, res):
+        card = st.get("cards", {}).get(j["cid"])
+        if not card: return
+        texts, has_qa = res if ok == "ok" else (None, False)
+        if texts:
+            card["ir_texts"] = texts
+            if not has_qa: card["qa_watch"] = time.time(); card.setdefault("qa_to", [])
+        for dest, reply in j["waiters"]:
+            if not texts:
+                with _key2(): out = ai_out_until()
+                if out: defer_ai(st, "ir", j["cid"], dest, reply, out); continue
+                tg("sendMessage", {"chat_id": dest, "text": f"IR·Q&A 요약 생성 실패({card['code']}). AI 한도일 수 있으니 잠시 뒤 다시 눌러 주세요.", **({"reply_to_message_id": reply} if reply else {})}); continue
+            try:
+                send_texts(card, texts, dest, reply)
+                if card.get("qa_watch") and str(dest) not in [str(x) for x in card.setdefault("qa_to", [])]: card["qa_to"].append(dest)
+            except Exception: traceback.print_exc()
+
+    @staticmethod
+    def rep(st, j, ok, res):
+        card = st.get("cards", {}).get(j["cid"])
+        if not card: return
+        for dest, reply in j["waiters"]:
+            rp = {"reply_to_message_id": reply, "allow_sending_without_reply": True} if reply else {}
+            if ok != "ok":
+                tg("sendMessage", {"chat_id": dest, "text": f"리포트 생성 실패({card['code']}). 잠시 뒤 다시 눌러 주세요.", **rp}); continue
+            fn, blob, ok_ai = res
+            if not ok_ai:
+                with _key2(): out = ai_out_until()
+                if out: defer_ai(st, "rep", j["cid"], dest, reply, out); continue   # 만드는 도중 한도가 끝남 → 풀린 뒤 다시
+            cap = f"📄 {card.get('name_ko') or card['name']}({card['code']}) 리포트 — 파일을 열어 보세요"
+            if not ok_ai: cap += "\n⚠️ AI 분석(결론·사업부·IR 핵심 데이터·Q&A)은 구글 서버 혼잡으로 빠졌습니다. 잠시 뒤 📄 리포트를 다시 누르면 새로 만듭니다."
+            if card.get("rep_file"):
+                r = tg("sendDocument", {"chat_id": dest, "caption": cap, "document": card["rep_file"], **rp})
+                if r.get("ok"): continue
+            r = tg("sendDocument", {"chat_id": dest, "caption": cap, **rp}, files={"document": (fn, blob, "text/html")}, timeout=90)
+            if r.get("ok") and ok_ai:
+                card["rep_file"] = ((r.get("result") or {}).get("document") or {}).get("file_id")
+
+def finish_jobs(st, timeout=300):
+    """실행을 마치기 전: 돌던 작업을 최대 timeout초 기다려 반영, 그래도 안 끝난 건 대기열에 되돌려 다음 실행이 이어서 처리"""
+    _collect(st, wait=timeout)
+    for j in list(JOBS):
+        if j["kind"] in ("analyze", "card"): st.setdefault("ask_q", []).insert(0, j["job"])
+        else:
+            for dest, reply in j["waiters"]:
+                st.setdefault("rep_q" if j["kind"] == "rep" else "ir_q", []).insert(0, {"cid": j["cid"], "chat": dest, "reply": reply})
+        log("미완료 작업 되돌림", j["kind"])
+    JOBS.clear()
+    POOL.shutdown(wait=False, cancel_futures=True)
 
 # ───────────────────────── 요청 분석: 종목명·코드를 보내면 최근 분기 실적 카드 ─────────────────────────
 _IDX = None
@@ -1369,39 +1516,6 @@ def drop_user(st, uid):
     st.setdefault("blocked", {})[uid] = now().strftime("%Y%m%d")
     log("user dropped (blocked)", uid)
 
-def do_asks(st):
-    q = st.get("ask_q") or []
-    while q:
-        job = q.pop(0)
-        code = job["code"]
-        try:
-            a, row = analyze_code(code)
-            personal = job.get("watch") or str(job["chat"]) not in (str(CHANNEL), str(st.get("owner")))
-            # 개인 대화로 요청했으면(주인 포함) 이미 있는 카드는 그 대화로 복사. 예전엔 주인 요청이 채널 카드만 확인하고 아무것도 안 보냈음
-            direct = personal or str(job["chat"]) != str(CHANNEL)
-            hit = reuse_card(st, code, row.get("d"), job["chat"] if direct else None, force=True)   # 요청이면 같은 자리에 있어도 다시 보여 줌
-            if hit:  # 같은 종목·같은 결산 카드가 이미 있으면 복사해서 보냄(AI 절약)
-                bump(st, "cache"); log("카드 재사용", code, job["chat"] if direct else "channel"); continue
-            if hit is False:
-                drop_user(st, job["chat"]); continue
-            cid = f"q{code}{int(time.time()) % 100000000}"
-            LAST_ERR["d"] = ""
-            msg = make_card(st, cid, a, row, job["chat"] if personal else None)  # 다른 사용자 요청은 그 사람 개인 대화로
-            if msg is None and personal and BLOCK_RE.search(LAST_ERR["d"] or ""):
-                drop_user(st, job["chat"]); continue
-            if msg is not None: bump(st, "cards")
-            if msg is not None and job.get("report"):
-                enqueue_out(st, "rep", cid, job["chat"] if personal else CHANNEL, msg)
-                if job.get("ir"): enqueue_out(st, "ir", cid, job["chat"] if personal else CHANNEL, msg)
-            if msg is None:
-                tg("sendMessage", {"chat_id": job["chat"], "text": f"{label_of(code)} 카드 게시에 실패했습니다."})
-            elif str(job["chat"]) != str(CHANNEL) and not personal:
-                tg("sendMessage", {"chat_id": job["chat"], "text": f"{label_of(code)} 카드를 채널에 올렸습니다."})
-            log("요청 분석", code, "통과" if a["pass"] else a["why"])
-        except Exception as e:
-            traceback.print_exc()
-            tg("sendMessage", {"chat_id": job["chat"], "text": f"{label_of(code)} 분석 실패: {str(e)[:120]}"})
-
 # ───────────────────────── 메인 처리 ─────────────────────────
 def is_tanshin(r):
     t = r["title"]
@@ -1479,6 +1593,10 @@ def valuation(code):
 
 def make_card(st, cid, a, row, chat=None):
     """분석 결과 → Gemini 요약 → 카드(차트+글) 게시 → 상태에 저장. 게시 실패면 None"""
+    return finish_card(st, cid, a, row, prepare_card(a, row), chat)
+
+def prepare_card(a, row):
+    """오래 걸리는 부분(밸류에이션·IR 자료·Gemini 요약·차트) — 작업 스레드에서 실행 가능(상태 st 를 건드리지 않음)"""
     if True:
         fem = fy_end_month_of(a["r"])
         m = metrics(a["series"], len(a["series"]) - 1)
@@ -1493,7 +1611,13 @@ def make_card(st, cid, a, row, chat=None):
         buf = io.BytesIO()
         chart_name = name_of(a["code"], a["name"], ai) + f"({a['code']})"
         card_chart(chart_name, a["series"], fem, buf)
-        msg = post_card(st, cid, cap, buf.getvalue(), chat)
+        return {"fem": fem, "ai": ai, "cap": cap, "png": buf.getvalue(), "mat_url": mat_url, "mat_src": mat_src}
+
+def finish_card(st, cid, a, row, prep, chat=None):
+    """준비된 카드 게시 + 상태 저장(메인 스레드)"""
+    if True:
+        fem, ai, cap, mat_url, mat_src = prep["fem"], prep["ai"], prep["cap"], prep["mat_url"], prep["mat_src"]
+        msg = post_card(st, cid, cap, prep["png"], chat)
         if msg is None and not DRY: return None
         if not chat and a.get("pass") and not a.get("ondemand"):  # 채널 통과 카드: 성과 추적 + 개인 알림
             st.setdefault("perf_log", []).append({"cid": cid, "code": a["code"], "name": name_of(a["code"], a["name"], ai), "d": row["d"],
@@ -1673,6 +1797,8 @@ def main():
             if ERRS["n"] >= 5: alert_owner(st, f"이번 실행에서 오류가 {ERRS['n']}번 났습니다. 마지막 오류: {str(e)[:200]}", "loop_err"); ERRS["n"] = 0
         poll_buttons(st, wait=25)
         save(st)
+    try: finish_jobs(st)
+    except Exception: traceback.print_exc()
     save(st)
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ def esc(s): return html.escape(str(s if s is not None else ""), quote=False)
 
 SLOW = {}  # 모델 → 다시 시도할 시각(응답 지연·과부하일 때)
 def gemini_pdf(prompt, pdfs, max_tokens=12000):
-    key = os.environ.get("GEMINI_API_KEY")
+    import jpall; key = jpall.gem_key()
     pdfs = [p for p in pdfs if p]
     if not key or not pdfs: return None
     parts = [{"inline_data": {"mime_type": "application/pdf", "data": base64.b64encode(p).decode()}} for p in pdfs] + [{"text": prompt}]

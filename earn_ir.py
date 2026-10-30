@@ -31,7 +31,7 @@ IR_PROMPT = """첨부 PDF는 일본 상장사 {name}({code})의 이번 결산 �
 
 SLOW = {}  # 모델 → 다시 시도할 시각(응답 지연·과부하일 때)
 def gemini_pdfs(prompt, pdfs):
-    key = os.environ.get("GEMINI_API_KEY")
+    import jpall; key = jpall.gem_key()
     if not key or not pdfs: return None
     parts = [{"inline_data": {"mime_type": "application/pdf", "data": base64.b64encode(b).decode()}} for b in pdfs] + [{"text": prompt}]
     body = json.dumps({"contents": [{"parts": parts}],
