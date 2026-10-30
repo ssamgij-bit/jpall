@@ -1083,6 +1083,62 @@ def _ir_refresh(cp):
     if not r or not r[0]: FAIL[cp["code"]] = ai_fail_reason()
     return r
 
+# ── japan stock 봇(Cloudflare) 공시 요약 대행: Cloudflare 무료 플랜 CPU 한도(실행당 약 30ms) 안에서 PDF를 읽고 요약하기 어려워 여기서 대신 함
+JPS_URL = "https://jp-disclosure-bot.ssamgij.workers.dev"
+JPS_SYS = """당신은 한국 자산운용사 애널리스트를 돕는 리서치 보조입니다. 일본어로 된 공시 본문을 읽고 한국어로 요약합니다.
+출력 규칙:
+- 반드시 한국어로만 쓴다. 일본어 문장·가나를 남기지 않는다. 회사명·인명도 한국어 음역 또는 영문으로.
+- 정확히 3줄. 각 줄은 70자 이내의 한 문장.
+- 첫 줄에는 가장 중요한 사실(무엇을, 얼마나, 언제).
+- 숫자·금액·비율·날짜는 원문 그대로(億円→억엔, 百万円→백만엔, 前年同期比→전년 동기 대비, 自己株式→자사주).
+- 원문에 없는 해석·전망·투자 판단은 쓰지 않는다.
+- 본문이 비었거나 의미가 없으면 lines를 빈 목록으로.
+출력은 JSON만: {{"lines": ["첫 줄", "둘째 줄", "셋째 줄"]}}
+
+[공시] 제목: {title}
+본문:
+{body}"""
+_JPS = {"t": 0, "run": None}
+def _jps_job(key):
+    from jpall import pdf_text, MON_MODELS
+    try:
+        items = json.loads(http(JPS_URL + "/pend", timeout=20, headers={"x-watch-key": key}))
+    except Exception as e:
+        log("jps pend error", str(e)[:80]); return
+    out = []
+    for x in items[:6]:
+        ko = ""
+        try:
+            body = re.sub(r"\s+", " ", pdf_text(x["url"]))
+            k = body.replace(" ", "").find(re.sub(r"\s", "", x["title"])[:12])
+            if k > 0:  # 머리말(회사명·연락처) 건너뛰기
+                n = i = 0
+                while i < len(body) and n < k:
+                    if body[i] != " ": n += 1
+                    i += 1
+                body = body[i:]
+            if len(body) > 80:
+                j = gemini_json(JPS_SYS.format(title=x["title"], body=body[:3500]), timeout=60, models=MON_MODELS) or {}
+                lines = [re.sub(r"^\s*(?:[•\-*・]|\d{1,2}[.)])\s*", "", str(l)).strip() for l in (j.get("lines") or [])][:3]
+                lines = [l for l in lines if re.search(r"[가-힣]", l) and len(re.findall(r"[\u3040-\u30ff]", l)) <= len(l) * 0.2]
+                ko = "\n".join("• " + l for l in lines)
+        except Exception as e:
+            log("jps sum error", x.get("code"), str(e)[:80])
+        out.append({"id": x["id"], "ko": ko})
+    if out:
+        try:
+            http(JPS_URL + "/sum", timeout=20, data=json.dumps(out, ensure_ascii=False).encode(), headers={"x-watch-key": key, "content-type": "application/json"})
+            log("japan stock 공시 요약 대행", len(out), "건(요약 성공", sum(1 for o in out if o["ko"]), ")")
+        except Exception as e:
+            log("jps sum post error", str(e)[:80])
+
+def jp_summaries():
+    """1분마다: japan stock 봇의 요약 대기 공시를 가져와 작업 스레드에서 요약(메인 루프는 막지 않음)"""
+    key = os.environ.get("WATCH_KEY")
+    if not key or time.time() - _JPS["t"] < 60 or (_JPS["run"] and not _JPS["run"].done()): return
+    _JPS["t"] = time.time()
+    _JPS["run"] = POOL.submit(_jps_job, key)
+
 def do_reports(st):
     AI_OUT.update(st.get("ai_out") or {})
     try:
@@ -1884,6 +1940,7 @@ def main():
         try:
             poll_buttons(st, wait=0)
             do_reports(st)
+            jp_summaries()
             if time.time() - last_scan > 90:
                 last_scan = time.time()
                 for back in (1, 0):
