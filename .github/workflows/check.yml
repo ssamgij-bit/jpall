@@ -43,27 +43,6 @@ jobs:
           for h, u in I.render_pages(urls, 2):
               print('rendered', u, len(h), 'スクリプト' in h, repr(h[:300]))
           PY
-      - name: 해외 실행 환경에서 회사 홈페이지 접속 시험(임시)
-        continue-on-error: true
-        run: |
-          python - <<'PY'
-          import earn_ir as I, concurrent.futures as cf, sys
-          codes = "3697 3030 3177 2927 8237 280A 5817 4673 4317 6224 2722 2305 3922 9628 3915 7928 523A 1434 2404 3077 2459 3562 2872 3192 2698 8260 7581 5527 4760 7035 3608 6150 9993 4668 3201 3075 3222 7818 3935 4992 3181 7373 5578 9778 7370 276A 9647 2999 340A 7049 3083 8200 277A 2936 3139 7713 4270 8127 9978 5078 9982 9168 3991 3892 3815 5967 8783 8887 8244 8008 2337 5018 6532 7074 463A 8908 3967 3172 6505 135A 3536 9837 3645 325A 7434 3996 2186 3543 4432 4015 1418 3021 6058 2669 3548 2735 245A 469A 8143 7357 9238 3810 6543 3223 3826 2484 3168 4430 2411 9602 6182".split()
-          def one(c):
-              try: h = I.company_site(c)
-              except Exception as e: return c, "kabutan-err " + str(e)[:40]
-              if not h: return c, "nohome"
-              try: I._get(h); return c, "ok"
-              except Exception as e: return c, "err " + str(e)[:40]
-          res = list(cf.ThreadPoolExecutor(8).map(one, codes))
-          from collections import Counter
-          print("home fetch:", Counter(r.split(":")[0][:22] for _, r in res).most_common())
-          print("blocked:", [(c, r) for c, r in res if r != "ok"][:40])
-          try: print("logmi items", len(I.logmi_index(2)))
-          except Exception as e: print("logmi err", e)
-          try: import json; print("xj raw", len(json.loads(I._get("https://www.xj-storage.jp/public-list/GetList.aspx?company=AS95685&len=80&output=json")).get("items") or []))
-          except Exception as e: print("xj err", e)
-          PY
       - name: 실패하면 주인에게 텔레그램 알림
         if: failure()
         env:
