@@ -55,7 +55,7 @@ jobs:
               if m >= 20 and kst_h in (9, 13, 18): down.append(f"네이버 프리미엄 요약 봇(맥): 마지막 신호가 {m / 60:.1f}시간 전입니다(맥이 꺼졌거나 잠자기·봇 중단)")
           except Exception as e:
               print("beats error", e)
-          # 뉴스 저장소(jpnews) 봇들: 이어 달리기(약 6시간) 방식 → 마지막 실행이 실패했거나, 이어지지 않고 끊겼거나, 6.5시간 넘게 멈춰 있으면
+          # 뉴스 저장소(jpnews) 봇들: 마지막 실행이 실패했거나, 6.5시간 넘게 새 실행이 없거나, 한 실행이 6.5시간 넘게 안 끝나면
           NAMES = {"run.yml": "일본 뉴스 봇", "highs.yml": "신고가·상승률 봇", "community.yml": "일본 커뮤니티 봇", "morning.yml": "아침 브리핑", "weather.yml": "서울 날씨 알림"}
           for f, name in NAMES.items():
               try:
@@ -67,8 +67,8 @@ jobs:
                   why = None
                   if r["status"] == "completed" and r["conclusion"] not in ("success", "skipped") and first_hour(age(ua)):
                       why = f"마지막 실행이 실패({r['conclusion']})"
-                  elif r["status"] == "completed" and first_hour(age(ua) - 60):
-                      why = f"실행이 이어지지 않고 {age(ua) / 60:.1f}시간째 멈춤"
+                  elif r["status"] == "completed" and first_hour(age(ua) - 390):   # 예약 실행이 6시간마다 있으므로 6.5시간 넘게 새 실행이 없으면
+                      why = f"{age(ua) / 60:.1f}시간째 새 실행이 없음"
                   elif r["status"] != "completed" and first_hour(age(ca) - 390):
                       why = f"한 실행이 {age(ca) / 60:.1f}시간째 끝나지 않음"
                   print(f, r["status"], r["conclusion"], f"{age(ca):.0f}분 전 시작")
