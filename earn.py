@@ -1969,6 +1969,83 @@ def weekly_post(st):
     tg("sendMessage", {"chat_id": CHANNEL, "text": "\n".join(L), "parse_mode": "HTML", "disable_web_page_preview": True})
     log("weekly posted", len(wkp))
 
+TOP5_PROMPT = """너는 일본 중소형주를 보는 한국 자산운용사 펀드매니저의 리서치 보조다. 아래는 이번 주 실적 스크리닝을 통과한 일본 상장사 후보들(카드 수치 + 결산단신 본문 일부)이다.
+이 중 실제로 투자 검토를 해볼 만한 종목 5개를 골라 순위를 매겨라.
+판단 기준(중요한 순): 1) 실적 개선의 질 — 본업·물량·가격 등 반복 가능한 요인인가, 일회성(관세 환급·자산 매각익·보상금·회계 변경)·환율·낮은 전년 기저·이벤트 효과가 아닌가
+2) 지속성 — 수주·가이던스 상향·두 분기 연속 개선 등 다음 분기도 이어질 근거 3) 밸류에이션(PER·PBR, 일회성으로 부풀려진 PER은 할인) 4) 분석할 투자 아이디어가 분명한가 5) 시장이 이미 많이 다루는 초대형주보다 정보 비대칭이 있는 중소형주에 가점.
+규칙: 자료에 있는 내용만 근거로. 모르면 쓰지 않는다. 일본어를 쓰지 말고 전부 한국어(회사명은 한글 표기). 각 항목 90자 이내, 숫자는 자료 그대로.
+출력 JSON: {{"top": [{{"code": "4자리 코드", "screened": "어떤 조건으로 걸렸나(핵심 수치)", "why": "왜 실적이 좋아졌나(요인과 숫자)", "idea": "분석해볼 투자 아이디어(가설)", "risk": "가장 강한 반론·리스크"}}]}}
+후보:
+{cands}
+"""
+
+def _clean_qual(q):
+    q = q or ""
+    if "{" in q[:300]:   # 예전 카드: 본문 앞에 서식(CSS)이 붙어 있음
+        i = q.rfind("}", 0, 9000); q = q[i + 1:] if i > 0 else q
+    q = re.sub(r"\.{4,}", " ", q).strip()
+    if "目次" in q[:200]:   # 목차를 건너뛰고 본문(경영성적 개황)부터
+        j = q.find("。")   # 목차에는 마침표가 없으므로 첫 문장 조금 앞부터
+        if j > 0: q = q[max(0, j - 80):]
+    return q
+
+def weekly_top5(st):
+    """토요일 오전: 이번 주 채널 통과 카드 중 투자 검토 후보 탑 5(AI 선별)를 채널에 게시"""
+    n = now(); wk = n.strftime("%G-%V")
+    if n.weekday() != TOP5_DOW or n.hour < TOP5_HOUR or st.get("top5_done") == wk: return
+    if st.get("top5_try", [None, 0])[0] == wk and st["top5_try"][1] >= 3: return
+    if time.time() - st.get("top5_last_try", 0) < 1800: return
+    st["top5_last_try"] = time.time()
+    week0 = (n - dt.timedelta(days=7)).strftime("%Y%m%d")
+    cards = [(cid, c) for cid, c in st.get("cards", {}).items() if not cid.startswith("q") and c.get("d", "") > week0 and c.get("msg")
+             and not c.get("deleted") and str(c.get("chat") or CHANNEL) == str(CHANNEL) and c.get("series")]
+    if len(cards) < 5: st["top5_done"] = wk; log("top5: 후보 부족", len(cards)); return
+    def feat(c):
+        s = c["series"]; m = metrics(s, len(s) - 1); q = m["q"]; py = m["py"] or {}
+        mg = (q["op"] / q["rev"] * 100) if q.get("op") is not None and q.get("rev") else None
+        pmg = (py["op"] / py["rev"] * 100) if py.get("op") is not None and py.get("rev") else None
+        cap = re.sub(r"<[^>]+>", "", c.get("caption", ""))
+        per = re.search(r"PER ([\d.]+)배", cap); pbr = re.search(r"PBR ([\d.]+)배", cap)
+        sc = min(m["op_yoy"] or 0, 150) / 50 + min(m["rev_yoy"] or 0, 60) / 20 + ((mg - pmg) / 3 if mg is not None and pmg is not None else 0)
+        sc += 1.5 if "가이던스 상향" in cap else 0
+        sc += 1 if "2개 분기 연속" in cap else 0
+        sc -= 3 if "일회성 요인" in cap else 0
+        if per and float(per.group(1)) > 35: sc -= 1.5
+        if pbr and float(pbr.group(1)) < 1: sc += 0.5
+        if (c.get("cap") or 0) > 20000: sc -= 1.5   # 널리 다뤄지는 초대형주보다 중소형주 우선
+        return sc, cap
+    ranked = sorted(((feat(c), cid, c) for cid, c in cards), key=lambda x: -x[0][0])[:15]
+    blocks = []
+    for (sc, cap), cid, c in ranked:
+        blocks.append(f"### {c['code']}\n[카드]\n{cap[:1100]}\n[결산단신 본문 일부]\n{_clean_qual(c.get('qual'))[:1500]}")
+    ai_reset()
+    with _key2(): out = gemini_json(TOP5_PROMPT.format(cands="\n\n".join(blocks)), timeout=180)
+    top = (out or {}).get("top") if isinstance(out, dict) else None
+    byc = {c["code"]: c for _, _, c in ranked}
+    top = [t for t in (top or []) if isinstance(t, dict) and str(t.get("code")) in byc][:5]
+    if len(top) < 3:
+        tr = st.get("top5_try", [wk, 0]); st["top5_try"] = [wk, (tr[1] if tr[0] == wk else 0) + 1]
+        log("top5: AI 결과 부족", ai_fail_reason()); return
+    st["top5_done"] = wk
+    L = [f"🏆 <b>이번 주 투자 검토 후보 탑 {len(top)}</b> ({(n - dt.timedelta(days=6)).strftime('%m/%d')}~{n.strftime('%m/%d')})",
+         f"이번 주 통과 {len(cards)}종목 중 실적 개선의 질·지속성·밸류에이션으로 골랐습니다.", ""]
+    for i, t in enumerate(top, 1):
+        c = byc[str(t["code"])]
+        cap = re.sub(r"<[^>]+>", "", c.get("caption", ""))
+        val = " · ".join(x.group(0) for x in [re.search(r"시총 [\d,]+억 엔", cap), re.search(r"PER [\d.]+배", cap), re.search(r"PBR [\d.]+배", cap)] if x)
+        L.append(f"<b>{i}. {esc(c.get('name_ko') or c['name'])} ({c['code']})</b>" + (f" · {esc(val)}" if val else ""))
+        for k, lab in (("screened", "걸린 이유"), ("why", "좋아진 이유"), ("idea", "아이디어"), ("risk", "반론")):
+            v = str(t.get(k) or "").strip()
+            if v: L.append(f"{'⚠️' if k == 'risk' else '▶️'} <b>{lab}</b> {esc(v)}")
+        L.append("")
+    L.append("<i>결산단신 본문과 카드 수치를 바탕으로 AI가 고른 후보입니다. 투자 자문이 아니며, 수치는 각 카드와 원문으로 확인하세요.</i>")
+    txt = "\n".join(L)
+    if len(txt) > 4000: txt = txt[:3990] + "…"
+    r = tg("sendMessage", {"chat_id": CHANNEL, "text": txt, "parse_mode": "HTML", "disable_web_page_preview": True})
+    log("top5 posted", [t["code"] for t in top], "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:80]}")
+
+TOP5_DOW, TOP5_HOUR = 5, 10   # 토요일 10시(일본·한국 시각)
+
 ERRS = {"n": 0}
 def alert_owner(st, text, key, every=6 * 3600):
     """주인에게 장애 알림(같은 종류는 every초에 한 번)"""
@@ -2102,6 +2179,9 @@ def main():
                 fanout_personal(st)
                 perf_update(st)
                 # weekly_post(st)   # 주간 정리 글은 보내지 않음(사용자 요청, 2026-10-31)
+                if not DRY:
+                    try: weekly_top5(st)   # 대신 토요일 오전 투자 검토 후보 탑 5
+                    except Exception: traceback.print_exc()
                 cleanup(st); save(st)
         except Exception as e:
             traceback.print_exc()
