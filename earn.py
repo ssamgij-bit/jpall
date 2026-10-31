@@ -32,7 +32,7 @@ RULES = {
     "R2_op_yoy": 10.0,        # R2 이익 성장: 분기 영업이익 YoY ≥ 10% 그리고 흑자
     "R3_accel_pp": 5.0,       # R3 성장 가속: 매출 또는 영업이익 YoY가 직전 분기보다 +5%p 이상(둘 다 플러스)
     "R4_turn_yoy": 20.0,      # R4 턴어라운드: 전년 동기 영업적자→흑자, 또는 2개 분기 연속 감익 뒤 영업이익 YoY ≥ 20%
-    "R5_rev_only_yoy": 15.0,  # R5 매출 고성장: 이익과 상관없이 분기 매출 YoY ≥ 15%
+    "R5_rev_only_yoy": 20.0,  # R5 매출 고성장: 분기 매출 YoY ≥ 20% 그리고 영업이익이 전년 동기보다 개선(적자여도 적자 폭이 줄면 인정)
     "X5_min_cap_oku": 300.0,  # X5 시가총액 300억 엔 미만 제외
 }
 # X4 제외 업종(도쿄증권거래소 33업종)
@@ -264,7 +264,9 @@ def judge(series, i):
     r1 = rg is not None and rg >= RULES["R1_rev_yoy"]
     r2 = og is not None and og >= RULES["R2_op_yoy"] and (op or 0) > 0
     if r1 and r2: hit += ["매출 성장", "이익 성장"]
-    if rg is not None and rg >= RULES["R5_rev_only_yoy"] and not (r1 and r2): hit.append("매출 고성장")
+    op_py = (a["py"] or {}).get("op")
+    if rg is not None and rg >= RULES["R5_rev_only_yoy"] and op is not None and op_py is not None and op > op_py and not (r1 and r2):
+        hit.append("매출 고성장")
     if rg is not None and og is not None and rg > 0 and og > 0 and (
             (rg1 is not None and rg - rg1 >= RULES["R3_accel_pp"]) or (og1 is not None and og - og1 >= RULES["R3_accel_pp"])):
         hit.append("성장 가속")
@@ -1499,7 +1501,7 @@ HELP_TXT = ("일본 실적 스크리닝 봇 사용법\n"
             "스크리닝 기준을 통과한 종목은 지금처럼 채널에 올라갑니다.")
 
 
-GUIDE_VER = 5  # 공지 문구를 바꾸면 올림 → 고정 공지를 새 내용으로 수정
+GUIDE_VER = 6  # 공지 문구를 바꾸면 올림 → 고정 공지를 새 내용으로 수정
 def guide_text(me):
     R = RULES
     sec = ", ".join(sorted(dict.fromkeys(SECTOR_KO.get(x, x) for x in EXCL_SECTORS)))
@@ -1508,14 +1510,15 @@ def guide_text(me):
             "<b>① 어떤 종목이 올라오나요?</b>\n"
             "분기(3개월) 실적을 전년 같은 분기와 비교해, 아래 4개 중 하나라도 맞으면 올라옵니다.\n"
             f"✅ 매출·이익 성장: 매출 +{R['R1_rev_yoy']:.0f}% 이상, 영업이익 +{R['R2_op_yoy']:.0f}% 이상(흑자)\n"
-            f"✅ 매출 고성장: 이익과 상관없이 매출 +{R['R5_rev_only_yoy']:.0f}% 이상\n"
+            f"✅ 매출 고성장: 매출 +{R['R5_rev_only_yoy']:.0f}% 이상이고 영업이익이 전년보다 개선(적자 폭 축소도 인정)\n"
             f"✅ 성장 가속: 매출·영업이익 모두 플러스이고, 둘 중 하나의 증가율이 직전 분기보다 {R['R3_accel_pp']:.0f}%p 이상 높아짐\n"
             f"✅ 턴어라운드: 영업적자에서 흑자 전환, 또는 2개 분기 연속 감익 뒤 영업이익 +{R['R4_turn_yoy']:.0f}% 이상\n\n"
             "다만 아래 경우는 제외합니다.\n"
             "❌ 매출·영업이익 증가율이 둘 다 직전 분기보다 낮아짐\n"
             "❌ 매출이 2개 분기 연속 전년보다 감소\n"
             f"❌ 시가총액 {R['X5_min_cap_oku']:,.0f}억 엔 미만\n"
-            f"❌ 업종: {sec}\n\n"
+            f"❌ 업종: {sec}\n"
+            "❌ 관세 환급·회계 변경 등 일회성 요인을 빼면 조건에 못 미치거나, 이익 증가분의 절반 이상이 일회성\n\n"
             "<b>② 카드 버튼</b>\n"
             "📄 리포트: 사업부·지역별 상세 분석, 시장 반응(note·야후 게시판·증권사 목표주가)\n"
             "🗣 IR·Q&amp;A: 실적 설명회 질의응답 요약\n"
@@ -2039,6 +2042,18 @@ def main():
                 log("제외 업종 카드 삭제", c["code"], "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:80]}")
         st["perf_log"] = [p for p in st.get("perf_log", []) if (p.get("code"), p.get("d")) not in bad]
         st["fix_excl_1031"] = True; save(st)
+    if not st.get("fix_rule_1031") and not DRY:  # 한 번: 바뀐 규칙(매출 고성장 +20%·영업이익 개선, 일회성 제외, 같은 분기 중복)에 안 맞는 채널 카드 6건 삭제 + 성과 집계 제외
+        bad = {"261009548847", "261030560625", "261030560502",   # 소지츠·메이와산업·Genki: 매출 고성장인데 영업이익 감소·미확인
+               "261020553608", "261028557610",                   # JVC켄우드(관세 환급)·르네사스(사업 양도익): 일회성
+               "261028558188"}                                   # 캐논 마케팅 재팬: 같은 분기 두 번째 카드
+        for cid in bad:
+            c = st.get("cards", {}).get(cid)
+            if c and c.get("msg") and not c.get("deleted") and str(c.get("chat") or CHANNEL) == str(CHANNEL):
+                r = tg("deleteMessage", {"chat_id": CHANNEL, "message_id": c["msg"]})
+                c["deleted"] = True; c["rx"] = c.get("rx") or "deleted"
+                log("규칙 변경 카드 삭제", c["code"], "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:80]}")
+        st["perf_log"] = [p for p in st.get("perf_log", []) if p.get("cid") not in bad]
+        st["fix_rule_1031"] = True; save(st)
     try: sync_jp_stock(st)
     except Exception: traceback.print_exc()
     try: gateway_setup(st)
