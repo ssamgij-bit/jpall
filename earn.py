@@ -2061,6 +2061,18 @@ def main():
                 log("규칙 변경 카드 삭제", c["code"], "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:80]}")
         st["perf_log"] = [p for p in st.get("perf_log", []) if p.get("cid") not in bad]
         st["fix_rule_1031"] = True; save(st)
+    if st.get("fix_repost_2768") and not st.get("fix_sj_chart") and not DRY:  # 한 번: 먼저 올라간 소지츠 카드 차트를 새 차트(매출 먼저·순이익)로 교체
+        st["fix_sj_chart"] = True; save(st)
+        try:
+            cid, c = next(((k, v) for k, v in st.get("cards", {}).items() if k.startswith("q2768") and v.get("msg")), (None, None))
+            if c:
+                a, _row = analyze_code("2768"); buf = io.BytesIO()
+                card_chart(f"{c.get('name_ko') or c['name']}({c['code']})", a["series"], c.get("fem") or fy_end_month_of(a["r"]), buf)
+                media = {"type": "photo", "media": "attach://photo", "caption": shrink(c["caption"]) if len(c["caption"]) > 1024 else c["caption"], "parse_mode": "HTML"}
+                r = tg("editMessageMedia", {"chat_id": c.get("chat") or CHANNEL, "message_id": c["msg"], "media": json.dumps(media, ensure_ascii=False),
+                                            "reply_markup": keyboard(cid)}, files={"photo": ("c.png", buf.getvalue(), "image/png")})
+                log("소지츠 차트 교체", "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:120]}")
+        except Exception: traceback.print_exc()
     if not st.get("fix_repost_2768") and not DRY:  # 한 번(사용자 요청): 기준 미통과(증가율 둔화)지만 소지츠 카드를 채널에 예외로 올림 — 요청 분석 카드라 성과 집계에서 빠짐
         st["fix_repost_2768"] = True; save(st)
         try:
