@@ -94,7 +94,16 @@ def company_site(code):
     return None
 
 VIA_GW, NO_GW = set(), set()   # 관문으로 열리는 호스트 / 관문으로도 안 열리는 호스트
+_GET_CACHE = {}
 def _get(url, timeout=25):
+    """같은 실행 안에서 같은 웹페이지(PDF 아님)는 한 번만 받음(IR 페이지 탐색이 여러 번 겹쳐 느려지는 것 방지)"""
+    hit = _GET_CACHE.get(url)
+    if hit and time.time() - hit[0] < 1800: return hit[1]
+    b = _get0(url, timeout)
+    if b"%PDF" not in b[:1024] and len(b) < 3_000_000: _GET_CACHE[url] = (time.time(), b)
+    return b
+
+def _get0(url, timeout=25):
     """회사 페이지 열기. GitHub 실행 환경(해외 데이터센터)의 접속을 막는 사이트(403·응답 없음)는
     즉시 응답 관문(Cloudflare Worker)의 /fetch 로 대신 열고, 그 호스트는 이번 실행 동안 계속 관문으로"""
     h = urllib.parse.urlparse(url).netloc.lower()
@@ -195,8 +204,17 @@ def xj_docs(cid, since_day, pat):
 IR_PAGE = re.compile(r"/ir|investor|kabunushi|stock|library|news|presentation|event|setsumei|kessan", re.I)
 IR_TEXT = re.compile(r"IR|投資家|株主|ライブラリ|資料|ニュース|news|library|説明会|決算|プレゼン|イベント", re.I)
 
+_RENDER_CACHE = {}
 def render_pages(urls, limit=6):
     """자바스크립트로 목록을 그리는 IR 페이지를 실제 브라우저(헤드리스 크롬)로 열어 완성된 HTML → [(html, url)]"""
+    key = tuple(urls[:limit])
+    hit = _RENDER_CACHE.get(key)
+    if hit and time.time() - hit[0] < 1800: return hit[1]
+    out = _render0(urls, limit)
+    _RENDER_CACHE[key] = (time.time(), out)
+    return out
+
+def _render0(urls, limit):
     try: from playwright.sync_api import sync_playwright
     except Exception: return []
     out = []
@@ -358,29 +376,44 @@ def logmi_docs(code, since_day, limit=1):
         out.append(("로그미 파이낸스 설명회 기록" + (" (질의응답 포함)" if it["qa"] else ""), it["url"], it["d"]))
     return sorted(out, key=lambda x: ("질의응답" in x[0], x[2] or ""), reverse=True)[:limit]
 
-def fetch_doc(url, depth=0, pat=None):
-    """→ ('pdf', bytes) 또는 ('text', 본문 문자열). 안내 글만 있는 페이지면 그 안의 PDF를 따라감"""
+_PDFS = {}
+def page_pdfs(url, raw=None):
+    """페이지 속 PDF 링크 [(주소, 제목)]. 목록을 자바스크립트로 그리는 IR 페이지(정적 HTML에 PDF가 거의 없음)는 헤드리스 브라우저로 그려서 다시 찾음"""
+    if url in _PDFS: return _PDFS[url]
+    if raw is None: raw = _get(url, timeout=60).decode("utf-8", "ignore")
+    pdfs = [(u, t) for u, t, d in _links(url, E.nfkc(raw)) if re.search(r"\.pdf($|\?)", u, re.I)]
+    if len([p for p in pdfs if not re.search(r"factsheet|ファクトシート|個人投資家", p[0] + p[1], re.I)]) < 2:
+        r = render_pages([url], limit=1)
+        if r:
+            p2 = [(u, t) for u, t, d in _links(r[0][1], r[0][0]) if re.search(r"\.pdf($|\?)", u, re.I)]
+            if len(p2) > len(pdfs): pdfs = p2; E.log("rendered pdf links", url, len(p2))
+    _PDFS[url] = pdfs
+    return pdfs
+
+def fetch_doc(url, depth=0, pat=None, period=None):
+    """→ ('pdf', bytes) 또는 ('text', 본문 문자열). 목록·안내 페이지면 그 안에서 제목이 맞는(그리고 이번 결산 기간인) PDF를 따라감"""
     b = _get(url, timeout=60)
     if b"%PDF" in b[:1024]: return "pdf", b   # 주소가 .pdf여도 실제로는 안내·오류 웹페이지일 수 있어 파일 머리로 판별
     raw = b.decode("utf-8", "ignore")
     if depth == 0:
-        pdfs = [(u, t) for u, t, d in _links(url, E.nfkc(raw)) if re.search(r"\.pdf($|\?)", u, re.I)]
         pat = pat or QA_LINK
-        pick = [p for p in pdfs if pat.search(p[1]) or pat.search(urllib.parse.unquote(p[0]))]
-        if not pick: pdfs = []  # 목록 페이지의 엉뚱한 PDF(중기계획 등)를 따라가지 않음
-        pick = pick or pdfs
-        body = re.sub(r"<[^>]+>", " ", re.sub(r"<(script|style|nav|footer|header)\b.*?</\1>", " ", raw, flags=re.S | re.I))
-        if pick and len(re.sub(r"\s+", " ", body)) < 6000:
-            try: return fetch_doc(pick[0][0], depth=1, pat=pat)
+        pick = [p for p in page_pdfs(url, raw) if pat.search(p[1]) or pat.search(urllib.parse.unquote(p[0]))]
+        if period and pick:   # 여러 분기 자료가 있으면 이번 결산 기간 것을 먼저, 다른 연도 것은 버림
+            sc = lambda p: period_score(p[1] + " " + urllib.parse.unquote(p[0]), period)
+            pick = sorted([p for p in pick if sc(p) >= 0], key=lambda p: -sc(p))
+        for u, t in pick[:2]:   # 목록 페이지의 엉뚱한 PDF(중기계획 등)는 따라가지 않음 — 제목이 맞는 것만
+            try:
+                kind, body = fetch_doc(u, depth=1, pat=pat)
+                if kind == "pdf": return kind, body
             except Exception as e: E.log("pdf follow error", e)
     t = raw
     t = re.sub(r"<(script|style|nav|footer|header)\b.*?</\1>", " ", t, flags=re.S | re.I)
     t = E.nfkc(re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", t)))).strip()
     return "text", t[:30000]
 
-def get_pdf(url, pat=None):
+def get_pdf(url, pat=None, period=None):
     """주소 → PDF 바이트. 웹페이지(예: IR 행사 안내 페이지)면 그 안의 결산 설명 자료 PDF를 따라감. PDF를 못 얻으면 None"""
-    kind, body = fetch_doc(url, pat=pat or MAT_LINK)
+    kind, body = fetch_doc(url, pat=pat or MAT_LINK, period=period)
     return body if kind == "pdf" else None
 
 def other_qa(card):
@@ -391,6 +424,13 @@ def other_qa(card):
     for fn in (ir_site_docs, logmi_docs):
         try: found += fn(card["code"], since, period=per) if fn is ir_site_docs else fn(card["code"], since)
         except Exception as e: E.log("qa source error", fn.__name__, e)
+    try:   # 결산 자료 목록 페이지(자바스크립트로 그리는 곳 포함) 안의 질의응답 PDF(예: 컨퍼런스콜 질의응답 개요)
+        for t, u, d in ir_site_docs(card["code"], since, limit=2, pat=MAT_LINK, period=per):
+            if re.search(r"\.pdf($|\?)", u, re.I): continue
+            for pu, pt in page_pdfs(u):
+                if QA_LINK.search(pt) and period_score(pt + " " + urllib.parse.unquote(pu), per) >= 1 and pu not in [x[1] for x in found]:
+                    found.insert(0, (pt, pu, None))
+    except Exception as e: E.log("qa listing error", e)
     out, sigs = [], set()
     for name, url, d in found:
         if url in card.get("qa_urls", []): continue
@@ -420,9 +460,11 @@ def kabutan_docs(card):
     for day, did, title in re.findall(r'/disclosures/pdf/(\d{8})/(\d+)/"[^>]*>([^<]+)<', s):
         try: gap = abs((dt.datetime.strptime(day, "%Y%m%d") - d0).days)
         except ValueError: continue
-        if gap > 3: continue
         url = f"https://tdnet-pdf.kabutan.jp/{day}/{did}.pdf"
         t = nfkc(html.unescape(title))
+        if day > card["d"] and re.search(r"業績予想.{0,6}修正|予想.{0,4}修正|業績修正", t) and not re.search(r"[A-Za-z]{5}", t):
+            out.setdefault("revs", []).append((day, url, t)); continue
+        if gap > 3: continue
         if "pdf" not in out and "決算短信" in t and "訂正" not in t: out["pdf"] = url
         elif "mat" not in out and re.search(r"決算説明|決算補足|説明会資料|プレゼンテーション|決算概要|Presentation", t) and "訂正" not in t: out["mat"] = url
     if out: E.log("kabutan disc found", card["code"], list(out))
@@ -432,13 +474,14 @@ def build(card, qa_rows=None):
     """→ (텔레그램 글 목록, Q&A 포함 여부)"""
     name = card.get("name_ko") or card["name"]
     docs, names = [], []
-    if not card.get("pdf") or not card.get("mat"):   # 오래된 결산(TDnet에서 내려감)·요청 카드: 가부탄의 TDnet 사본으로 보충
-        for k, v in kabutan_docs(card).items():
-            if not card.get(k): card[k] = v
+    kd = kabutan_docs(card)   # 오래된 결산(TDnet에서 내려감)·요청 카드: 가부탄의 TDnet 사본으로 보충 + 발표 이후 업적 예상 수정
+    for k in ("pdf", "mat"):
+        if kd.get(k) and not card.get(k): card[k] = kd[k]
+    per = card_period(card)
     for url, lab in ((card.get("mat"), "결산 설명 자료"), (card.get("pdf"), "결산단신")):
         if url:
             try:
-                b = get_pdf(url)   # 설명 자료 주소가 웹페이지인 경우(회사 IR 홈페이지)가 있어 PDF로 따라감
+                b = get_pdf(url, period=per)   # 설명 자료 주소가 웹페이지인 경우(회사 IR 홈페이지)가 있어 PDF로 따라감
                 if b: docs.append(b); names.append(lab)
                 else: E.log("ir pdf skip(not pdf)", url)
             except Exception as e: E.log("ir pdf error", e)
@@ -446,7 +489,7 @@ def build(card, qa_rows=None):
         try:
             for t, u, d in ir_site_docs(card["code"], card["d"], limit=4, pat=MAT_LINK, period=card_period(card)):
                 if QA_LINK.search(t): continue
-                kind, body = fetch_doc(u, pat=MAT_LINK)
+                kind, body = fetch_doc(u, pat=MAT_LINK, period=per)
                 if kind == "pdf" and len(body) < 12_000_000: docs.insert(0, body); names.insert(0, "결산 설명 자료(회사 IR 홈페이지)"); break
         except Exception as e:
             E.log("ir site material error", e)
@@ -466,6 +509,13 @@ def build(card, qa_rows=None):
         if total + len(d) <= 12_000_000: keep.append(d); total += len(d)
     docs = keep
     prompt = IR_PROMPT.format(name=name, code=card["code"])
+    for day, u, t in (kd.get("revs") or [])[:1]:   # 발표 이후 나온 업적 예상 수정 → 최신 가이던스로 반영
+        try:
+            b = http(u, timeout=60)
+            if b"%PDF" in b[:1024]:
+                docs.append(b); names.append(f"이후 업적 예상 수정({day[:4]}-{day[4:6]}-{day[6:]})")
+                prompt += f"\n참고: 마지막 첨부는 이번 결산 발표 뒤 {day[:4]}-{day[4:6]}-{day[6:]}에 나온 업적 예상 수정 공시다. guidance에는 이 최신 수정치와 날짜를 반드시 반영하라."
+        except Exception as e: E.log("revision pdf error", e)
     if texts: prompt += "\n\n아래는 회사 IR 홈페이지·설명회 기록 웹페이지 본문(질의응답이 있으면 qa에 반영):\n" + "\n\n".join(texts)
     if docs: out = gemini_pdfs(prompt, docs)
     else:   # 공식 PDF를 하나도 못 구함 → 카드 수치·결산단신 본문(있으면)으로 Q&A 없는 요약

@@ -362,12 +362,14 @@ def build(card):
     s = allq[-8:]
     r = card["r"]; fc = r.get("fc") or {}
 
-    if not card.get("pdf") or not card.get("mat"):   # 오래된 결산(TDnet에서 내려감)·요청 카드: 가부탄의 TDnet 사본으로 보충
-        try:
-            import earn_ir
-            for k, v in earn_ir.kabutan_docs(card).items():
-                if not card.get(k): card[k] = v
-        except Exception as e: E.log("report kabutan docs error", e)
+    kd = {}
+    try:   # 오래된 결산(TDnet에서 내려감)·요청 카드: 가부탄의 TDnet 사본으로 보충 + 발표 이후 업적 예상 수정
+        import earn_ir
+        kd = earn_ir.kabutan_docs(card)
+        for k in ("pdf", "mat"):
+            if kd.get(k) and not card.get(k): card[k] = kd[k]
+    except Exception as e: E.log("report kabutan docs error", e)
+    per = earn_ir.card_period(card)
     # 1) 결산단신 XBRL 첨부(손익 상세·세그먼트)
     att = {"pl": {}, "seg": []}
     if not card.get("xbrl") and card.get("pdf"):  # 예전 카드: TDnet 파일 이름 규칙(1401…pdf ↔ 0812…zip)으로 XBRL 주소 복원
@@ -393,14 +395,14 @@ def build(card):
     mat_pdf, mat_url, mat_src = None, card.get("mat"), card.get("mat_src") or "TDnet"
     if not mat_url:
         try:
-            for t, u, d in earn_ir.ir_site_docs(code, card["d"], limit=4, pat=earn_ir.MAT_LINK):
+            for t, u, d in earn_ir.ir_site_docs(code, card["d"], limit=4, pat=earn_ir.MAT_LINK, period=per):
                 if earn_ir.QA_LINK.search(t): continue
-                kind, body = earn_ir.fetch_doc(u, pat=earn_ir.MAT_LINK)
+                kind, body = earn_ir.fetch_doc(u, pat=earn_ir.MAT_LINK, period=per)
                 if kind == "pdf" and len(body) < 12_000_000: mat_pdf, mat_url, mat_src = body, u, "회사 IR 홈페이지"; break
         except Exception as e:
             E.log("ir site material error", e)
     elif mat_url:
-        try: mat_pdf = earn_ir.get_pdf(mat_url)   # 회사 IR 홈페이지 주소면 페이지 속 PDF로 따라감
+        try: mat_pdf = earn_ir.get_pdf(mat_url, period=per)   # 회사 IR 홈페이지 주소면 페이지 속 PDF로 따라감
         except Exception as e: E.log("material download error", e)
     tan_pdf = None
     if card.get("pdf"):
@@ -418,8 +420,16 @@ def build(card):
                 rec_links.append((nm, url))
     except Exception as e:
         E.log("record error", e)
+    rev_pdf, rev_note = None, ""
+    for day, u, t in (kd.get("revs") or [])[:1]:   # 발표 이후 나온 업적 예상 수정 → 최신 가이던스로 반영
+        try:
+            b = http(u, timeout=60)
+            if b"%PDF" in b[:1024]:
+                rev_pdf = b; rec_links.append((f"이후 업적 예상 수정({day[:4]}-{day[4:6]}-{day[6:]})", u))
+                rev_note = f"\n참고: 첨부 중 하나는 이번 결산 발표 뒤 {day[:4]}-{day[4:6]}-{day[6:]}에 나온 업적 예상 수정 공시다. 가이던스(guidance) 서술에는 이 최신 수정치와 날짜를 반드시 반영하라."
+        except Exception as e: E.log("revision pdf error", e)
     pdfs, total = [], 0
-    for p_ in [mat_pdf, rec_pdfs[0] if rec_pdfs else None, tan_pdf if not mat_pdf else None, tan_pdf if mat_pdf else None]:
+    for p_ in [mat_pdf, rec_pdfs[0] if rec_pdfs else None, tan_pdf if not mat_pdf else None, tan_pdf if mat_pdf else None, rev_pdf]:
         if p_ and p_ not in pdfs and total + len(p_) <= 12_000_000:  # Gemini 요청 한도(약 20MB, base64 포함) 안으로
             pdfs.append(p_); total += len(p_)
     # 4) Gemini 분석(설명 자료 + 결산단신 + 기록)
@@ -431,6 +441,7 @@ def build(card):
     prompt = IR_PROMPT.format(name=name, code=code, sector=E.SECTOR_KO.get(card["sector"], card["sector"]), profile=card.get("profile", "")[:500],
                               nums=nums, segs=seg_txt or "없음", words=json.dumps(words, ensure_ascii=False), qual=card.get("qual", "")[:5000],
                               extra=("설명회 기록(웹):\n" + "\n\n".join(rec_texts)) if rec_texts else "")
+    prompt += rev_note
     ai = (gemini_pdf(prompt, pdfs, max_tokens=16000) if pdfs else gemini_json(prompt, timeout=180)) or {}
     card["_ai_ok"] = bool(ai)
     if isinstance(ai, list): ai = ai[0] if ai and isinstance(ai[0], dict) else {}
