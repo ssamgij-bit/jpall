@@ -2101,7 +2101,7 @@ def main():
                 update_reactions(st)
                 fanout_personal(st)
                 perf_update(st)
-                weekly_post(st)
+                # weekly_post(st)   # 주간 정리 글은 보내지 않음(사용자 요청, 2026-10-31)
                 cleanup(st); save(st)
         except Exception as e:
             traceback.print_exc()
