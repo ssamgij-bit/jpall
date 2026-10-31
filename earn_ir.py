@@ -20,12 +20,16 @@ IR_PROMPT = """첨부 PDF는 일본 상장사 {name}({code})의 이번 결산 �
 - 일본어를 그대로 쓰지 말고 전부 한국어로 번역(인명·제품명은 한글 발음 또는 통용 영문).
 - 금액은 자료 단위 그대로 쓰되 억 엔으로 바꿀 수 있으면 억 엔(1억 엔=100백만 엔). 전년 대비는 YoY.
 - quality: 실적 퀄리티 1~10점(매출·이익 성장의 질, 일회성 여부, 가이던스 변화를 종합)과 한 줄 근거.
-- qa: 질의응답 자료가 있을 때만 3~8개. 질문자 소속이 있으면 asker에, 답변자 직함이 있으면 answerer에.
+- qa: 질의응답 자료가 있을 때만, 주식 운용역이 투자 판단에 쓸 질문만 골라 중요한 순서로 3~8개. 전부 옮기지 말 것.
+  우선순위: ① 가이던스·실적 전망의 전제(수요·환율·가격 가정)와 상향·하향 여지 ② 수주·주문·수요 흐름과 지속성 ③ 가격 인상·원가·마진 방향 ④ 일회성 요인과 구조적 변화 구분 ⑤ 신사업·설비투자·M&A ⑥ 배당·자사주 등 자본 정책 ⑦ 경영진이 인정한 리스크.
+  빼는 것: 인사말, 단순 사실 확인, 이미 결산 숫자로 나온 내용의 반복, 회사 홍보성 답변.
+  답변의 숫자(금액·비율·시점)는 그대로 살리고, 경영진이 말을 아끼거나 피한 부분도 그대로 적는다. why에는 그 답이 왜 투자 판단에 중요한지 한 문장.
+  질문자 소속이 있으면 asker에, 답변자 직함이 있으면 answerer에.
 출력:
 {{"quality": 8, "quality_why": "...", "overview": "회사가 무엇으로 돈을 버는지 1~2문장",
  "key": ["핵심 실적 3~5줄: 매출·영업이익·순이익과 YoY, 부문 숫자"], "message": "경영진 핵심 메시지 3~4문장",
  "surprise": [{{"title": "짧은 제목", "body": "1~2문장"}}], "kpi": ["특이사항·핵심 KPI(수주잔고, 점포 수, 단가, 환율 영향 등) 3~6줄"],
- "guidance": "가이던스와 수정 이유, 배당·주주환원 2~4문장", "qa": [{{"asker": "", "answerer": "", "q": "질문", "a": "답변 2~3문장"}}],
+ "guidance": "가이던스와 수정 이유, 배당·주주환원 2~4문장", "qa": [{{"asker": "", "answerer": "", "q": "질문", "a": "답변 2~3문장", "why": "투자 판단에 중요한 이유 한 문장"}}],
  "qa_source": "질의응답 출처 자료 이름(없으면 빈 문자열)"}}
 """
 
@@ -134,7 +138,10 @@ MAT_LINK = re.compile(r"決算説明|説明会資料|説明資料|プレゼン�
 def stale_years(txt, since_day):
     """글·주소에 나오는 연도(2024, FY2024, 2024年3月期 등)가 모두 결산 연도보다 2년 이상 이전이면 True"""
     ys = [int(y) for y in re.findall(r"(?<!\d)(20[0-4]\d)(?!\d)", txt)]
-    return bool(ys) and max(ys) < int(since_day[:4]) - 1
+    if ys and max(ys) < int(since_day[:4]) - 1: return True
+    # 제목의 'YYYY年M月'(설명회 개최월)이 결산일보다 2개월 넘게 이전이면 지난 분기 자료(예: 10월 결산인데 '決算関連Q&A(2026年7月)')
+    ms = [int(y) * 12 + int(m) for y, m in re.findall(r"(20\d\d)\s*年\s*(\d{1,2})\s*月(?!期)", txt)]
+    return bool(ms) and max(ms) < int(since_day[:4]) * 12 + int(since_day[4:6]) - 2
 
 def doc_dates(kind, body):
     """자료 첫 부분에 적힌 날짜들(YYYYMMDD) — 옛 자료 걸러내기용"""
@@ -298,7 +305,7 @@ def logmi_date(aid):
     if aid in ids: return ids[aid]
     return "old" if aid < min(ids) else None
 
-NOISE = re.compile(r"採用|リクルート|新卒|よくある|FAQ|製品|商品|サービスについて|お客様")
+NOISE = re.compile(r"採用|リクルート|新卒|よくある|FAQ|製品|商品|サービスについて|お客様|提供サービス|サービスのご案内|有料")
 def period_score(txt, period):
     """제목·주소에 적힌 회계연도·분기가 이번 결산과 맞는지: 2=연도·분기 일치, 1=연도 일치, 0=정보 없음, -1=다른 연도"""
     fy_y, fem, n = period
@@ -469,7 +476,8 @@ def render(card, o, has_qa, names, links=None):
         L.append(f"📞 <b>Q&amp;A 요약</b> ({_e(o.get('qa_source') or '질의응답 자료')})")
         for i, x in enumerate(qa, 1):
             who = "·".join(_e(v) for v in (x.get("asker"), x.get("answerer")) if v)
-            L += [f"<b>Q{i}</b>" + (f": {who}" if who else ""), f"- 질문: {_e(x['q'])}", f"- 답변: {_e(x['a'])}", ""]
+            L += [f"<b>Q{i}</b>" + (f": {who}" if who else ""), f"- 질문: {_e(x['q'])}", f"- 답변: {_e(x['a'])}"] + \
+                 ([f"- 👉 {_e(x['why'])}"] if x.get("why") else []) + [""]
     else:
         L += ["📞 <b>Q&amp;A</b> 아직 질의응답 자료를 찾지 못했습니다(TDnet·회사 IR 홈페이지·로그미 확인). 14일 동안 다시 확인해 올라오면 따로 보내드립니다.", ""]
     L.append(f"<i>자료: {', '.join(names)}. 투자 자문이 아닌 정보 정리입니다.</i>")
