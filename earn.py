@@ -2060,6 +2060,15 @@ def main():
                 log("규칙 변경 카드 삭제", c["code"], "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:80]}")
         st["perf_log"] = [p for p in st.get("perf_log", []) if p.get("cid") not in bad]
         st["fix_rule_1031"] = True; save(st)
+    if not st.get("fix_repost_2768") and not DRY:  # 한 번(사용자 요청): 기준 미통과(증가율 둔화)지만 소지츠 카드를 채널에 예외로 올림 — 요청 분석 카드라 성과 집계에서 빠짐
+        st["fix_repost_2768"] = True; save(st)
+        try:
+            a, row = analyze_code("2768")
+            if a and row:
+                make_card(st, f"q2768{int(time.time()) % 100000000}", a, row)
+                log("소지츠 예외 게시", "통과" if a["pass"] else a["why"])
+        except Exception: traceback.print_exc()
+        save(st)
     try: sync_jp_stock(st)
     except Exception: traceback.print_exc()
     try: gateway_setup(st)
