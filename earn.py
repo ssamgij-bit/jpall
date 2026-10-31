@@ -292,7 +292,8 @@ def read_tanshin(row):
         zf = zipfile.ZipFile(io.BytesIO(blob))
         n = next((n for n in zf.namelist() if n.endswith("qualitative.htm")), None)
         if n:
-            qual = nfkc(text_of(zf.read(n).decode("utf-8", "ignore")))
+            h = re.sub(r"(?is)<(style|script|title)\b[^>]*>.*?</\1>", " ", zf.read(n).decode("utf-8", "ignore"))   # 글꼴·여백 서식(CSS)이 본문 앞 수천 자를 차지하던 문제
+            qual = nfkc(text_of(h))
     except Exception as e:
         log("qualitative error", e)
     return r, qual
