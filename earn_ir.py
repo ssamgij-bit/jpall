@@ -9,7 +9,7 @@
 import os, re, json, time, base64, html, datetime as dt
 
 import earn as E
-from jpall import http, GEMINI_MODELS
+from jpall import http, GEMINI_MODELS, nfkc
 
 QA_RE = re.compile(r"質疑応答|質疑|Q&A|Q＆A|主な質問|説明会.*(要旨|内容|スクリプト|記録)|書き起こし|書起こし|文字起こし|スクリプト|Transcript|スモールミーティング", re.I)
 
@@ -409,10 +409,32 @@ def other_qa(card):
             E.log("qa fetch error", url, e)
     return out
 
+def kabutan_docs(card):
+    """TDnet 보관 기간(약 1개월)이 지난 결산: 가부탄 공시 목록의 TDnet 사본 PDF 주소 → {"pdf": 결산단신, "mat": 설명 자료}"""
+    out = {}
+    try:
+        s = _get(f"https://kabutan.jp/stock/news?code={card['code']}&nmode=3").decode("utf-8", "ignore")
+    except Exception as e:
+        E.log("kabutan disc error", e); return out
+    d0 = dt.datetime.strptime(card["d"], "%Y%m%d")
+    for day, did, title in re.findall(r'/disclosures/pdf/(\d{8})/(\d+)/"[^>]*>([^<]+)<', s):
+        try: gap = abs((dt.datetime.strptime(day, "%Y%m%d") - d0).days)
+        except ValueError: continue
+        if gap > 3: continue
+        url = f"https://tdnet-pdf.kabutan.jp/{day}/{did}.pdf"
+        t = nfkc(html.unescape(title))
+        if "pdf" not in out and "決算短信" in t and "訂正" not in t: out["pdf"] = url
+        elif "mat" not in out and re.search(r"決算説明|決算補足|説明会資料|プレゼンテーション|決算概要|Presentation", t) and "訂正" not in t: out["mat"] = url
+    if out: E.log("kabutan disc found", card["code"], list(out))
+    return out
+
 def build(card, qa_rows=None):
     """→ (텔레그램 글 목록, Q&A 포함 여부)"""
     name = card.get("name_ko") or card["name"]
     docs, names = [], []
+    if not card.get("pdf") or not card.get("mat"):   # 오래된 결산(TDnet에서 내려감)·요청 카드: 가부탄의 TDnet 사본으로 보충
+        for k, v in kabutan_docs(card).items():
+            if not card.get(k): card[k] = v
     for url, lab in ((card.get("mat"), "결산 설명 자료"), (card.get("pdf"), "결산단신")):
         if url:
             try:
@@ -445,7 +467,12 @@ def build(card, qa_rows=None):
     docs = keep
     prompt = IR_PROMPT.format(name=name, code=card["code"])
     if texts: prompt += "\n\n아래는 회사 IR 홈페이지·설명회 기록 웹페이지 본문(질의응답이 있으면 qa에 반영):\n" + "\n\n".join(texts)
-    out = gemini_pdfs(prompt, docs)
+    if docs: out = gemini_pdfs(prompt, docs)
+    else:   # 공식 PDF를 하나도 못 구함 → 카드 수치·결산단신 본문(있으면)으로 Q&A 없는 요약
+        E.log("ir: 공식 자료 없음 → 카드 자료로 요약", card["code"])
+        blob = re.sub(r"<[^>]+>", "", card.get("caption") or "") + "\n\n" + (card.get("qual") or "")[:8000] + ("\n\n" + "\n\n".join(texts) if texts else "")
+        out = E.gemini_json(prompt.replace("첨부 PDF는", "아래 자료는") + "\n\n자료(봇 카드 수치·결산단신 본문, 질의응답 없음):\n" + blob, timeout=150)
+        if out: names.append("봇 카드 수치(공식 PDF 없음)")
     if not out: return None, False
     return render(card, out, bool(qa_rows) or bool(links), names, links), bool(out.get("qa"))
 

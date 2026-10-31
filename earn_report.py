@@ -362,6 +362,12 @@ def build(card):
     s = allq[-8:]
     r = card["r"]; fc = r.get("fc") or {}
 
+    if not card.get("pdf") or not card.get("mat"):   # 오래된 결산(TDnet에서 내려감)·요청 카드: 가부탄의 TDnet 사본으로 보충
+        try:
+            import earn_ir
+            for k, v in earn_ir.kabutan_docs(card).items():
+                if not card.get(k): card[k] = v
+        except Exception as e: E.log("report kabutan docs error", e)
     # 1) 결산단신 XBRL 첨부(손익 상세·세그먼트)
     att = {"pl": {}, "seg": []}
     if not card.get("xbrl") and card.get("pdf"):  # 예전 카드: TDnet 파일 이름 규칙(1401…pdf ↔ 0812…zip)으로 XBRL 주소 복원
