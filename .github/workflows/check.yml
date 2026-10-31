@@ -42,6 +42,14 @@ jobs:
           if dup: sys.exit("전역 이름 중복 정의:\n" + "\n".join(dup))
           print("no duplicate globals")
           PY
+      - name: 실행 시험(게시 없이 2분 돌려 보고, 실행 중 오류가 나면 실패)
+        timeout-minutes: 8
+        run: |
+          pip install -q matplotlib koreanize-matplotlib
+          mkdir -p /tmp/dry
+          STATE_DIR=/tmp/dry DRY_RUN=1 RUN_SECONDS=120 WATCH_KEY=dummy GATEWAY_URL=off PYTHONUNBUFFERED=1 timeout 360 python earn.py 2>&1 | tee /tmp/dry.log || true
+          if grep -q "Traceback" /tmp/dry.log; then echo "::error::실행 중 오류(Traceback)가 났습니다 — 위 로그 확인"; exit 1; fi
+          echo "실행 시험 통과"
       - name: IR 페이지 브라우저 열기 시험(실패해도 배포는 막지 않음)
         continue-on-error: true
         run: |
