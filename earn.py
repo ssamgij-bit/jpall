@@ -1952,6 +1952,15 @@ def main():
                 log("제외 업종 카드 삭제", c["code"], "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:80]}")
         st["perf_log"] = [p for p in st.get("perf_log", []) if (p.get("code"), p.get("d")) not in bad]
         st["fix_excl_1030"] = True; save(st)
+    if not st.get("fix_excl_1031") and not DRY:  # 한 번: 같은 이유(가부탄 줄임 업종 표기 '証券・商品')로 올라간 증권 업종 카드 3건 삭제 + 성과 집계 제외
+        bad = {("7172", "20261030"), ("7177", "20261030"), ("8704", "20261030")}
+        for cid, c in list(st.get("cards", {}).items()):
+            if (c.get("code"), c.get("d")) in bad and c.get("msg") and not c.get("deleted") and not c.get("chat"):
+                r = tg("deleteMessage", {"chat_id": CHANNEL, "message_id": c["msg"]})
+                c["deleted"] = True; c["rx"] = c.get("rx") or "deleted"
+                log("제외 업종 카드 삭제", c["code"], "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:80]}")
+        st["perf_log"] = [p for p in st.get("perf_log", []) if (p.get("code"), p.get("d")) not in bad]
+        st["fix_excl_1031"] = True; save(st)
     try: sync_jp_stock(st)
     except Exception: traceback.print_exc()
     try: gateway_setup(st)
