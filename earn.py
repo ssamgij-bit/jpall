@@ -441,7 +441,8 @@ def card_chart(name, series, fy_end_month, path):
         labs.append(f"{n}Q\n{fy}")
     fig, axes = plt.subplots(2, 1, figsize=(7.2, 7.6), dpi=150)
     fig.patch.set_facecolor("white")
-    for ax, key, title in ((axes[0], "op", "① 분기 영업이익과 YoY"), (axes[1], "rev", "② 분기 매출과 YoY")):
+    pk, pn = ("op", "영업이익") if s[-1].get("op") is not None or s[-1].get("ni") is None else ("ni", "순이익")   # 영업이익 항목이 없는 회계 양식이면 순이익
+    for ax, key, title in ((axes[0], "rev", "① 분기 매출과 YoY"), (axes[1], pk, f"② 분기 {pn}과 YoY")):
         vals = [(q.get(key) or 0) / 100 for q in s]
         cols = [BLUE if i == len(s) - 1 else "#9dbbea" for i in range(len(s))]
         cols = [("#d9534f" if v < 0 else c) for v, c in zip(vals, cols)]
