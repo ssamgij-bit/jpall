@@ -1507,7 +1507,7 @@ HELP_TXT = ("일본 실적 스크리닝 봇 사용법\n"
             "스크리닝 기준을 통과한 종목은 지금처럼 채널에 올라갑니다.")
 
 
-GUIDE_VER = 7  # 공지 문구를 바꾸면 올림 → 고정 공지를 새 내용으로 수정
+GUIDE_VER = 8  # 공지 문구를 바꾸면 올림 → 고정 공지를 새 내용으로 수정
 def guide_text(me):
     R = RULES
     sec = ", ".join(sorted(dict.fromkeys(SECTOR_KO.get(x, x) for x in EXCL_SECTORS)))
@@ -1519,6 +1519,7 @@ def guide_text(me):
             f"✅ 매출 고성장: 매출 +{R['R5_rev_only_yoy']:.0f}% 이상이고 영업이익이 전년보다 개선(적자 폭 축소도 인정)\n"
             f"✅ 성장 가속: 매출·영업이익 모두 플러스이고, 둘 중 하나의 증가율이 직전 분기보다 {R['R3_accel_pp']:.0f}%p 이상 높아짐\n"
             f"✅ 턴어라운드: 영업적자에서 흑자 전환, 또는 2개 분기 연속 감익 뒤 영업이익 +{R['R4_turn_yoy']:.0f}% 이상\n\n"
+            f"⚡ 실적 속보: 결산 발표 전 회사가 상반기·연간 예상 영업이익을 +{FLASH_MIN:.0f}% 이상 올리면 따로 알림(차트 없음)\n\n"
             "다만 아래 경우는 제외합니다.\n"
             "❌ 매출·영업이익 증가율이 둘 다 직전 분기보다 낮아짐\n"
             "❌ 매출이 2개 분기 연속 전년보다 감소\n"
@@ -1759,6 +1760,104 @@ def is_tanshin(r):
     return ("決算短信" in t and r.get("xbrl") and "訂正" not in t and "REIT" not in t.upper() and "ETF" not in t.upper()
             and not re.search(r"投資法人|ファンド", r["name"]))
 
+# ───────────────────────── 실적 속보: 결산 전 큰 폭의 업적 예상 상향 ─────────────────────────
+FLASH_MIN = 20.0   # 상반기·연간 예상 영업이익을 이 비율(%) 이상 올리면 속보 카드
+PER_KO = {"CurrentAccumulatedQ2Duration": "상반기(중간기)", "CurrentYearDuration": "연간", "CurrentAccumulatedQ1Duration": "1Q 누적",
+          "CurrentAccumulatedQ3Duration": "3Q 누적"}
+
+def is_revision(r):
+    t = r["title"]
+    return (r.get("xbrl") and re.search(r"業績予想.{0,6}修正|予想.{0,4}修正", t) and "決算短信" not in t and "訂正" not in t
+            and not t.startswith("配当予想") and not re.search(r"投資法人|ファンド", r["name"]))
+
+def revision_periods(facts, ctx):
+    """업적 예상 수정 XBRL → {기간: {'rev': (이전, 수정), 'op': (...), 'last_rev', 'last_op', 'end'}} (백만엔)"""
+    out = {}
+    for scope in ("ConsolidatedMember", "NonConsolidatedMember"):
+        for per in PER_KO:
+            prev = lambda cid, per=per, scope=scope: cid.startswith(f"{per}_{scope}_PreviousMember_") and cid.endswith("ForecastMember")
+            curr = lambda cid, per=per, scope=scope: cid.startswith(f"{per}_{scope}_CurrentMember_") and cid.endswith("ForecastMember")
+            pper = per.replace("Current", "Prior")
+            last = lambda cid, pper=pper, scope=scope: cid.startswith(f"{pper}_{scope}") and cid.endswith("ResultMember")
+            row = {}
+            for m in ("rev", "op", "ni"):
+                a, b, l = X.pick(facts, m, prev), X.pick(facts, m, curr), X.pick(facts, m, last)
+                row[m] = (a / 1e6 if a is not None else None, b / 1e6 if b is not None else None)
+                row["last_" + m] = l / 1e6 if l is not None else None
+            if row["op"][1] is not None or row["rev"][1] is not None:
+                cid = next((c for c in ctx if c.startswith(f"{per}_{scope}_CurrentMember_")), None)
+                row["end"] = ctx.get(cid, (None, None))[1] if cid else None
+                row["scope"] = "연결" if scope == "ConsolidatedMember" else "개별"
+                out[per] = row
+        if out: return out
+    return out
+
+FLASH_PROMPT = """아래는 일본 상장사 {name}({code})의 업적 예상 수정 공시 본문이다. 수정 이유를 한국어 2문장(각 80자 이내)으로 요약하라.
+숫자는 원문 그대로, 일본어를 쓰지 말고 회사·제품명은 한글로. 자료에 없는 내용은 쓰지 마라. 출력 JSON: {{"why": "..."}}
+본문:
+{body}
+"""
+
+def flash_card(st, row, rows):
+    """결산 전 업적 예상 상향(영업이익 +20% 이상) → 채널에 텍스트 속보 카드. 올리면 True"""
+    code = row["code"]
+    if any(x["code"] == code and is_tanshin(x) for x in rows): return False   # 같은 날 결산단신이 있으면 결산 카드가 다룸
+    kind, facts, ctx = X.open_zip(http(row["xbrl"], timeout=40))
+    rv = revision_periods(facts, ctx)
+    hits = []
+    for per, x in rv.items():
+        a, b = x["op"]
+        if a is not None and b is not None and b > 0 and (a <= 0 or (b / a - 1) * 100 >= FLASH_MIN): hits.append(per)
+    if not hits: return False
+    kb = kb_finance(code)
+    if kb["sector"] in EXCL_SECTORS: log("속보 제외 업종", code); return False
+    cap, profile = kb_profile(code)
+    if cap is None or cap < RULES["X5_min_cap_oku"]: log("속보 시총 미달·확인 불가", code, cap); return False
+    name = name_of(code, row["name"], None)
+    L = [f"⚡ <b>실적 속보 · 예상 상향</b> — <b>{esc(name)} ({code})</b> · {int(row['d'][4:6])}/{int(row['d'][6:])} {row.get('t') or ''}".rstrip(),
+         (f"시총 {cap:,.0f}억 엔" if cap else "시총 —") + f" · {esc(SECTOR_KO.get(kb['sector'], kb['sector']))}", ""]
+    def pct(a, b): return f"{(b / a - 1) * 100:+.0f}%" if a and a > 0 and b is not None else ("흑자전환" if a is not None and a <= 0 < (b or 0) else "—")
+    for per in [p for p in PER_KO if p in rv]:
+        x = rv[per]; yend = (rv.get("CurrentYearDuration") or {}).get("end")   # 회계연도 표기는 연간 기간 끝 기준(상반기 끝으로 하면 FY9/26처럼 틀림)
+        lab = (f"{fy_label_end(yend)} " if yend else "") + PER_KO[per]
+        L.append(f"▶️ <b>{lab} 예상</b>" + (" ✅" if per in hits else ""))
+        for m, ml in (("rev", "매출"), ("op", "영업이익"), ("ni", "순이익")):
+            a, b = x[m]
+            if b is None: continue
+            yoy = f", 전년 실적 대비 {pct(x['last_' + m], b)}" if x.get("last_" + m) else ""
+            L.append(f" {ml} {oku(a)} → <b>{oku(b)}</b> ({pct(a, b)}{yoy})")
+        # 상반기 예상 − 1Q 실적 = 2Q(3개월) 추정
+        if per == "CurrentAccumulatedQ2Duration" and x.get("end"):
+            e = x["end"][:7]; qs = {q["end"]: q for q in kb["q"]}
+            q1, py2 = qs.get(ym_add(e, -3)), qs.get(ym_add(e, -12))
+            if q1 and q1.get("op") is not None and x["op"][1] is not None:
+                q2op = x["op"][1] - q1["op"]; q2rev = x["rev"][1] - q1["rev"] if x["rev"][1] is not None and q1.get("rev") is not None else None
+                ytxt = f" (전년 2Q {oku(py2['op'])} 대비 {pct(py2['op'], q2op)})" if py2 and py2.get("op") is not None else ""
+                L.append(f" ↳ 2Q(3개월) 추정: 매출 {oku(q2rev)} · 영업이익 <b>{oku(q2op)}</b>{ytxt} <i>(상반기 예상 − 1Q 실적)</i>")
+        L.append("")
+    try:
+        import subprocess
+        txt = subprocess.run(["pdftotext", "-layout", "-", "-"], input=http(row["pdf"], timeout=40), capture_output=True, timeout=60).stdout.decode("utf-8", "ignore")
+        i = max(txt.find("修正の理由"), txt.find("修正理由"))
+        body = nfkc(txt[i:i + 2500] if i >= 0 else txt[-2500:])
+        why = (gemini_json(FLASH_PROMPT.format(name=name, code=code, body=body), timeout=60, models=__import__("jpall").MON_MODELS) or {}).get("why")
+        if why: L += [f"📝 <b>수정 이유</b> {esc(why)}", ""]
+    except Exception as e:
+        log("flash reason error", code, e)
+    L.append(f"<a href=\"{row['pdf']}\">공시 원문</a> · <i>결산 발표 전 회사 예상 수정입니다. 확정 실적은 결산단신에서 확인하세요.</i>")
+    if DRY:
+        print("-" * 60 + "\n" + re.sub(r"<[^>]+>", "", "\n".join(L))); return True
+    r = tg("sendMessage", {"chat_id": CHANNEL, "text": "\n".join(L), "parse_mode": "HTML", "disable_web_page_preview": True})
+    log("실적 속보", code, name, [PER_KO[p] for p in hits], "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:80]}")
+    return bool(r.get("ok"))
+
+def process_flash(st, day, rows):
+    seen = st.setdefault("seen", {})
+    for row in [r for r in rows if is_revision(r) and ("rv:" + r["id"]) not in seen]:
+        seen["rv:" + row["id"]] = day
+        try: flash_card(st, row, rows); time.sleep(2)
+        except Exception as e: log("flash error", row["code"], e)
+
 def post_selected(st, spec):
     """지정한 날짜·종목의 결산단신만 판별해 통과하면 카드 게시(기준 변경 등으로 놓친 카드 보충용, 이미 있는 카드는 건너뜀)"""
     done = {(c.get("d"), c.get("code")) for c in st.get("cards", {}).values()}
@@ -1785,6 +1884,9 @@ def process_day(st, day, test=False):
     seen = st.setdefault("seen", {})
     if not test and not DRY:
         try: qa_followup(st, day, rows)
+        except Exception: traceback.print_exc()
+    if not test:
+        try: process_flash(st, day, rows)
         except Exception: traceback.print_exc()
     todo = [r for r in rows if is_tanshin(r) and (test or r["id"] not in seen)]
     if not test:
