@@ -451,13 +451,24 @@ def other_qa(card):
 
 def kabutan_docs(card):
     """TDnet 보관 기간(약 1개월)이 지난 결산: 가부탄 공시 목록의 TDnet 사본 PDF 주소 → {"pdf": 결산단신, "mat": 설명 자료}"""
-    out = {}
+    out, items = {}, []
     try:
         s = _get(f"https://kabutan.jp/stock/news?code={card['code']}&nmode=3").decode("utf-8", "ignore")
+        items = re.findall(r'/disclosures/pdf/(\d{8})/(\d+)/"[^>]*>([^<]+)<', s)
     except Exception as e:
-        E.log("kabutan disc error", e); return out
+        E.log("kabutan disc error", e)
+    if not items or min(x[0] for x in items) > card["d"]:   # PC판이 막히거나 목록이 짧으면 모바일판(쪽 넘김)
+        for pg in range(1, 7):
+            try:
+                s = E.mget(f"https://s.kabutan.jp/stocks/{card['code']}/news/?category=disclosure&page={pg}")
+            except Exception as e:
+                E.log("kabutan mobile disc error", e); break
+            got = re.findall(r'tdnet-pdf\.kabutan\.jp/(\d{8})/(\d+)\.pdf">\s*<div[^>]*>\s*([^<]+?)\s*</div>', s)
+            if not got: break
+            items += got
+            if min(x[0] for x in got) < card["d"]: break
     d0 = dt.datetime.strptime(card["d"], "%Y%m%d")
-    for day, did, title in re.findall(r'/disclosures/pdf/(\d{8})/(\d+)/"[^>]*>([^<]+)<', s):
+    for day, did, title in items:
         try: gap = abs((dt.datetime.strptime(day, "%Y%m%d") - d0).days)
         except ValueError: continue
         url = f"https://tdnet-pdf.kabutan.jp/{day}/{did}.pdf"

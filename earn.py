@@ -2201,8 +2201,8 @@ def main():
                                             "reply_markup": keyboard(cid)}, files={"photo": ("c.png", buf.getvalue(), "image/png")})
                 log("소지츠 차트 교체", "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:120]}")
         except Exception: traceback.print_exc()
-    if not st.get("fix_redo_7867") and not DRY and st.get("owner"):  # 한 번: 자료를 못 찾아 빈약했던 타카라토미 리포트·IR 요약을 새 자료 찾기로 다시 만들어 주인에게
-        st["fix_redo_7867"] = True
+    if not st.get("fix_redo_7867b") and not DRY and st.get("owner"):  # 한 번: 자료를 못 찾아 빈약했던 타카라토미 리포트·IR 요약을 새 자료 찾기로 다시 만들어 주인에게
+        st["fix_redo_7867b"] = True
         for cid, c in st.get("cards", {}).items():
             if c.get("code") == "7867":
                 for k in ("rep_file", "ir_texts", "pdf", "mat"): c.pop(k, None)
