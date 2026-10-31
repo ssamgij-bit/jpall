@@ -488,8 +488,16 @@ CARD_PROMPT = """너는 일본 중소형주를 보는 한국 애널리스트다.
 - 일본어를 그대로 쓰지 말고 전부 한국어로. 회사명·제품명은 한글 발음이나 통용 영문명으로.
 - 짧게: bm 45자, summary 60자, P/Q/C/etc 각 70자 이내. 숫자는 본문 그대로(억 엔 환산은 1억 엔=100백만 엔).
 - P=가격·환율·제품 믹스, Q=물량·수주·고객 수·점포 수, C=원가·판관비·감가상각, etc=일회성·영업외·특별손익 등 그 밖의 요인.
+- oneoff: 영업이익(IFRS면 영업이익 또는 사업이익)을 이번 분기에 일시적으로 끌어올린 요인만 적는다.
+  해당: 관세 환급금(예: 미국 IEEPA 관세 환급), 회계 방침·회계 추정 변경 효과(내용연수·감가상각 방법·수익 인식 변경 등),
+  영업이익에 들어간 사업·자산 양도익, 충당금 환입, 보험금·보상금·화해금·일시 보조금 수령, 과거 비용의 환입·정산,
+  전년 동기에 있었던 일회성 비용이 사라진 효과(기저 효과).
+  제외: 특별이익·영업외 수익(영업이익에 안 들어감), 환율, 가격 인상, 해마다 받는 보조금(예: 미국 IRA 생산 세액공제)처럼 계속되는 것.
+  amt = 그 금액(억 엔, 숫자, 1억 엔=100백만 엔). 이번 3개월 분기분을 우선, 분기 구분이 안 되면 누적 금액. 금액이 자료에 없으면 null, 없으면 0.
+  main = 이 요인을 빼면 영업이익이 전년 동기보다 늘지 않았거나 증가분의 절반 이상이 이 요인인가(true/false).
 출력: {{"name_ko": "회사명(한국어 표기)", "bm": "무엇을 만들어/팔아 누구에게 파는 회사인지", "summary": "이번 분기 실적이 좋았던 핵심 이유 한 줄",
- "P": "...", "Q": "...", "C": "...", "etc": "..."}}
+ "P": "...", "Q": "...", "C": "...", "etc": "...",
+ "oneoff": {{"what": "요인(없으면 빈 문자열)", "amt": 0, "main": false}}}}
 
 회사: {name} ({code}) · 업종: {sector}
 회사 개요(가부탄): {profile}
@@ -527,6 +535,55 @@ def ai_card(info, pdf=None):
     if not out: out = gemini_json(p, timeout=120)
     if isinstance(out, list): out = out[0] if out and isinstance(out[0], dict) else None
     return out if isinstance(out, dict) else None
+
+# ───────────────────────── 일회성 요인(관세 환급·회계 변경 등) ─────────────────────────
+ONEOFF_RE = re.compile(r"関税[^。]{0,15}還付|還付[^。]{0,6}関税|IEEPA[^。]{0,30}還付|"
+                       r"(会計方針|会計上の見積り|耐用年数|減価償却方法)の変更[^。]{0,120}営業(利益|損失)[^。]{0,60}(増加|減少)")
+_AMT_RE = re.compile(r"([\d,.]+)億(?:([\d,]+)百万)?円|([\d,.]+)百万円")
+_OTHER_RE = re.compile(r"売上高|営業利益|事業利益|経常利益|純利益|営業損失")
+
+def oneoff_scan(qual):
+    """결산단신 본문에서 일회성 요인 문장을 찾음 → (요인, 억 엔 또는 None) 또는 None. AI가 실패했을 때의 대비용"""
+    found = None
+    for sen in re.split(r"(?<=。)", qual or ""):
+        m = ONEOFF_RE.search(sen)
+        if not m: continue
+        if m.group(1) and m.group(3) == "減少" and "増加" not in sen: continue   # 회계 변경으로 이익이 줄어든 경우는 해당 없음
+        what = "관세 환급" if "還付" in sen else "회계 변경"
+        rest = sen[m.end(2):] if m.group(1) else sen[m.end():]   # 회계 변경은 '営業利益が○百万円増加'처럼 금액이 지표 뒤에 옴
+        am = _AMT_RE.search(rest)
+        if am and not _OTHER_RE.search(rest[:am.start()]):   # 금액 앞에 다른 지표 이름이 오면 그 지표의 금액이라 쓰지 않음
+            f = lambda x: float(x.replace(",", ""))
+            v = f(am.group(1)) + (f(am.group(2)) / 100 if am.group(2) else 0) if am.group(1) else f(am.group(3)) / 100
+            return what, v
+        found = found or (what, None)
+    return found
+
+def oneoff_check(a, ai):
+    """일회성 요인을 빼고 다시 판별 → (제외할지, 카드에 붙일 설명 한 줄 또는 '')"""
+    o = (ai or {}).get("oneoff") if isinstance((ai or {}).get("oneoff"), dict) else {}
+    what = str(o.get("what") or "").strip()
+    try: amt = float(o.get("amt")) if o.get("amt") not in (None, "") else None
+    except (TypeError, ValueError): amt = None
+    main = o.get("main") is True or str(o.get("main")).lower() == "true"
+    if not what or (amt == 0 and not main):
+        sc = oneoff_scan(a.get("qual"))
+        if not sc: return False, ""
+        what, amt = sc; main = amt is None and ai is None   # AI 확인을 못 했고 금액도 모르면 보수적으로 제외
+    series = a["series"]; q = series[-1]; op = q.get("op")
+    by_end = {x["end"]: x for x in series}; py = by_end.get(ym_add(q["end"], -12)) or {}
+    excl, adj_txt = main, ""
+    if amt and op is not None:
+        adj = op - amt * 100
+        s2 = [dict(x) for x in series]; s2[-1]["op"] = adj
+        ok2, hit2, _ = judge(s2, len(s2) - 1)
+        inc = op - (py.get("op") or 0) if py.get("op") is not None else None
+        share = (amt * 100 / inc) if inc and inc > 0 else None
+        excl = (not ok2) or (share is not None and share >= 0.5) or (main and amt is None)
+        ay, ast = yoy(adj, py.get("op"))
+        adj_txt = f" · 빼면 영업이익 {oku(adj)}엔({yoy_txt(ay, ast)})"
+    amt_txt = f" 약 {amt:,.1f}억 엔" if amt else " (금액 미공개)"
+    return excl, f"⚠️ <b>일회성 요인</b> {esc(what)}{amt_txt}{adj_txt}"
 
 # ───────────────────────── 카드 ─────────────────────────
 def analyze(row, rows, st):
@@ -630,6 +687,7 @@ def card_text(a, ai, row):
     if g_line:
         prog = progress(series, r, fem)
         L.append(g_line + (f" · 진척률 {prog[0]:.0f}%" + (f"(작년 {prog[1]:.0f}%)" if prog[1] is not None else "") if prog else ""))
+    if a.get("oneoff"): L.append(a["oneoff"])
     L.append("")
     if ai:
         L.append(("▶️ <b>왜 좋았나</b>" if not a.get("ondemand") or a.get("pass") else "▶️ <b>실적 요인</b>")
@@ -1740,6 +1798,11 @@ def process_day(st, day, test=False):
         st.setdefault("log", []).append([day, row["code"], row["name"], a["pass"], " ".join(a["hit"]), a["why"]])
         if not a["pass"]:
             log("탈락", row["code"], row["name"], a["why"] or "기준 미달"); continue
+        end = (a.get("r") or {}).get("end")
+        dup = next((c for k, c in st.get("cards", {}).items() if not k.startswith("q") and c.get("code") == a["code"]
+                    and (c.get("r") or {}).get("end") == end and str(c.get("chat") or CHANNEL) == str(CHANNEL) and not c.get("deleted")), None) if end else None
+        if dup:
+            log("이미 같은 분기 카드 있음", row["code"], row["name"], dup.get("d")); continue
         passed += 1
         log("통과", row["code"], row["name"], a["hit"])
         if make_card(st, cid, a, row) is None and not DRY: continue
@@ -1776,6 +1839,16 @@ def prepare_card(a, row):
         mat_pdf, mat_url, mat_src = find_mat_pdf(a, row)
         ai = ai_card({"name": a["name"], "code": a["code"], "sector": a["sector"], "profile": a.get("profile", ""), "nums": nums, "qual": a.get("qual", "")}, mat_pdf)
         if ai is not None and mat_pdf: ai["_src"] = mat_src
+        skip = ""
+        try:
+            excl, a["oneoff"] = oneoff_check(a, ai)
+            if excl and a.get("pass"):
+                skip = "X6 일회성 요인으로 이익 증가(" + re.sub(r"<[^>]+>|⚠️ ?", "", a["oneoff"]).replace("일회성 요인 ", "") + ")"
+                if a.get("ondemand"): a["pass"] = False; a["why"] = skip
+        except Exception as e:
+            log("oneoff check error", a.get("code"), e)
+        if skip and not a.get("ondemand"):
+            return {"skip": skip}
         cap = card_text(a, ai, row)
         buf = io.BytesIO()
         chart_name = name_of(a["code"], a["name"], ai) + f"({a['code']})"
@@ -1784,6 +1857,11 @@ def prepare_card(a, row):
 
 def finish_card(st, cid, a, row, prep, chat=None):
     """준비된 카드 게시 + 상태 저장(메인 스레드)"""
+    if prep.get("skip"):
+        log("탈락", a["code"], a["name"], prep["skip"])
+        for x in reversed(st.get("log", [])[-50:]):
+            if x[1] == a["code"] and x[3]: x[3] = False; x[5] = prep["skip"]; break
+        return None
     if True:
         fem, ai, cap, mat_url, mat_src = prep["fem"], prep["ai"], prep["cap"], prep["mat_url"], prep["mat_src"]
         msg = post_card(st, cid, cap, prep["png"], chat)
