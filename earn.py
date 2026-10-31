@@ -249,6 +249,8 @@ def metrics(series, i):
 def judge(series, i):
     """규칙 판별 → (통과 여부, 충족 규칙 목록, 제외 사유)"""
     if i < 1: return False, [], "이력 부족"
+    if series[i].get("op") is None and series[i].get("ni") is not None:   # 영업이익 항목이 없는 회계 양식(IFRS 종합상사 등) → 순이익으로 판별
+        series = [dict(x, op=x.get("ni")) for x in series]
     a, b = metrics(series, i), metrics(series, i - 1)
     c = metrics(series, i - 2) if i >= 2 else {}
     rg, og = a["rev_yoy"], a["op_yoy"]
@@ -674,6 +676,8 @@ def card_text(a, ai, row):
                 ({"turn": "흑자전환", "loss": "적자"}.get(m["op_st"]) or ("증익" if (m["op_yoy"] or 0) >= 0 else "감익")))
     tags = [base_tag] + tags if (a.get("ondemand") or not tags) else tags
     L.append("▶️ <b>실적 유형</b> " + " · ".join(dict.fromkeys(tags)))
+    if q.get("op") is None and q.get("ni") is not None:
+        L.append("※ 영업이익 항목이 없는 회계 양식(IFRS)이라 순이익으로 판별")
     L.append(f"{lab}({months}) 매출/영익/순익")
     L.append(f" {oku(q.get('rev'))}/{oku(q.get('op'))}/{oku(q.get('ni'))} "
              f"({yoy_txt(m['rev_yoy'], m['rev_st'])}/{yoy_txt(m['op_yoy'], m['op_st'])}/{yoy_txt(m['ni_yoy'], m['ni_st'])})")
@@ -1502,7 +1506,7 @@ HELP_TXT = ("일본 실적 스크리닝 봇 사용법\n"
             "스크리닝 기준을 통과한 종목은 지금처럼 채널에 올라갑니다.")
 
 
-GUIDE_VER = 6  # 공지 문구를 바꾸면 올림 → 고정 공지를 새 내용으로 수정
+GUIDE_VER = 7  # 공지 문구를 바꾸면 올림 → 고정 공지를 새 내용으로 수정
 def guide_text(me):
     R = RULES
     sec = ", ".join(sorted(dict.fromkeys(SECTOR_KO.get(x, x) for x in EXCL_SECTORS)))
@@ -1519,6 +1523,7 @@ def guide_text(me):
             "❌ 매출이 2개 분기 연속 전년보다 감소\n"
             f"❌ 시가총액 {R['X5_min_cap_oku']:,.0f}억 엔 미만\n"
             f"❌ 업종: {sec}\n"
+            "※ 영업이익 항목이 없는 기업(IFRS 종합상사 등)은 영업이익 대신 순이익으로 판별\n"
             "❌ 관세 환급·회계 변경 등 일회성 요인을 빼면 조건에 못 미치거나, 이익 증가분의 절반 이상이 일회성\n\n"
             "<b>② 카드 버튼</b>\n"
             "📄 리포트: 사업부·지역별 상세 분석, 시장 반응(note·야후 게시판·증권사 목표주가)\n"
