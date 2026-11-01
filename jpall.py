@@ -1631,10 +1631,24 @@ def gem_key():
     return getattr(AI_TL, "key", None) or os.environ.get("GEMINI_API_KEY")
 
 _KEY_OUT = {}   # 한도(429)에 걸린 키 → 이 시각까지 쉼
+_KM_OUT = {}   # (키 끝 6자리+모델) → 한도로 쉬는 시각(실적 봇 보조 키 순환용)
 def gemini_json(prompt, timeout=150, models=None):
     """공시 채널은 전용 키(JPALL_GEMINI_KEY → GEMINI_API_KEY로 전달)를 먼저 쓰고, 한도가 차면 예비 키(GEMINI_API_KEY_FALLBACK)로 넘어감"""
     key = gem_key()
     if not key: return None
+    hk = getattr(AI_TL, "keys", None)
+    if hk and len(hk) > 1:   # 실적 봇 리포트·IR: 한도가 나면 가벼운 모델로 내려가기 전에 같은 모델로 다른 보조 키부터
+        for model in models or GEMINI_MODELS:
+            for k in hk:
+                if _KM_OUT.get(k[-6:] + model, 0) > time.time(): continue
+                out, quota = _gemini_try(k, prompt, timeout, [model])
+                if out is not None:
+                    AI_TL.key = k
+                    if getattr(AI_TL, "used", None) is not None: AI_TL.used.append(model)
+                    return out
+                if quota: _KM_OUT[k[-6:] + model] = time.time() + 2 * 3600; continue
+                break
+        return None
     keys = [key]
     fb = os.environ.get("GEMINI_API_KEY_FALLBACK")
     if fb and fb != key and not getattr(AI_TL, "key", None): keys.append(fb)

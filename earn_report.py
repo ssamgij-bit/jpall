@@ -40,28 +40,14 @@ def gemini_pdf(prompt, pdfs, max_tokens=12000):
         if getattr(_j.AI_TL, "fails", None) is not None: _j.AI_TL.fails.append("nodoc")
     if not key or not pdfs: return None
     import aicache
-    ck = aicache.key(prompt + f"|{max_tokens}", pdfs); hit = aicache.get(ck)
+    ck = aicache.key(prompt + f"|{max_tokens}|v2", pdfs); hit = aicache.get(ck)   # v2: 예전 저장분(가벼운 모델 결과일 수 있음)은 쓰지 않음
     if hit: E.log("ai cache hit(리포트)"); return hit   # 같은 자료·같은 지시문 → 저장해 둔 결과(한도 절약)
     parts = [{"inline_data": {"mime_type": "application/pdf", "data": base64.b64encode(p).decode()}} for p in pdfs] + [{"text": prompt}]
     body = json.dumps({"contents": [{"parts": parts}],
                        "generationConfig": {"temperature": 0.2, "maxOutputTokens": max_tokens, "responseMimeType": "application/json"}}).encode()
-    for model in GEMINI_MODELS + GEMINI_MODELS:  # 구글 서버가 붐비면(503) 한 바퀴 더
-        if SLOW.get(model, 0) > time.time() or E.ai_skip(model): continue  # 방금 응답 없던 모델·한도 초과 모델은 잠시 건너뜀
-        try:
-            r = json.loads(http(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}",
-                                timeout=240, data=body, headers={"content-type": "application/json"}))
-            txt = "".join(p.get("text", "") for p in r["candidates"][0]["content"]["parts"])
-            out = json.loads(re.sub(r"^```(json)?|```$", "", txt.strip()))
-            if isinstance(out, list): out = out[0] if out and isinstance(out[0], dict) else None
-            aicache.put(ck, out)
-            return out
-        except Exception as e:
-            kind = E.ai_err(e, model, "pdf")   # 키 이름·구글 응답 사유까지 기록, 실패 사유 분류
-            if kind == "quota": E.ai_429(model)
-            if kind == "busy": SLOW[model] = time.time() + 1200  # 응답 지연·과부하 → 20분간 건너뜀
-            if kind in ("quota", "busy"): time.sleep(8)
-            if kind in ("bad", "key"): break   # 자료·키 문제는 모델을 바꿔도 같음 → 한도 낭비 없이 중단
-    return None
+    out, model = E.heavy_call(body, "pdf", SLOW)   # 한도가 나면 같은 모델로 다른 보조 키 먼저, 다 막히면 가벼운 모델
+    if out is not None and E.is_top(model): aicache.put(ck, out)   # 가벼운 모델 결과는 저장하지 않음 → 한도가 풀린 뒤 상위 모델로 다시
+    return out
 
 def tr_google(texts):
     """일본어 짧은 문자열 → 한국어(키 없는 공개 번역 주소). 실패하면 원문 그대로"""
@@ -443,6 +429,7 @@ def guide_section(plt, card, kb):
         if parts:
             dd = [float(re.search(r"([+-][\d.]+)%", p_).group(1)) for p_ in parts]
             tone = "회사 예상이 시장 기대보다 보수적" if max(dd) < -3 else "회사 예상이 시장 기대보다 높음" if min(dd) > 3 else "회사 예상이 시장 기대와 비슷"
+            card["_cons"] = 1
             cons_html = (f"<div class=card><b>회사 예상 vs 시장 컨센서스</b> — {tone}<br>" + "<br>".join(parts)
                          + "<br><small class=muted>컨센서스: Yahoo Finance 애널리스트 평균(이번 회계연도). 발표 전에 받아 둔 값이 있으면 그것(=발표 전 시장 기대), 없으면 리포트 작성 시점 값</small></div>")
     except Exception as e:
@@ -492,7 +479,7 @@ def deep_extract(card, name, code, pdfs, pnames):
     out = (gemini_pdf(prompt, [pdfs[i] for i in idx], max_tokens=9000) if idx else gemini_json(prompt, timeout=150)) or {}
     if isinstance(out, list): out = out[0] if out and isinstance(out[0], dict) else {}
     if reuse_biz: out["biz"] = old["biz"]; out["_biz_cached"] = old.get("t")
-    elif out.get("biz"):
+    elif out.get("biz") and not E.ai_used_light():   # 가벼운 모델로 만든 사업 분석은 90일 저장하지 않음
         cache[code] = {"t": time.time(), "biz": out["biz"], "v": BIZ_VER}
         try:
             cache = {k: v for k, v in cache.items() if time.time() - v.get("t", 0) < 120 * 86400}
@@ -600,6 +587,7 @@ def ret_section(card, kb, att, plt=None, policy=None, div_html=""):
         import earn_edinet
         hist, note = earn_edinet.history(card["code"], card.get("fem") or 3)
         E.log("주주환원 10년", card["code"], f"{len(hist)}개년", note or "")
+        card["_edinet_n"] = len(hist)
         if hist:
             fc = {"lab": fy_lab(ret.get("fy_end")), "dps": ret.get("dps_fc"), "payout": ret.get("payout_fc")} if ret.get("dps_fc") is not None else None
             ds = [h.get("dps") for h in hist if h.get("dps") is not None]
@@ -1268,4 +1256,13 @@ details.sec{{padding:0 12px 8px}} details.sec>summary{{list-style:none;padding:1
 </main></body></html>"""
     card["_stats"] = {"mat": int(bool(mat_pdf)), "refs": len(refs), "capa": int(capa_hit), "ai_fail": int(not ai),
                       "qfail": int(bool(att["seg"]) and (r.get("q") or 1) > 1 and not seg_q)}
+    try:   # 실행 기록용 섹션별 결과(텔레그램을 안 열어도 빠진 항목을 알 수 있게)
+        bz = deep.get("biz") or {}
+        vm = (bz.get("vc_map") or {}) if isinstance(bz, dict) else {}
+        card["_stats"]["_sec"] = {
+            "설명자료": "O" if mat_pdf else "X", "이전IR": len(refs), "분기3개월": "X" if card["_stats"]["qfail"] else "O",
+            "캐파": "O" if capa_hit else "X", "사업분석": ("저장분" if deep.get("_biz_cached") else "O") if bz else "X",
+            "밸류체인지도": f"{len(vm.get('players') or [])}개사", "환원목표": len(deep.get("policy") or []),
+            "EDINET": f"{card.pop('_edinet_n', 0)}개년", "배당자료": len(div_ins), "컨센서스": "O" if card.pop("_cons", 0) else "X"}
+    except Exception as e: E.log("rep sec stats error", e)
     return f"{code}_{card['d']}_report.html", doc.encode("utf-8")

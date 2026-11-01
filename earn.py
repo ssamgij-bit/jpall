@@ -1252,6 +1252,48 @@ def ai_err(e, model, where):
 def ai_reset():
     import jpall
     jpall.AI_TL.fails = []
+    jpall.AI_TL.used = []   # 이번 작업에서 실제로 답을 준 모델들(가벼운 모델로 만들었는지 판단 → 보강판)
+
+TOP_N = 2   # GEMINI_MODELS 앞 2개 = 상위 모델. 그 아래로 내려가 만든 결과는 '가벼운 모델' 결과로 보고 저장·재사용하지 않음
+def is_top(model):
+    from jpall import GEMINI_MODELS
+    return model in GEMINI_MODELS[:TOP_N]
+
+def ai_used_light():
+    import jpall
+    return any(not is_top(m) for m in (getattr(jpall.AI_TL, "used", None) or []))
+
+def heavy_call(body, where, slow, timeout=240):
+    """PDF 요청(리포트·IR): 한도(429)가 나면 같은 모델로 다른 보조 키를 먼저 시도하고, 모든 키에서 막혔을 때만 가벼운 모델로 내려감
+    → (결과 dict 또는 None, 쓴 모델)"""
+    import jpall
+    from jpall import GEMINI_MODELS, http
+    cur = jpall.gem_key()
+    ks = _heavy_keys()
+    keys = ([cur] + [k for k in ks if k != cur]) if cur in ks else [cur]
+    for model in GEMINI_MODELS + GEMINI_MODELS:  # 구글 서버가 붐비면(503) 한 바퀴 더
+        if slow.get(model, 0) > time.time(): continue
+        for key in keys:
+            if len(keys) > 1: jpall.AI_TL.key = key
+            if ai_skip(model): continue   # 이 키에서 이 모델은 한도 초과로 쉬는 중
+            try:
+                r = json.loads(http(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}",
+                                    timeout=timeout, data=body, headers={"content-type": "application/json"}))
+                txt = "".join(p_.get("text", "") for p_ in r["candidates"][0]["content"]["parts"])
+                out = json.loads(re.sub(r"^```(json)?|```$", "", txt.strip()))
+                if isinstance(out, list): out = out[0] if out and isinstance(out[0], dict) else None
+                if getattr(jpall.AI_TL, "used", None) is None: jpall.AI_TL.used = []
+                jpall.AI_TL.used.append(model)
+                if key != cur: log("한도 → 보조 키 전환해 같은 모델로 성공", model, key_label())
+                return out, model
+            except Exception as e:
+                kind = ai_err(e, model, where)   # 키 이름·구글 응답 사유까지 기록, 실패 사유 분류
+                if kind == "quota": ai_429(model); time.sleep(3); continue   # 같은 모델, 다음 키
+                if kind == "key": continue
+                if kind == "busy": slow[model] = time.time() + 1200; time.sleep(5)   # 응답 지연·과부하 → 20분간 건너뜀
+                if kind == "bad": return None, None   # 자료 문제는 모델·키를 바꿔도 같음
+                break   # 다음 모델
+    return None, None
 
 def ai_fail_reason():
     import jpall
@@ -1313,10 +1355,12 @@ class _key2:
                 jpall.AI_TL.key = k
                 if not ai_out_until(heavy=True): pick = k; break
             jpall.AI_TL.key = pick
+            jpall.AI_TL.keys = [pick] + [k for k in ks if k != pick]   # 텍스트 요청도 한도가 나면 같은 모델로 다음 키부터
             if pick != ks[0]: log("보조 키 전환", key_label())   # 첫 보조 키가 한도·거부로 쉬는 중
     def __exit__(self, *a):
         import jpall
         jpall.AI_TL.key = self.k
+        jpall.AI_TL.keys = None
 
 # ── 작업 스레드: 오래 걸리는 일(종목 분석·카드 준비·리포트·IR 요약)은 따로 돌리고, 메인 루프는 계속 요청·버튼을 받음
 import concurrent.futures as _cf, copy as _copy
@@ -1348,7 +1392,15 @@ def _rep_build(cp):
     ok_ai = cp.pop("_ai_ok", True)
     if not ok_ai: FAIL[cp["code"]] = ai_fail_reason()
     log("리포트 AI", cp["code"], key_label(), "성공" if ok_ai else f"실패({ai_fail_reason()})")
-    return fn, blob, ok_ai, cp.get("_stats") or {}
+    stt = dict(cp.get("_stats") or {})
+    import jpall
+    used = getattr(jpall.AI_TL, "used", None) or []
+    stt["light"] = int(ai_used_light())
+    stt["quota"] = int("quota" in (getattr(jpall.AI_TL, "fails", None) or []))
+    sec = stt.pop("_sec", {}) or {}
+    log("리포트 구성", cp["code"], " · ".join(f"{k} {v}" for k, v in sec.items()),
+        "· 모델 " + (",".join(dict.fromkeys(used)) or "없음(저장분)") + (" ⚠️가벼운 모델" if stt["light"] else ""))
+    return fn, blob, ok_ai, stt
 
 def _matchk(cp):
     """리포트를 만들 때 이번 분기 설명 자료가 없던 카드: 그사이 회사 IR 홈페이지·TDnet에 올라왔는지 → True/False"""
@@ -1376,6 +1428,31 @@ def rep_refresh(st, limit=2):
         if age > 7 or time.time() - c.get("mat_chk", 0) < 6 * 3600: continue
         c["mat_chk"] = time.time(); n += 1
         _submit("matchk", _matchk, _copy.deepcopy(c), cid=cid, waiters=[])
+    # 보강판: AI 한도 때문에 가벼운 모델로 만들었거나 AI가 빠진 리포트 → 상위 모델 한도가 풀리면 한 번 다시 만들어 받았던 사람에게
+    if top_ready():
+        for cid, c in (st.get("cards") or {}).items():
+            if n >= limit: break
+            if not c.get("rep_weak") or not c.get("rep_to") or c.get("deleted") or _running(None, cid): continue
+            if time.time() - c["rep_weak"] > 3 * 86400: c.pop("rep_weak", None); continue
+            if time.time() - c["rep_weak"] < 1800: continue   # 방금 만든 것 → 잠시 뒤
+            c.pop("rep_weak", None); c.pop("rep_file", None); c["weak_refresh"] = True; n += 1
+            log("가벼운 모델로 만든 리포트 → 상위 모델로 보강판", c["code"])
+            for d in c.get("rep_to") or []:
+                st.setdefault("rep_q", []).append({"cid": cid, "chat": d, "reply": None})
+
+def top_ready():
+    """보조 키 중 하나라도 상위 모델 한도가 남아 있으면 True"""
+    import jpall
+    from jpall import GEMINI_MODELS
+    ks = _heavy_keys() or [jpall.gem_key()]
+    old = getattr(jpall.AI_TL, "key", None)
+    try:
+        for k in ks:
+            jpall.AI_TL.key = k
+            if not ai_skip(GEMINI_MODELS[0]): return True
+        return False
+    finally:
+        jpall.AI_TL.key = old
 
 def _rep_stats(st, stt):
     for k, v in (stt or {}).items():
@@ -1738,13 +1815,16 @@ class _DONE:
                 if out: defer_ai(st, "rep", j["cid"], dest, reply, out); continue   # 만드는 도중 한도가 끝남 → 풀린 뒤 다시
             cap = f"📄 {card.get('name_ko') or card['name']}({card['code']}) 리포트 — 파일을 열어 보세요"
             if card.get("mat_refresh"): cap = f"🔁 {card.get('name_ko') or card['name']}({card['code']}) 결산 설명 자료가 새로 올라와 반영한 리포트입니다"
+            elif card.get("weak_refresh"): cap = f"🔁 {card.get('name_ko') or card['name']}({card['code']}) 보강판 — 앞서 AI 한도 때문에 가벼운 모델로 만든 리포트를 상위 모델로 다시 만들었습니다"
+            if ok_ai and len(res) > 3 and (res[3] or {}).get("light") and not card.get("weak_refresh"):
+                cap += "\n⚠️ AI 한도 때문에 일부를 가벼운 모델로 만들었습니다. 한도가 풀리면 상위 모델로 다시 만든 보강판을 자동으로 보내드립니다."
             if not ok_ai: cap += "\n⚠️ AI 분석(결론·사업부·IR 핵심 데이터·Q&A)이 빠졌습니다. " + FAIL_TXT.get(FAIL.get(card["code"]), FAIL_TXT[None]) + " 📄 리포트를 다시 누르면 새로 만듭니다."
-            if card.get("rep_file") and card.get("rep_ver") == REP_VER:
+            if card.get("rep_file") and card.get("rep_ver") == REP_VER and not card.get("weak_refresh"):
                 r = tg("sendDocument", {"chat_id": dest, "caption": cap, "document": card["rep_file"], **rp})
                 if r.get("ok"): continue
             r = tg("sendDocument", {"chat_id": dest, "caption": cap, **rp}, files={"document": (fn, blob, "text/html")}, timeout=90)
             log("리포트 보냄", card["code"], dest, "AI 포함" if ok_ai else "AI 빠짐", "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:80]}")
-            if r.get("ok") and ok_ai:
+            if r.get("ok") and ok_ai and not (len(res) > 3 and (res[3] or {}).get("light")):   # 가벼운 모델 결과는 다시 쓰지 않음(보강판 대상)
                 card["rep_file"] = ((r.get("result") or {}).get("document") or {}).get("file_id"); card["rep_ver"] = REP_VER
             if r.get("ok") and str(dest) not in [str(x) for x in card.setdefault("rep_to", [])]: card["rep_to"] = (card["rep_to"] + [dest])[-10:]
         if ok == "ok":
@@ -1752,6 +1832,9 @@ class _DONE:
             _rep_stats(st, {"built": 1, **stt})
             card["rep_mat"] = bool(stt.get("mat")) or card.get("mat_refresh", False)
             card.pop("mat_refresh", None)
+            if (stt.get("light") or (stt.get("ai_fail") and stt.get("quota"))) and not card.get("weak_refresh"):
+                card["rep_weak"] = time.time()   # 한도가 풀리면 보강판(한 번만)
+            card.pop("weak_refresh", None)
 
     @staticmethod
     def matchk(st, j, ok, res):
@@ -2616,6 +2699,18 @@ def cleanup(st):
         if time.time() - c.get("ts", 0) > 86400 * 7: c.pop("qual", None)
     st["log"] = st.get("log", [])[-3000:]
 
+def new_code():
+    """main 브랜치의 최신 커밋이 이번 실행의 커밋과 다르면 True(코드 수정이 몇 분 안에 반영되도록)"""
+    sha, repo, tok = os.environ.get("GITHUB_SHA"), os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GH_TOKEN")
+    if not (sha and repo and tok): return False
+    try:
+        req = urllib.request.Request(f"https://api.github.com/repos/{repo}/commits/main",
+                                     headers={"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github.sha", "User-Agent": "earn-bot"})
+        head = urllib.request.urlopen(req, timeout=10).read().decode().strip()
+        return bool(re.fullmatch(r"[0-9a-f]{40}", head)) and head != sha
+    except Exception as e:
+        log("code check error", str(e)[:80]); return False
+
 def main():
     t0 = time.time()
     st = load()
@@ -2730,7 +2825,12 @@ def main():
     except Exception: traceback.print_exc()
     import aicache; aicache.prune()   # 7일 지난 AI 결과 저장분 정리
     last_scan = 0
+    last_code_chk = time.time()
     while time.time() - t0 < RUN_SECONDS:
+        if time.time() - last_code_chk > 60 and not (TEST_DAY or TEST_REPORT):
+            last_code_chk = time.time()
+            if new_code():
+                log("새 코드가 배포됨 → 하던 작업을 마치고 이번 실행 종료(다음 실행이 새 코드로 이어받음)"); break
         try:
             poll_buttons(st, wait=0)
             do_reports(st)

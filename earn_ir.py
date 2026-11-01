@@ -60,28 +60,14 @@ def gemini_pdfs(prompt, pdfs):
         if getattr(_j.AI_TL, "fails", None) is not None: _j.AI_TL.fails.append("nodoc")
     if not key or not pdfs: return None
     import aicache
-    ck = aicache.key(prompt, pdfs); hit = aicache.get(ck)
+    ck = aicache.key(prompt + "|v2", pdfs); hit = aicache.get(ck)   # v2: 예전 저장분(가벼운 모델 결과일 수 있음)은 쓰지 않음
     if hit: E.log("ai cache hit(IR)"); return hit   # 같은 자료·같은 지시문 → 저장해 둔 결과(한도 절약)
     parts = [{"inline_data": {"mime_type": "application/pdf", "data": base64.b64encode(b).decode()}} for b in pdfs] + [{"text": prompt}]
     body = json.dumps({"contents": [{"parts": parts}],
                        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 12000, "responseMimeType": "application/json"}}).encode()
-    for model in GEMINI_MODELS + GEMINI_MODELS:  # 구글 서버가 붐비면(503) 한 바퀴 더
-        if SLOW.get(model, 0) > time.time() or E.ai_skip(model): continue  # 방금 응답 없던 모델·한도 초과 모델은 잠시 건너뜀
-        try:
-            r = json.loads(http(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}",
-                                timeout=240, data=body, headers={"content-type": "application/json"}))
-            txt = "".join(p.get("text", "") for p in r["candidates"][0]["content"]["parts"])
-            out = json.loads(re.sub(r"^```(json)?|```$", "", txt.strip()))
-            if isinstance(out, list): out = out[0] if out and isinstance(out[0], dict) else None
-            aicache.put(ck, out)
-            return out
-        except Exception as e:
-            kind = E.ai_err(e, model, "ir")   # 키 이름·구글 응답 사유까지 기록, 실패 사유 분류
-            if kind == "quota": E.ai_429(model)
-            if kind == "busy": SLOW[model] = time.time() + 1200  # 응답 지연·과부하 → 20분간 건너뜀
-            if kind in ("quota", "busy"): time.sleep(8)
-            if kind in ("bad", "key"): break   # 자료·키 문제는 모델을 바꿔도 같음 → 한도 낭비 없이 중단
-    return None
+    out, model = E.heavy_call(body, "ir", SLOW)   # 한도가 나면 같은 모델로 다른 보조 키 먼저, 다 막히면 가벼운 모델
+    if out is not None and E.is_top(model): aicache.put(ck, out)   # 가벼운 모델 결과는 저장하지 않음 → 한도가 풀린 뒤 상위 모델로 다시
+    return out
 
 def find_qa(code, since_day, days=14):
     """since_day(YYYYMMDD)부터 오늘까지 TDnet에서 같은 종목의 질의응답 자료"""
