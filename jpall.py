@@ -1603,9 +1603,26 @@ AI_TL = _th.local()   # 스레드별 Gemini 키(실적 봇: 리포트·IR 작업
 def gem_key():
     return getattr(AI_TL, "key", None) or os.environ.get("GEMINI_API_KEY")
 
+_KEY_OUT = {}   # 한도(429)에 걸린 키 → 이 시각까지 쉼
 def gemini_json(prompt, timeout=150, models=None):
+    """공시 채널은 전용 키(JPALL_GEMINI_KEY → GEMINI_API_KEY로 전달)를 먼저 쓰고, 한도가 차면 예비 키(GEMINI_API_KEY_FALLBACK)로 넘어감"""
     key = gem_key()
     if not key: return None
+    keys = [key]
+    fb = os.environ.get("GEMINI_API_KEY_FALLBACK")
+    if fb and fb != key and not getattr(AI_TL, "key", None): keys.append(fb)
+    live = [k for k in keys if _KEY_OUT.get(k, 0) < time.time()] or keys[-1:]
+    for i, key in enumerate(live):
+        out, quota = _gemini_try(key, prompt, timeout, models)
+        if out is not None: return out
+        if quota and i + 1 < len(live):
+            _KEY_OUT[key] = time.time() + 1800; log("gemini key quota → 예비 키")
+            continue
+        break
+    return None
+
+def _gemini_try(key, prompt, timeout, models):
+    quota = 0
     for model in models or GEMINI_MODELS:
         t0 = time.time()
         try:
@@ -1616,11 +1633,11 @@ def gemini_json(prompt, timeout=150, models=None):
             txt = "".join(p.get("text", "") for p in r["candidates"][0]["content"]["parts"])
             out = json.loads(re.sub(r"^```(json)?|```$", "", txt.strip()))
             if models: log("gemini ok", model, f"{time.time() - t0:.0f}s")
-            return out
+            return out, False
         except Exception as e:
             log("gemini error", model, str(e)[:150])
-            if "429" in str(e): time.sleep(3)
-    return None
+            if "429" in str(e): time.sleep(3); quota += 1
+    return None, quota >= max(1, len(models or GEMINI_MODELS) - 1)
 
 AI_PROMPT = """너는 일본 주식 애널리스트다. 아래는 오늘 도쿄증시 적시공시 중 하이라이트로 뽑힌 항목들이다.
 각 항목에는 [분류], 기업, 핵심 수치, 그리고 공시 원문(일본어)에서 이유·설명 부분을 잘라낸 글이 있다.
@@ -2028,9 +2045,9 @@ HELP = ("관심 종목 명령\n/add 7203 6758 — 추가(여러 개 가능)\n/de
 WATCH_URL = os.environ.get("WATCH_URL", "https://jp-disclosure-bot.ssamgij.workers.dev/watchlist")
 WATCH_KEY = os.environ.get("WATCH_KEY", "")
 def watch_sync(st):
-    today = now().strftime("%Y%m%d")
-    if not (WATCH_URL and WATCH_KEY) or st.get("watch_date") == today: return  # 하루 한 번만 읽음(키가 없으면 /add 목록 사용)
-    st["watch_date"] = today
+    # 30분마다 읽음(japan stock 봇에서 구독하면 30분 안에 ⭐ 반영). 키가 없으면 /add 목록 사용
+    if not (WATCH_URL and WATCH_KEY) or time.time() - (st.get("watch_ts") or 0) < 1800: return
+    st["watch_ts"] = time.time(); st.pop("watch_date", None)
     j = json.loads(http(WATCH_URL, timeout=20, headers={"x-watch-key": WATCH_KEY, **UA}))
     codes = [nfkc(str(c)).upper()[:4] for c in (j.get("codes") or [])]
     old = st.get("watch", {})
@@ -2062,7 +2079,7 @@ def tg_commands(st, names):
         watch = st.setdefault("watch", {})
         def label(c): return f"{(names.get(c) or {}).get('ko') or '?'}({c})"
         if WATCH_URL and WATCH_KEY and cmd in ("/add", "/추가", "/del", "/삭제", "/remove"):
-            tg_reply(chat["id"], "관심 종목은 japan stock 봇(@JP_stock_yh_bot)의 구독 목록을 그대로 씁니다. 그쪽에서 구독/구독해지 해주세요. (하루 한 번 반영)"); continue
+            tg_reply(chat["id"], "관심 종목은 japan stock 봇(@JP_stock_yh_bot)의 구독 목록을 그대로 씁니다. 그쪽에서 구독/구독해지 해주세요. (30분 안에 반영)"); continue
         if cmd in ("/add", "/추가"):
             ok = [c for c in codes if c in names]; bad = [c for c in codes if c not in names]
             for c in ok: watch[c] = time.time()
