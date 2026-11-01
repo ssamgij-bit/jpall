@@ -738,4 +738,83 @@ figure{{margin:10px 0;background:#fff;border-radius:10px;padding:8px}} figure im
 <p class=muted>출처: TDnet(결산단신 XBRL·PDF, 설명 자료), 회사 IR 홈페이지, 로그미 파이낸스, 가부탄(실적·시가총액·대주주), 네이버 증권(주가). 금액 억 엔(원자료 백만 엔 환산).
 결론·요약·번역과 설명 자료에서 뽑은 숫자는 Gemini가 원문만 읽고 작성 — 숫자는 원문 쪽 이미지·링크로 확인하세요. 작성 {E.now():%Y-%m-%d %H:%M} JST</p>
 </main></body></html>"""
+    card["_deck"] = (mat_pdf, mat_url, mat_src) if mat_pdf else None   # 같은 설명 자료로 한국어 번역본(deck_ko)을 이어서 만듦
     return f"{code}_{card['d']}_report.html", doc.encode("utf-8")
+
+
+# ───────────────────────── IR 발표 자료(PPT) 한국어 번역본 ─────────────────────────
+DECK_PROMPT = """첨부 PDF는 일본 상장사 {name}({code})의 결산 설명 자료(IR 발표 자료)다. 이 회사를 공부하는 한국 애널리스트가 읽을 수 있게 {a}~{b}쪽을 한국어로 옮겨라.
+규칙
+- 각 쪽에 적힌 글(제목, 본문, 표·그래프의 항목명·범례·주석)을 빠뜨리지 말고 한국어로 옮긴다. 요약하거나 자료에 없는 말을 보태지 않는다.
+- 숫자·단위·기간은 원문 그대로(백만 엔·억 엔·%·FY 표기, 1Q·2Q 등). 회사·제품·인명은 한글 발음 또는 통용 영문. 일본어 문자를 남기지 말 것.
+- 표는 한 줄에 한 행: "항목: 값 / 값 / 값"(첫 줄에 열 이름). 그래프는 "그래프 제목 — 읽히는 숫자"만.
+- 표지·목차·면책 문구만 있는 쪽은 lines를 짧게.
+출력: {{"pages": [{{"p": 쪽번호, "title": "그 쪽 제목", "lines": ["..."]}}]}}
+"""
+
+def _pdf_pages(pdf):
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "a.pdf"); open(p, "wb").write(pdf)
+        out = subprocess.run(["pdfinfo", p], capture_output=True, text=True, timeout=60).stdout
+    m = re.search(r"Pages:\s+(\d+)", out)
+    return int(m.group(1)) if m else 0
+
+def _pdf_images(pdf, n):
+    """1~n쪽 작은 JPEG(data URI) 목록"""
+    imgs = {}
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "a.pdf"); open(p, "wb").write(pdf)
+            subprocess.run(["pdftoppm", "-f", "1", "-l", str(n), "-r", "60", "-jpeg", "-jpegopt", "quality=65", p, os.path.join(d, "pg")],
+                           capture_output=True, timeout=180)
+            for f in os.listdir(d):
+                m = re.match(r"pg-0*(\d+)\.jpg$", f)
+                if m: imgs[int(m.group(1))] = "data:image/jpeg;base64," + base64.b64encode(open(os.path.join(d, f), "rb").read()).decode()
+    except Exception as e:
+        E.log("deck image error", e)
+    return imgs
+
+DECK_MAX, DECK_CHUNK = 60, 12
+def deck_ko(card, pdf, url, src):
+    """결산 설명 자료 PDF → 쪽마다 원문 이미지 + 한국어 번역(HTML 한 파일). → (파일 이름, bytes, 번역한 쪽 수, 전체 쪽 수) 또는 None"""
+    code = card["code"]; name = card.get("name_ko") or card["name"]
+    n_all = _pdf_pages(pdf)
+    if not n_all: return None
+    n = min(n_all, DECK_MAX)
+    tr = {}
+    for a in range(1, n + 1, DECK_CHUNK):
+        b = min(n, a + DECK_CHUNK - 1)
+        out = gemini_pdf(DECK_PROMPT.format(name=name, code=code, a=a, b=b), [pdf], max_tokens=24000) or {}
+        for pg in out.get("pages") or []:
+            try: k = int(pg.get("p"))
+            except Exception: continue
+            if a <= k <= b:
+                lines = [re.sub(r"[぀-ヿ]+", "", str(x)).strip() for x in (pg.get("lines") or []) if str(x).strip()]
+                tr[k] = (str(pg.get("title") or "").strip(), lines)
+    if not tr: return None
+    imgs = _pdf_images(pdf, n)
+    body = []
+    for k in range(1, n + 1):
+        t, lines = tr.get(k, ("", []))
+        body.append(f"<section id=p{k}><div class=pn>{k}쪽" + (f" · <b>{esc(t)}</b>" if t else "") + "</div>"
+                    + (f'<img loading=lazy src="{imgs[k]}">' if k in imgs else "")
+                    + ("<div class=ko>" + "".join(f"<p>{esc(x)}</p>" for x in lines) + "</div>" if lines else
+                       ("<div class=ko muted>(번역 없음 — 원문 이미지 참고)</div>" if k not in tr else ""))
+                    + "</section>")
+    toc = " · ".join(f'<a href="#p{k}">{k}</a>' for k in range(1, n + 1) if tr.get(k, ("",))[0])
+    lab, months = E.qlabel(card["series"][-1], card["fem"]) if card.get("series") and card.get("fem") else ("", "")
+    doc = f"""<!doctype html><html lang=ko><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>{esc(name)}({code}) IR 자료 한국어</title><style>
+body{{font-family:-apple-system,'Apple SD Gothic Neo','Noto Sans KR','Malgun Gothic',sans-serif;margin:0;background:#f6f7f9;color:#1f2328;line-height:1.55}}
+main{{max-width:880px;margin:0 auto;padding:16px}} h1{{font-size:20px;margin:8px 0 4px}} .muted{{color:#6b7280;font-size:13px}} a{{color:#2f6fd6}}
+section{{background:#fff;border-radius:12px;padding:12px 14px;margin:14px 0;box-shadow:0 1px 2px rgba(0,0,0,.06)}}
+.pn{{font-size:14px;color:#374151;margin-bottom:6px}} img{{width:100%;border:1px solid #eee;border-radius:6px}}
+.ko{{margin-top:8px;font-size:14px}} .ko p{{margin:3px 0}} .toc{{font-size:13px;line-height:1.9}}
+</style></head><body><main>
+<h1>{esc(name)} <small class=muted>({code} JP)</small> IR 발표 자료 한국어판</h1>
+<p class=muted>{esc(lab)}{f"({esc(months)})" if months else ""} 결산 설명 자료 · 원문: <a href="{esc(url)}">{esc(src)}</a> · 전체 {n_all}쪽{f" 중 앞 {n}쪽" if n < n_all else ""} ·
+쪽마다 위는 원문 이미지, 아래는 Gemini 번역(숫자는 원문 이미지로 확인하세요) · 작성 {E.now():%Y-%m-%d %H:%M} JST</p>
+<p class=toc>바로 가기: {toc}</p>
+{''.join(body)}
+</main></body></html>"""
+    return f"{code}_{card['d']}_IR_ko.html", doc.encode("utf-8"), len(tr), n_all
