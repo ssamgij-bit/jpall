@@ -372,7 +372,7 @@ QRULE = """- 기간 기준: 이번 3개월 분기(예: 2Q(7~9월))가 기본이�
   자료에 누적(반기·1~3Q 누적)만 있으면, 같은 자료에 직전 분기 누적도 있을 때만 '이번 누적 − 직전 분기 누적'으로 분기 숫자를 계산해 쓰고,
   그럴 수 없으면 누적 숫자를 쓰되 반드시 '(누적 n~m월)'이라고 붙인다. 누적 숫자를 분기 숫자처럼 쓰지 말 것.
 """
-REP_VER = 8   # 리포트 내용·구성을 바꾸면 올림 → 예전에 만든 리포트를 다시 보내지 않고 새로 만듦
+REP_VER = 9   # 리포트 내용·구성을 바꾸면 올림 → 예전에 만든 리포트를 다시 보내지 않고 새로 만듦
 QBASIS_VER = 1   # 올리면 예전 기준으로 만든 리포트·IR 요약 저장분을 버리고 새로 만듦
 
 def read_tanshin(row):
@@ -895,14 +895,12 @@ def shareholder_return(code, r, kb, day):
     return out
 
 def ret_line(ret):
-    """카드용 한 줄: 배당성향 · 총주주환원율"""
+    """카드용 한 줄: 배당성향(총주주환원율은 표시하지 않음 — 2026-11 요청)"""
     if not ret: return ""
     p = []
     if ret.get("payout_fc") is not None: p.append(f"배당성향(회사 예상) <b>{ret['payout_fc']:.0f}%</b>")
     elif ret.get("payout_last") is not None: p.append(f"배당성향(최근 실적) {ret['payout_last']:.0f}%")
-    if ret.get("total_fc") is not None: p.append(f"총주주환원율(예상) <b>{ret['total_fc']:.0f}%</b>")
-    if ret.get("ytd_ratio") is not None:
-        p.append(f"올해 누적 환원 {ret['ytd_ratio']:.0f}%(배당 {oku(ret['ytd_div'])}" + (f"·자사주 {oku(ret['ytd_buy'])}" if (ret.get("ytd_buy") or 0) >= 50 else "") + ")")
+    if ret.get("dps_fc") is not None: p.append(f"주당배당 예상 {ret['dps_fc']:,.1f}엔".replace(".0엔", "엔"))
     if ret.get("buys"): p.append(f"자사주 매입 결정 {len(ret['buys'])}건(최근 1년)")
     return "▶️ <b>주주환원</b> " + " · ".join(p) if p else ""
 

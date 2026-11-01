@@ -468,6 +468,7 @@ def cons_fy(code):
 
 # ───────────────────────── 심층 추출 한 번에: 캐파 · 비즈니스 심층 · 주주환원 목표 ─────────────────────────
 # 같은 IR 자료를 세 번 읽던 것을 한 번의 AI 호출로 합침(한도·시간 절약). 비즈니스 심층은 분기마다 크게 안 바뀌어 종목별 90일 저장
+BIZ_VER = 2   # 2: 밸류체인 위 회사별 담당 단계 지도(vc_map) 추가
 def deep_extract(card, name, code, pdfs, pnames):
     import hashlib
     idx = [i for i, (nm, _) in enumerate(pnames) if "결산단신" not in nm and "질의응답" not in nm and "수정 공시" not in nm][:2]
@@ -475,7 +476,7 @@ def deep_extract(card, name, code, pdfs, pnames):
     try: cache = json.load(open(cpath))
     except Exception: cache = {}
     old = cache.get(code) or {}
-    reuse_biz = bool(old.get("biz")) and time.time() - old.get("t", 0) < 90 * 86400
+    reuse_biz = bool(old.get("biz")) and old.get("v", 1) >= BIZ_VER and time.time() - old.get("t", 0) < 90 * 86400   # 형식이 바뀌면(BIZ_VER) 새로 정리
     docs = "; ".join(f"{k}. {pnames[i][0]}" for k, i in enumerate(idx, 1)) or "없음"
     parts = [CAPA_PROMPT.split("출력:")[0].format(name=name, code=code, docs=docs).strip(),
              "- 주주환원 목표: " + POLICY_PROMPT.split("출력:")[0].split("\n- ", 1)[1].format(docs=docs, name=name, code=code).strip()]
@@ -483,7 +484,7 @@ def deep_extract(card, name, code, pdfs, pnames):
               '"policy": [{"metric": "배당성향|총주주환원율|DOE|누진배당|자사주|기타", "target": "", "period": "", "src": ""}]']
     if not reuse_biz:
         parts.append("- 비즈니스 심층(아래 규칙):\n" + BIZ_PROMPT.split("규칙", 1)[1].split("출력:")[0].strip().replace("{{", "{").replace("}}", "}"))
-        schema.append('"biz": {"model": {"flow": [""], "mix": [{"name": "", "share": 0}], "mix_src": "", "mix_period": ""}, "value_chain": [], "competitors": [], "position": "", "strengths": [], "weaknesses": [], "leading": []}')
+        schema.append('"biz": {"model": {"flow": [""], "mix": [{"name": "", "share": 0}], "mix_src": "", "mix_period": ""}, "value_chain": [], "vc_map": {"headline": "", "caption": "", "stages": [], "cross": [], "players": []}, "competitors": [], "position": "", "strengths": [], "weaknesses": [], "leading": []}')
     prompt = (f"너는 일본 중소형주를 깊게 보는 한국 바이사이드 애널리스트다. {name}({code}, 업종 {E.SECTOR_KO.get(card['sector'], card['sector'])})의 첨부 IR 자료(첨부 목록: {docs})와 "
               "아래 회사 개요·결산단신 본문을 읽고 세 가지를 한 번에 한국어 JSON으로 정리하라. 자료에 없는 숫자는 쓰지 말 것. 일본어를 그대로 쓰지 말 것.\n\n"
               + "\n\n".join(parts) + "\n\n출력(JSON 하나): {" + ", ".join(schema) + "}\n\n"
@@ -492,7 +493,7 @@ def deep_extract(card, name, code, pdfs, pnames):
     if isinstance(out, list): out = out[0] if out and isinstance(out[0], dict) else {}
     if reuse_biz: out["biz"] = old["biz"]; out["_biz_cached"] = old.get("t")
     elif out.get("biz"):
-        cache[code] = {"t": time.time(), "biz": out["biz"]}
+        cache[code] = {"t": time.time(), "biz": out["biz"], "v": BIZ_VER}
         try:
             cache = {k: v for k, v in cache.items() if time.time() - v.get("t", 0) < 120 * 86400}
             os.makedirs(E.STATE_DIR, exist_ok=True); json.dump(cache, open(cpath, "w"), ensure_ascii=False)
@@ -503,7 +504,7 @@ def deep_extract(card, name, code, pdfs, pnames):
         except Exception: c["doc"] = idx[0] + 1
     return out
 
-# ───────────────────────── 주주환원: 배당성향 · 총주주환원율 ─────────────────────────
+# ───────────────────────── 주주환원: 회사 목표 · 주당배당·배당성향 ─────────────────────────
 POLICY_PROMPT = """첨부 IR 자료(첨부 목록: {docs})와 아래 결산단신 본문에서 {name}({code})이 밝힌 주주환원 정책·목표만 찾아 한국어 JSON으로.
 - 찾을 것: 배당성향 목표, 총주주환원율(총환원성향) 목표, DOE(자기자본배당률) 목표, 누진배당(감배하지 않음) 방침, 자사주 매입 방침·규모, 적용 기간(예: 중기계획 기간 FY3/27~FY3/31).
 - 자료에 적힌 것만. 추측 금지. 없으면 {{"items": []}}. 일본어를 그대로 쓰지 말 것.
@@ -522,33 +523,44 @@ def ret_policy(card, pdfs, pnames):
     if isinstance(out, list): out = out[0] if out and isinstance(out[0], dict) else {}
     return [x for x in (out.get("items") or []) if isinstance(x, dict) and x.get("target")]
 
-def ret_hist_chart(plt, rows):
+def ret_hist_chart(plt, rows, fc=None, progressive=False):
+    """주당배당(막대, 분할 조정) + 배당성향(선) 10년 + 이번 회계연도 회사 예상(빗금 막대)"""
     import numpy as np
-    rows = [r for r in rows if r.get("div") is not None or r.get("buy") is not None or r.get("payout") is not None]
+    rows = [r for r in rows if r.get("dps") is not None or r.get("payout") is not None]
     if len(rows) < 3: return ""
+    lab = [f"FY{int(r['fy'][5:7])}/{r['fy'][2:4]}" for r in rows]
+    dps = [r.get("dps") for r in rows]; pay = [r.get("payout") for r in rows]
+    fc_on = bool(fc and fc.get("dps") is not None and fc.get("lab") and fc["lab"] not in lab)
+    if fc_on: lab.append(fc["lab"] + "\n(예상)"); dps.append(fc["dps"]); pay.append(fc.get("payout"))
     fig, ax = plt.subplots(figsize=(8, 3.8))
-    x = np.arange(len(rows)); lab = [f"FY{int(r['fy'][5:7])}/{r['fy'][2:4]}" for r in rows]
-    dv = [(r.get("div") or 0) / 100 for r in rows]; bb = [(r.get("buy") or 0) / 100 for r in rows]
-    ax.bar(x, dv, 0.6, color="#9dbbea", label="배당금 지급")
-    ax.bar(x, bb, 0.6, bottom=dv, color=E.BLUE, label="자사주 매입")
-    ax.set_ylabel("억 엔", fontsize=9); ax.set_xticks(x); ax.set_xticklabels(lab, fontsize=8)
+    x = np.arange(len(lab))
+    cols = ["#9dbbea"] * len(lab)
+    if fc_on: cols[-1] = "#ffffff"
+    bars = ax.bar(x, [d or 0 for d in dps], 0.6, color=cols, edgecolor=[E.BLUE if (fc_on and i == len(lab) - 1) else "#9dbbea" for i in range(len(lab))],
+                  hatch=None, label="주당배당(엔, 분할 조정)")
+    if fc_on: bars[-1].set_hatch("///")
+    for i, d in enumerate(dps):
+        if d is not None: ax.annotate(f"{d:,.0f}" if d >= 10 else f"{d:,.1f}", (i, d), textcoords="offset points", xytext=(0, 3), ha="center", fontsize=7.5, color="#374151")
+    ax.set_ylabel("엔", fontsize=9); ax.set_xticks(x); ax.set_xticklabels(lab, fontsize=8)
     ax2 = ax.twinx()
-    pay = [r.get("payout") for r in rows]; tot = [r.get("total") for r in rows]
-    xp = [i for i, v in enumerate(pay) if v is not None]; xt = [i for i, v in enumerate(tot) if v is not None]
-    ax2.plot(xp, [pay[i] for i in xp], color=E.ORANGE, marker="o", ms=4, label="배당성향(%)")
-    ax2.plot(xt, [min(tot[i], 300) for i in xt], color="#2e7d32", marker="s", ms=4, ls="--", label="총주주환원율(%)")
-    for i in xt[-1:]: ax2.annotate(f"{tot[i]:.0f}%", (i, min(tot[i], 300)), textcoords="offset points", xytext=(0, 6), ha="center", fontsize=8, color="#2e7d32")
-    for i in xp[-1:]: ax2.annotate(f"{pay[i]:.0f}%", (i, pay[i]), textcoords="offset points", xytext=(0, -12), ha="center", fontsize=8, color=E.ORANGE)
+    xp = [i for i, v in enumerate(pay) if v is not None]
+    if xp:
+        ax2.plot(xp, [min(pay[i], 200) for i in xp], color=E.ORANGE, marker="o", ms=4, label="배당성향(%)")
+        i = xp[-1]; ax2.annotate(f"{pay[i]:.0f}%", (i, min(pay[i], 200)), textcoords="offset points", xytext=(0, 7), ha="center", fontsize=8, color=E.ORANGE)
+        top = max(min(max(pay[i] for i in xp), 200), 20)
+        ax2.set_ylim(-top * 1.15, top * 1.25)   # 배당성향 선은 위쪽, 주당배당 막대는 아래쪽에 → 겹치지 않게
+        ax2.set_yticks([v for v in ax2.get_yticks() if 0 <= v <= top * 1.2])
     ax2.set_ylabel("%", fontsize=9)
     h1, l1 = ax.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
-    ax.legend(h1 + h2, l1 + l2, fontsize=8, frameon=False, loc="upper left", ncol=4)
-    ax.set_title("주주환원 추이 — 배당·자사주 매입(억 엔)과 배당성향·총주주환원율", loc="left", fontsize=12, fontweight="bold")
+    ax.legend(h1 + h2, l1 + l2, fontsize=8, frameon=False, loc="upper left", ncol=3, bbox_to_anchor=(0, 1.02))
+    ax.set_title("주당 배당금과 배당성향 추이" + (" — 누진배당 방침" if progressive else ""), loc="left", fontsize=12, fontweight="bold")
     for sp in ("top",): ax.spines[sp].set_visible(False); ax2.spines[sp].set_visible(False)
-    lo, hi = ax.get_ylim(); ax.set_ylim(0, hi * 1.25)
+    lo, hi = ax.get_ylim(); ax.set_ylim(0, hi * 1.9)
     fig.tight_layout()
     return f'<figure><img src="{b64png(fig)}"></figure>'
 
-def ret_section(card, kb, att, plt=None, policy=None):
+def ret_section(card, kb, att, plt=None, policy=None, div_html=""):
+    """주주환원: 회사 목표 → 주당배당·배당성향 10년(EDINET)+이번 회계연도 예상 → IR 자료의 배당 자료 → 이번 회계연도 표"""
     ret = card.get("ret")
     if not ret:   # 예전 카드: 결산단신 XBRL 현금흐름표로 다시 계산
         r = dict(card["r"])
@@ -563,45 +575,60 @@ def ret_section(card, kb, att, plt=None, policy=None):
         rows.append(f"<tr><td>배당성향(회사 예상, {fy_lab(ret.get('fy_end'))})</td><td><b>{ret['payout_fc']:.1f}%</b></td><td>주당배당 {fmt(ret.get('dps_fc'))}엔 ÷ 주당순이익 {fmt(ret.get('eps_fc'))}엔</td></tr>")
     if ret.get("payout_last") is not None:
         rows.append(f"<tr><td>배당성향(최근 실적, {fy_lab(ret.get('last_end'))})</td><td>{ret['payout_last']:.1f}%</td><td>주당배당 {fmt(ret.get('dps_last'))}엔</td></tr>")
-    if ret.get("total_fc") is not None:
-        rows.append(f"<tr><td>총주주환원율(회사 예상 기준)</td><td><b>{ret['total_fc']:.1f}%</b></td><td>(예상 배당 총액 {E.oku(ret.get('div_total_fc'))} + 이번 회계연도 자사주 매입 결정 {E.oku(ret.get('buy_fy'))}) ÷ 예상 순이익</td></tr>")
-    if ret.get("ytd_ratio") is not None:
-        rows.append(f"<tr><td>올해 누적 실제 환원율</td><td>{ret['ytd_ratio']:.1f}%</td><td>(배당금 지급 {E.oku(ret.get('ytd_div'))} + 자사주 취득 {E.oku(ret.get('ytd_buy'))}) ÷ 누적 순이익 {E.oku(ret.get('ytd_ni'))}</td></tr>")
+    if ret.get("ytd_div") is not None or ret.get("ytd_buy") is not None:
+        rows.append(f"<tr><td>올해 누적 지급액</td><td>배당 {E.oku(ret.get('ytd_div'))}</td><td>자사주 취득 {E.oku(ret.get('ytd_buy'))} (결산단신 현금흐름표)</td></tr>")
     buys = ret.get("buys") or []
     if buys:
         rows.append("<tr><td>자사주 매입 결정(최근 1년)</td><td>" + f"{len(buys)}건</td><td>" + " · ".join(
             f"{x['d'][2:4]}/{x['d'][4:6]}/{x['d'][6:]} {('상한 ' + E.oku(x['amt'])) if x.get('amt') else '(금액 확인 못 함)'}" for x in buys) + "</td></tr>")
     # 회사가 밝힌 주주환원 목표(가이던스)
-    pol_html = ""
+    pol_html, progressive = "", False
     try:
         pol = [x for x in (policy or []) if isinstance(x, dict) and x.get("target")]
+        progressive = any("누진" in f"{x.get('metric')}{x.get('target')}" for x in pol) or "누진" in (div_html or "")
         if pol:
             pol_html = ("<div class=card><b>회사가 밝힌 주주환원 목표</b><ul>" + "".join(
                 f"<li><b>{esc(x.get('metric'))}</b> {esc(x.get('target'))}" + (f" · {esc(x['period'])}" if x.get("period") else "")
                 + (f" <small class=muted>({esc(x.get('src'))})</small>" if x.get("src") else "") + "</li>" for x in pol) + "</ul></div>")
         else:
-            pol_html = "<p class=muted>회사가 수치로 밝힌 주주환원 목표(배당성향·총환원율·DOE 등)는 이번 자료에서 찾지 못했습니다.</p>"
+            pol_html = "<p class=muted>회사가 수치로 밝힌 주주환원 목표(배당성향·DOE·누진배당 등)는 이번 자료에서 찾지 못했습니다.</p>"
     except Exception as e:
         E.log("ret policy error", e)
-    # 10년 추이(EDINET 유가증권보고서)
+    # 10년 추이(EDINET 유가증권보고서) + 이번 회계연도 회사 예상
     hist_html = ""
     try:
         import earn_edinet
         hist, note = earn_edinet.history(card["code"], card.get("fem") or 3)
+        E.log("주주환원 10년", card["code"], f"{len(hist)}개년", note or "")
         if hist:
-            trs = "".join(f"<tr><td>FY{int(h['fy'][5:7])}/{h['fy'][2:4]}</td><td>{fmt(h.get('dps'))}엔{f"<br><small>(당시 {fmt(h.get('dps_raw'))}엔, 1:{h['split']:g} 분할 조정)</small>" if (h.get('split') or 1) > 1 else ""}</td><td>{E.oku(h.get('div'))}</td><td>{E.oku(h.get('buy'))}</td>"
-                          f"<td>{E.oku(h.get('ni'))}</td><td>{fmt(h.get('payout'))}%</td><td><b>{fmt(h.get('total'))}%</b></td></tr>" for h in hist)
-            hist_html = ((ret_hist_chart(plt, hist) if plt else "") +
-                         "<div class=scroll><table><tr><th>회계연도</th><th>주당배당</th><th>배당금 지급</th><th>자사주 매입</th><th>순이익</th><th>배당성향</th><th>총주주환원율</th></tr>"
-                         + trs + "</table></div><p class=muted>출처: EDINET 유가증권보고서(주요 경영지표 추이·현금흐름표). 배당금·자사주는 그해 실제 지급액(현금 기준), "
-                         "총주주환원율 = (배당금 지급 + 자사주 매입) ÷ 지배주주 순이익. 주당배당은 발행주식수 변화로 주식분할을 찾아 지금 기준으로 조정(조정한 해는 당시 숫자 병기)."
+            fc = {"lab": fy_lab(ret.get("fy_end")), "dps": ret.get("dps_fc"), "payout": ret.get("payout_fc")} if ret.get("dps_fc") is not None else None
+            ds = [h.get("dps") for h in hist if h.get("dps") is not None]
+            cut = [hist[i]["fy"] for i in range(1, len(hist)) if hist[i].get("dps") is not None and hist[i - 1].get("dps") is not None and hist[i]["dps"] < hist[i - 1]["dps"] * 0.995]
+            summ = ""
+            if len(ds) >= 3:
+                n = len(ds) - 1
+                cagr = ((ds[-1] / ds[0]) ** (1 / n) - 1) * 100 if ds[0] and ds[0] > 0 else None
+                summ = (f"<p><b>{len(ds)}개년 주당배당 {fmt(ds[0])}엔 → {fmt(ds[-1])}엔</b>" + (f"(연평균 {cagr:+.1f}%)" if cagr is not None else "")
+                        + (" · 이 기간 감배 없음" if not cut else " · 감배 " + ", ".join(f"FY{int(c[5:7])}/{c[2:4]}" for c in cut))
+                        + (f" · 이번 회계연도 회사 예상 {fmt(fc['dps'])}엔" if fc else "") + "</p>")
+            trs = "".join(f"<tr><td>FY{int(h['fy'][5:7])}/{h['fy'][2:4]}</td><td><b>{fmt(h.get('dps'))}엔</b>{f"<br><small>(당시 {fmt(h.get('dps_raw'))}엔, 1:{h['split']:g} 분할 조정)</small>" if (h.get('split') or 1) > 1 else ""}</td>"
+                          f"<td>{fmt(h.get('payout'))}%</td><td>{E.oku(h.get('div'))}</td><td>{E.oku(h.get('buy'))}</td><td>{E.oku(h.get('ni'))}</td></tr>" for h in hist)
+            if fc:
+                trs += f"<tr class=cur><td>{fc['lab']} 회사 예상</td><td><b>{fmt(fc['dps'])}엔</b></td><td>{fmt(fc.get('payout'))}%</td><td></td><td></td><td></td></tr>"
+            hist_html = (summ + (ret_hist_chart(plt, hist, fc, progressive) if plt else "") +
+                         "<div class=scroll><table><tr><th>회계연도</th><th>주당배당</th><th>배당성향</th><th>배당금 지급</th><th>자사주 매입</th><th>순이익</th></tr>"
+                         + trs + "</table></div><p class=muted>출처: EDINET 유가증권보고서(주요 경영지표 추이·현금흐름표), 이번 회계연도 예상은 결산단신. 배당금·자사주는 그해 실제 지급액(현금 기준). "
+                         "주당배당은 발행주식수 변화로 주식분할을 찾아 지금 기준으로 조정(조정한 해는 당시 숫자 병기)."
                          + (f" {esc(note)}" if note else "") + "</p>")
         elif note:
             hist_html = f"<p class=muted>10년 추이: {esc(note)}</p>"
     except Exception as e:
         E.log("ret history error", e)
-    if not rows and not hist_html and not pol_html: return ""
-    return ("<h2>주주환원</h2>" + pol_html + hist_html + "<h3>이번 회계연도</h3><p class=muted>배당성향 = 주당배당 ÷ 주당순이익(가부탄 연간 실적·예상, 분할 반영) · 총주주환원율 = (배당 + 자사주 매입) ÷ 순이익 · "
+    if div_html:
+        div_html = "<h3>회사 IR 자료의 배당 자료</h3>" + div_html
+    if not rows and not hist_html and not pol_html and not div_html: return ""
+    return ("<h2>주주환원</h2>" + pol_html + "<h3>주당 배당금·배당성향 추이</h3>" + (hist_html or "<p class=muted>10년 추이 자료 없음</p>") + div_html
+            + "<h3>이번 회계연도</h3><p class=muted>배당성향 = 주당배당 ÷ 주당순이익(가부탄 연간 실적·예상, 분할 반영) · "
             "올해 누적은 결산단신 현금흐름표의 실제 지급액 · 자사주 매입 금액은 결정 공시의 취득 총액 상한(실제 매입액과 다를 수 있음)</p>"
             + ("<div class=scroll><table><tr><th>항목</th><th>값</th><th>계산</th></tr>" + "".join(rows) + "</table></div>" if rows else ""))
 
@@ -614,15 +641,68 @@ BIZ_PROMPT = """너는 일본 중소형주를 깊게 보는 한국 바이사이�
 - model.flow: 돈이 도는 구조를 화살표 한 줄씩 3~5줄(예: "원료 조달 → 정제·가공 → 반도체 웨이퍼 연마재로 판매 → 고객: 웨이퍼·소자 업체").
 - model.mix: 사업·제품·용도별 매출 비중(자료에 있을 때만, share는 % 숫자).
 - value_chain: 이 회사가 속한 산업의 단계 4~6개. 각 {{"stage": 단계, "what": 하는 일, "players": [대표 기업 2~4개], "role": "이 회사의 위치(해당 없으면 빈 문자열)", "src": ""}}.
+- vc_map: 밸류체인 위에 '회사별로 어느 단계를 하는지'를 겹쳐 그리는 지도(경쟁 구도를 한 장에). 
+  {{"headline": "이 회사가 밸류체인의 어디에 집중하고 무엇을 안 하는지 한 문장(예: \"A사는 '전략 → IT 구상'의 앞단에 집중 — 구축·운영은 하지 않음\")",
+   "caption": "지도 설명 한 줄(예: 기업 변혁 프로젝트의 일 흐름과 회사별 담당 단계)",
+   "stages": [{{"name": "value_chain 단계 이름(짧게)", "sub": "8자 안팎 부연"}}],
+   "cross": [{{"name": "여러 단계에 걸친 수요·테마 이름(예: AI 도입)", "from": 0, "to": 4, "text": "예: 전 단계에 걸친 수요"}}],
+   "players": [{{"name": "회사명", "country": "일본|미국|한국|중국|유럽 등", "spans": [{{"from": 시작 단계 번호(0부터), "to": 끝 단계 번호(포함), "label": "그 구간의 사업 이름(예: 컨설팅 100%(단일 부문))", "main": true면 주력·본업, false면 일부·부수 사업}}], "src": ""}}]}}
+  stages는 value_chain과 같은 순서·개수. players는 첫 번째가 이 회사, 이어서 경쟁·비교 기업 5~8개를 나라별로 묶어 정렬(일본 → 미국 → 한국 → 기타).
+  한 회사가 떨어진 두 구간을 하면 spans를 2개로. cross는 없으면 빈 배열. 확실하지 않은 기업·구간은 넣지 말 것.
 - competitors: 주요 경쟁사 3~6개. {{"name": "", "code": "일본 상장사면 4자리, 아니면 null", "country": "", "overlap": "겹치는 제품·시장", "edge": "이 회사 대비 강점·약점 한 줄", "src": ""}}.
 - position: 시장 내 위치·점유율·진입장벽(자료 근거 우선) 2~3문장. strengths/weaknesses: 각 2~4개 짧은 문장(src 포함 객체 {{"t": "", "src": ""}}).
 - leading: 실적을 앞서 보여주는 선행지표 2~3개 {{"name": "", "why": "왜 실적에 앞서는지", "where": "어디서 확인하는지(월간 공시·업계 통계 등)"}}.
-출력: {{"model": {{"flow": [""], "mix": [{{"name": "", "share": 0}}], "mix_src": "", "mix_period": ""}}, "value_chain": [], "competitors": [],
+출력: {{"model": {{"flow": [""], "mix": [{{"name": "", "share": 0}}], "mix_src": "", "mix_period": ""}}, "value_chain": [], "vc_map": {{}}, "competitors": [],
  "position": "", "strengths": [], "weaknesses": [], "leading": []}}
 
 회사 개요(일본어): {profile}
 결산단신 본문(일부): {qual}
 """
+
+def vc_map_html(m, name, code):
+    """밸류체인 지도: 위에 단계 상자(화살표), 그 아래 회사별로 담당 단계 구간을 막대로(주력=붉은 테두리, 일부=회색). 나라가 바뀌면 점선"""
+    if not isinstance(m, dict): return ""
+    st = [s for s in (m.get("stages") or []) if isinstance(s, dict) and s.get("name")][:7]
+    n = len(st)
+    if n < 3: return ""
+    def rng(x):
+        try:
+            a_, b_ = int(x.get("from")), int(x.get("to"))
+            a_, b_ = max(0, min(a_, n - 1)), max(0, min(b_, n - 1))
+            return (min(a_, b_), max(a_, b_))
+        except Exception: return None
+    pl = []
+    for p_ in (m.get("players") or [])[:10]:
+        if not isinstance(p_, dict) or not p_.get("name"): continue
+        sp = [(rng(s), s) for s in (p_.get("spans") or []) if isinstance(s, dict)]
+        sp = [(r_, s) for r_, s in sp if r_]
+        if sp: pl.append((p_, sp))
+    if len(pl) < 2: return ""
+    cols = f"grid-template-columns:118px repeat({n},minmax(92px,1fr))"
+    G = [f"<div class=vmg style='{cols}'>", "<div class=vml>일의 흐름</div>"]
+    for i, s in enumerate(st):
+        G.append(f"<div class='vst{' la' if i == n - 1 else ''}' style='grid-column:{i + 2}'><b>{esc(s['name'])}</b>"
+                 + (f"<small>{esc(s.get('sub'))}</small>" if s.get("sub") else "") + "</div>")
+    for c in (m.get("cross") or [])[:2]:
+        r_ = rng(c) if isinstance(c, dict) else None
+        if not r_ or not c.get("name"): continue
+        G.append(f"<div class=vml>{esc(c['name'])}</div><div class=vcx style='grid-column:{r_[0] + 2}/{r_[1] + 3}'>{esc(c.get('text') or '')}</div>")
+    prev = None
+    for k, (p_, sp) in enumerate(pl):
+        ctry = str(p_.get("country") or "")
+        if prev is not None and ctry != prev: G.append("<div class=vsep></div>")
+        prev = ctry
+        me = k == 0
+        G.append(f"<div class='vml vco{' me' if me else ''}'><b>{esc(p_['name'])}</b><small>{esc(ctry)}"
+                 + (" · 일반 지식" if str(p_.get("src", "")).startswith("일반") else "") + "</small></div>")
+        for (a_, b_), s in sorted(sp, key=lambda z: z[0][0]):
+            main = s.get("main") is not False and str(s.get("main")).lower() != "false"
+            G.append(f"<div class='vbar{' mn' if main else ' sub'}{' me' if me else ''}' style='grid-column:{a_ + 2}/{b_ + 3}'>{esc(s.get('label') or '')}</div>")
+        G.append("<div class=vrowend></div>")
+    G.append("</div>")
+    head = (f"<p class=vmh><b>{esc(m.get('headline'))}</b></p>" if m.get("headline") else "") + (f"<p class=muted>{esc(m.get('caption'))}</p>" if m.get("caption") else "")
+    return (head + "<div class=scroll>" + "".join(G) + "</div>"
+            "<p class=muted>붉은 테두리 = 주력·본업 구간 · 회색 = 일부·부수 사업 · 맨 위 굵은 이름이 이 회사 · 점선 = 나라 구분 · Gemini 정리(자료+업계 일반 지식, 검증 필요)</p>")
 
 def biz_section(plt, card, name, code, b, cached_t=None):
     """심층 추출 결과(b) → HTML 또는 """""
@@ -651,8 +731,12 @@ def biz_section(plt, card, name, code, b, cached_t=None):
             fig.tight_layout(); H.append(f'<figure><img src="{b64png(fig)}"></figure>')
         except Exception as e: E.log("mix chart error", e)
     vc = [x for x in (b.get("value_chain") or []) if isinstance(x, dict) and x.get("stage")]
+    vmap = ""
+    try: vmap = vc_map_html(b.get("vc_map"), name, code)
+    except Exception as e: E.log("vc map error", e)
+    if vmap: H.append("<h3>밸류체인과 회사별 담당 단계</h3>" + vmap)
     if vc:
-        # 도식: 단계 상자를 화살표로 이어 붙이고, 이 회사가 있는 단계는 파란 테두리·'여기' 표시(휴대폰에서는 세로로 쌓임)
+        # 단계별 설명: 단계 상자를 화살표로 이어 붙이고, 이 회사가 있는 단계는 파란 테두리·'여기' 표시(휴대폰에서는 세로로 쌓임)
         boxes = []
         for k, x in enumerate(vc[:6], 1):
             me = bool(str(x.get("role") or "").strip())
@@ -660,8 +744,9 @@ def biz_section(plt, card, name, code, b, cached_t=None):
                          f"<div class=vw>{esc(x.get('what'))}</div>"
                          + (f"<div class=vp>{esc(' · '.join(map(str, (x.get('players') or [])[:4])))}</div>" if x.get("players") else "")
                          + (f"<div class=vr>📍 {esc(code)} 여기: {esc(x.get('role'))}{tag(x)}</div>" if me else "") + "</div>")
-        H.append("<h3>밸류체인</h3><div class=vchain>" + "<div class=varr>→</div>".join(boxes) + "</div>"
-                 "<p class=muted>왼쪽(상류)에서 오른쪽(하류) 순서 · 파란 상자 = 이 회사가 있는 단계 · 상자 안 회사는 각 단계의 대표 기업</p>")
+        body = ("<div class=vchain>" + "<div class=varr>→</div>".join(boxes) + "</div>"
+                "<p class=muted>왼쪽(상류)에서 오른쪽(하류) 순서 · 파란 상자 = 이 회사가 있는 단계 · 상자 안 회사는 각 단계의 대표 기업</p>")
+        H.append(("<details><summary><b>단계별 설명·대표 기업</b></summary>" + body + "</details>") if vmap else ("<h3>밸류체인</h3>" + body))
     comp = [x for x in (b.get("competitors") or []) if isinstance(x, dict) and x.get("name")][:6]
     if comp:
         rows = []
@@ -694,6 +779,7 @@ def biz_section(plt, card, name, code, b, cached_t=None):
     return "".join(H) if len(H) > 2 else ""
 
 # ───────────────────────── 캐파(생산능력)·증설 자료 따로 찾기 ─────────────────────────
+DIV_RE = re.compile(r"배당|주주환원|자사주|DOE|환원")
 CAPA_RE = re.compile(r"캐파|생산능력|생산 능력|증설|설비 능력|가동률|라인 증설|공장 신설|생산 체제")
 CAPA_PROMPT = """첨부 PDF는 일본 상장사 {name}({code})의 IR 자료다(첨부 목록: {docs}). 생산능력(캐파)·증설과 관련된 숫자만 찾아 한국어 JSON으로.
 - 찾을 것: 연도·시점별 생산능력(톤/년, 개/월, 배수, 지수 등)과 그 추이, 증설·신규 공장의 완공·가동 시기와 투자액, 가동률.
@@ -928,16 +1014,13 @@ def build(card):
 
     try: guide_html = guide_section(plt, card, kb)
     except Exception as e: E.log("guide section error", e); guide_html = ""
-    try: ret_html = ret_section(card, kb, att, plt, deep.get("policy"))
-    except Exception as e: E.log("ret section error", e); ret_html = ""
-    try: bizdeep_html = biz_section(plt, card, name, code, deep.get("biz"), deep.get("_biz_cached"))
-    except Exception as e: E.log("biz section error", e); bizdeep_html = ""
-    # 6) IR 자료에서 고른 핵심 데이터
-    ins_html = ""
+    # IR 자료에서 고른 배당·주주환원 자료(예: 주당 배당금 추이·누진배당)는 '핵심 데이터'가 아니라 주주환원 섹션에 합쳐 보여줌
+    all_ins = [x for x in (ai.get("insights") or []) if isinstance(x, dict) and x.get("title")][:6]
+    div_ins = [x for x in all_ins if DIV_RE.search(x.get("title", "")) and not CAPA_RE.search(x.get("title", ""))]
+    other_ins = [x for x in all_ins if x not in div_ins]
     base_pdf = mat_pdf or tan_pdf
     used_refs = []
-    for it in (ai.get("insights") or [])[:6]:
-        if not isinstance(it, dict) or not it.get("title"): continue
+    def ins_card(it):
         img = insight_chart(plt, it.get("chart") or {}, it["title"])
         try: di = int(it.get("doc") or 0) - 1
         except Exception: di = -1
@@ -947,10 +1030,22 @@ def build(card):
         if ref:
             tag = f' <small class=muted>({esc(ref[2])} 발표 「<a href="{esc(ref[0])}">{esc(ref[1][:30])}</a>」 기준)</small>'
             if ref not in used_refs: used_refs.append(ref)
-        ins_html += (f"<div class=card><h3>{esc(it['title'])}{tag}</h3>" + (f"<p><b>{esc(it.get('takeaway'))}</b></p>" if it.get("takeaway") else "")
-                     + (f"<p class=muted>왜 중요한가: {esc(it.get('why'))}</p>" if it.get("why") else "")
-                     + (f'<img src="{img}">' if img else "")
-                     + (f"<details><summary>원문 {esc(it.get('page'))}쪽 보기</summary><img src=\"{pg}\"></details>" if pg else "") + "</div>")
+        return (f"<div class=card><h3>{esc(it['title'])}{tag}</h3>" + (f"<p><b>{esc(it.get('takeaway'))}</b></p>" if it.get("takeaway") else "")
+                + (f"<p class=muted>왜 중요한가: {esc(it.get('why'))}</p>" if it.get("why") else "")
+                + (f'<img src="{img}">' if img else "")
+                + (f"<details><summary>원문 {esc(it.get('page'))}쪽 보기</summary><img src=\"{pg}\"></details>" if pg else "") + "</div>")
+    div_html = ""
+    for it in div_ins:
+        try: div_html += ins_card(it)
+        except Exception as e: E.log("div insight error", e)
+    try: ret_html = ret_section(card, kb, att, plt, deep.get("policy"), div_html)
+    except Exception as e: E.log("ret section error", e); ret_html = ""
+    try: bizdeep_html = biz_section(plt, card, name, code, deep.get("biz"), deep.get("_biz_cached"))
+    except Exception as e: E.log("biz section error", e); bizdeep_html = ""
+    # 6) IR 자료에서 고른 핵심 데이터
+    ins_html = ""
+    for it in other_ins:
+        ins_html += ins_card(it)
     if ins_html:
         ins_html = (f"<h2>IR 자료에서 고른 핵심 데이터</h2><p class=muted>출처: {esc(src_name)}({esc(mat_src if mat_pdf else 'TDnet')}) — Gemini가 의미 있는 표를 골라 숫자를 뽑고, "
                     "한국어 차트로 다시 그렸습니다. 숫자는 원문 쪽 이미지로 확인하세요."
@@ -1140,6 +1235,13 @@ details.sec{{padding:0 12px 8px}} details.sec>summary{{list-style:none;padding:1
 .vchain{{display:flex;align-items:stretch;gap:6px;overflow-x:auto;padding:4px 0 10px}} .varr{{align-self:center;color:#2f6fd6;font-size:20px;font-weight:700}}
 .vc{{flex:0 0 150px;background:#fff;border:1px solid #dde3ec;border-radius:10px;padding:8px 10px;font-size:12.5px;box-shadow:0 1px 2px rgba(0,0,0,.05)}}
 .vc.me{{border:2px solid #2f6fd6;background:#eef4ff}} .vn{{font-size:11px;color:#6b7280}} .vs{{font-weight:700;font-size:14px;margin:2px 0 4px}} .vw{{color:#374151}} .vp{{color:#6b7280;margin-top:6px;font-size:12px}} .vr{{margin-top:6px;color:#1d4ed8;font-weight:600}}
+.vmh{{margin:4px 0 0;font-size:15px}} .vmg{{display:grid;column-gap:18px;row-gap:8px;align-items:center;min-width:620px;padding:6px 2px}}
+.vml{{grid-column:1;font-size:12px;color:#6b7280}} .vml.vco{{color:#1f2328;font-size:13px;line-height:1.2}} .vml.vco small{{display:block;color:#6b7280;font-size:11px}} .vml.vco.me b{{color:#b33a2e}}
+.vst{{position:relative;background:#fff;border:1px solid #d6dbe3;border-radius:8px;padding:6px 4px;text-align:center;font-size:13px;line-height:1.25}} .vst small{{display:block;color:#6b7280;font-size:11px;font-weight:400}}
+.vst:after{{content:"➜";position:absolute;right:-16px;top:50%;transform:translateY(-50%);color:#6b7280;font-size:13px}} .vst.la:after{{content:none}}
+.vcx{{background:#e8eef5;border:1px solid #d6dbe3;border-radius:8px;padding:6px;text-align:center;font-size:12.5px;font-weight:600}}
+.vbar{{border-radius:8px;padding:7px 6px;text-align:center;font-size:12.5px;font-weight:600;line-height:1.25}} .vbar.mn{{background:#fbe4de;border:2px solid #b33a2e}} .vbar.sub{{background:#e8eef5;border:1px solid #9aa4b2;font-weight:500}}
+.vbar.me{{box-shadow:0 0 0 2px #fde68a}} .vsep{{grid-column:1/-1;border-top:1px dashed #c3c9d2;height:0}} .vrowend{{display:none}}
 @media (max-width:600px){{.vchain{{flex-direction:column}} .vc{{flex:1 1 auto}} .varr{{transform:rotate(90deg);align-self:center}}}} .tag{{font-size:11px;background:#fde68a;color:#78350f;border-radius:4px;padding:0 4px;margin-left:4px}}
 </style></head><body><main>
 <h1>{esc(name)} <small>({code} JP · {esc(E.SECTOR_KO.get(card['sector'], card['sector']))})</small></h1>
