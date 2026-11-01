@@ -634,7 +634,11 @@ def biz_section(plt, card, name, code, b, cached_t=None):
     m = b.get("model") or {}
     flow = [str(x) for x in (m.get("flow") or []) if str(x).strip()][:5]
     if flow:
-        H.append("<h3>돈이 도는 구조</h3><div class=card>" + "".join(f"<div class=flow>{esc(x)}</div>" for x in flow) + "</div>")
+        def chain(line):   # "A → B → C" 한 줄을 상자 사슬로
+            steps = [t.strip() for t in re.split(r"\s*(?:→|->|⇒)\s*", line) if t.strip()]
+            if len(steps) < 2: return f"<div class=flow>{esc(line)}</div>"
+            return "<div class=fchain>" + "<span class=farr>→</span>".join(f"<span class=fstep>{esc(t)}</span>" for t in steps) + "</div>"
+        H.append("<h3>돈이 도는 구조</h3><div class=card>" + "".join(chain(x) for x in flow) + "</div>")
     mix = [x for x in (m.get("mix") or []) if isinstance(x, dict) and num(x.get("share"))]
     if len(mix) >= 2:
         try:
@@ -648,10 +652,16 @@ def biz_section(plt, card, name, code, b, cached_t=None):
         except Exception as e: E.log("mix chart error", e)
     vc = [x for x in (b.get("value_chain") or []) if isinstance(x, dict) and x.get("stage")]
     if vc:
-        H.append("<h3>밸류체인</h3><div class=scroll><table><tr><th>단계</th><th>하는 일</th><th>대표 기업</th><th>이 회사의 위치</th></tr>" +
-                 "".join(f"<tr{' class=cur' if x.get('role') else ''}><td>{esc(x['stage'])}</td><td style='white-space:normal'>{esc(x.get('what'))}</td>"
-                         f"<td style='white-space:normal'>{esc(', '.join(map(str, x.get('players') or [])))}</td><td style='white-space:normal'>{esc(x.get('role'))}{tag(x)}</td></tr>" for x in vc)
-                 + "</table></div>")
+        # 도식: 단계 상자를 화살표로 이어 붙이고, 이 회사가 있는 단계는 파란 테두리·'여기' 표시(휴대폰에서는 세로로 쌓임)
+        boxes = []
+        for k, x in enumerate(vc[:6], 1):
+            me = bool(str(x.get("role") or "").strip())
+            boxes.append(f"<div class='vc{' me' if me else ''}'><div class=vn>{k}</div><div class=vs>{esc(x['stage'])}</div>"
+                         f"<div class=vw>{esc(x.get('what'))}</div>"
+                         + (f"<div class=vp>{esc(' · '.join(map(str, (x.get('players') or [])[:4])))}</div>" if x.get("players") else "")
+                         + (f"<div class=vr>📍 {esc(code)} 여기: {esc(x.get('role'))}{tag(x)}</div>" if me else "") + "</div>")
+        H.append("<h3>밸류체인</h3><div class=vchain>" + "<div class=varr>→</div>".join(boxes) + "</div>"
+                 "<p class=muted>왼쪽(상류)에서 오른쪽(하류) 순서 · 파란 상자 = 이 회사가 있는 단계 · 상자 안 회사는 각 단계의 대표 기업</p>")
     comp = [x for x in (b.get("competitors") or []) if isinstance(x, dict) and x.get("name")][:6]
     if comp:
         rows = []
@@ -1125,7 +1135,12 @@ figure{{margin:10px 0;background:#fff;border-radius:10px;padding:8px}} figure im
 .glance{{background:#fff;border:2px solid #2f6fd6;border-radius:12px;padding:12px 16px;margin:12px 0}} .glance .gt{{font-weight:700;color:#2f6fd6;margin-bottom:6px}} .glance>div{{margin:4px 0}} .glance ul{{margin:4px 0 0 0;padding-left:18px}}
 details.sec{{padding:0 12px 8px}} details.sec>summary{{list-style:none;padding:10px 0}} details.sec>summary::-webkit-details-marker{{display:none}}
 .h2{{font-size:17px;font-weight:700;border-left:4px solid #2f6fd6;padding-left:8px}} details.sec>summary .h2:after{{content:" ▸";color:#6b7280;font-size:13px}} details.sec[open]>summary .h2:after{{content:" ▾"}}
-.flow{{padding:6px 10px;margin:4px 0;background:#f0f6ff;border-left:3px solid #2f6fd6;border-radius:4px}} .tag{{font-size:11px;background:#fde68a;color:#78350f;border-radius:4px;padding:0 4px;margin-left:4px}}
+.flow{{padding:6px 10px;margin:4px 0;background:#f0f6ff;border-left:3px solid #2f6fd6;border-radius:4px}}
+.fchain{{display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin:6px 0}} .fstep{{background:#f0f6ff;border:1px solid #c9dafb;border-radius:8px;padding:4px 8px;font-size:13px}} .farr{{color:#2f6fd6;font-weight:700}}
+.vchain{{display:flex;align-items:stretch;gap:6px;overflow-x:auto;padding:4px 0 10px}} .varr{{align-self:center;color:#2f6fd6;font-size:20px;font-weight:700}}
+.vc{{flex:0 0 150px;background:#fff;border:1px solid #dde3ec;border-radius:10px;padding:8px 10px;font-size:12.5px;box-shadow:0 1px 2px rgba(0,0,0,.05)}}
+.vc.me{{border:2px solid #2f6fd6;background:#eef4ff}} .vn{{font-size:11px;color:#6b7280}} .vs{{font-weight:700;font-size:14px;margin:2px 0 4px}} .vw{{color:#374151}} .vp{{color:#6b7280;margin-top:6px;font-size:12px}} .vr{{margin-top:6px;color:#1d4ed8;font-weight:600}}
+@media (max-width:600px){{.vchain{{flex-direction:column}} .vc{{flex:1 1 auto}} .varr{{transform:rotate(90deg);align-self:center}}}} .tag{{font-size:11px;background:#fde68a;color:#78350f;border-radius:4px;padding:0 4px;margin-left:4px}}
 </style></head><body><main>
 <h1>{esc(name)} <small>({code} JP · {esc(E.SECTOR_KO.get(card['sector'], card['sector']))})</small></h1>
 <p class=muted>{lab}({months}) 실적 · 발표 {card['d'][:4]}-{card['d'][4:6]}-{card['d'][6:]} {card['t']} JST · {' · '.join(card.get('hit') or []) or '요청 분석'}</p>
