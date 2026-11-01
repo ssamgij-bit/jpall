@@ -1198,20 +1198,7 @@ def _rep_build(cp):
     ok_ai = cp.pop("_ai_ok", True)
     if not ok_ai: FAIL[cp["code"]] = ai_fail_reason()
     log("리포트 AI", cp["code"], key_label(), "성공" if ok_ai else f"실패({ai_fail_reason()})")
-    return fn, blob, ok_ai, cp.pop("_deck", None)
-
-def _deck_build(cp, pdf, url, src):
-    """[📄 리포트] 다음에 보내는 IR 발표 자료 한국어 번역본"""
-    import earn_report
-    ai_reset()
-    return earn_report.deck_ko(cp, pdf, url, src)
-
-def send_deck(card, dest, reply):
-    """저장해 둔 번역본(텔레그램 파일)이 있으면 다시 보냄 → 보냈으면 True"""
-    if not card.get("deck_file"): return False
-    rp = {"reply_to_message_id": reply, "allow_sending_without_reply": True} if reply else {}
-    r = tg("sendDocument", {"chat_id": dest, "caption": f"🇰🇷 {card.get('name_ko') or card['name']}({card['code']}) IR 발표 자료 한국어 번역본", "document": card["deck_file"], **rp})
-    return bool(r.get("ok"))
+    return fn, blob, ok_ai
 
 def _ir_build(cp):
     import earn_ir
@@ -1432,7 +1419,7 @@ def _start_jobs(st):
         card = st.get("cards", {}).get(cid)
         if not card: q.pop(0); continue
         if card.get("ir_texts") and card.get("qa_watch") and time.time() - card.get("qa_site_ts", 0) > 3600 and not _running("ir", cid) \
-                and len([x for x in JOBS if x["kind"] in ("rep", "ir", "deck")]) < MAX_HEAVY:  # Q&A 없던 요약 → 그사이 올라왔는지 확인(1시간에 한 번)
+                and len([x for x in JOBS if x["kind"] in ("rep", "ir")]) < MAX_HEAVY:  # Q&A 없던 요약 → 그사이 올라왔는지 확인(1시간에 한 번)
             q.pop(0); card["qa_site_ts"] = time.time()
             _submit("ir", _ir_refresh, _copy.deepcopy(card), key2=True, cid=cid, waiters=[(dest, reply)]); log("IR Q&A 다시 확인", card["code"], dest)
             continue
@@ -1447,7 +1434,7 @@ def _start_jobs(st):
         if same: q.pop(0); same[0]["waiters"].append((dest, reply)); continue   # 같은 카드 요약을 만드는 중이면 끝나면 같이 보냄
         with _key2(): out = ai_out_until(heavy=True)
         if out: q.pop(0); defer_ai(st, "ir", cid, dest, reply, out); continue
-        if len([x for x in JOBS if x["kind"] in ("rep", "ir", "deck")]) >= MAX_HEAVY: break
+        if len([x for x in JOBS if x["kind"] in ("rep", "ir")]) >= MAX_HEAVY: break
         q.pop(0)
         _submit("ir", _ir_build, _copy.deepcopy(card), key2=True, cid=cid, waiters=[(dest, reply)]); log("IR 요약 시작", card["code"], dest)
     # 3) 리포트
@@ -1458,19 +1445,15 @@ def _start_jobs(st):
         if not card: q.pop(0); continue
         rp = {"reply_to_message_id": reply, "allow_sending_without_reply": True} if reply else {}
         cap = f"📄 {card.get('name_ko') or card['name']}({card['code']}) 리포트 — 파일을 열어 보세요"
-        if card.get("rep_file") and (card.get("deck_file") or card.get("deck_none")):  # 이미 만든 리포트(·IR 번역본)는 텔레그램 파일을 그대로 다시 보냄
+        if card.get("rep_file"):  # 이미 만든 리포트는 텔레그램 파일을 그대로 다시 보냄
             r = tg("sendDocument", {"chat_id": dest, "caption": cap, "document": card["rep_file"], **rp})
             log("리포트 재전송", card["code"], dest, "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:80]}")
-            if r.get("ok"):
-                q.pop(0)
-                try: send_deck(card, dest, reply)
-                except Exception: traceback.print_exc()
-                continue
+            if r.get("ok"): q.pop(0); continue
         same = _running("rep", cid)
         if same: q.pop(0); same[0]["waiters"].append((dest, reply)); continue
         with _key2(): out = ai_out_until(heavy=True)
         if out: q.pop(0); defer_ai(st, "rep", cid, dest, reply, out); continue
-        if len([x for x in JOBS if x["kind"] in ("rep", "ir", "deck")]) >= MAX_HEAVY: break
+        if len([x for x in JOBS if x["kind"] in ("rep", "ir")]) >= MAX_HEAVY: break
         q.pop(0)
         _submit("rep", _rep_build, _copy.deepcopy(card), key2=True, cid=cid, waiters=[(dest, reply)]); log("리포트 만들기 시작", card["code"], dest)
 
@@ -1552,7 +1535,7 @@ class _DONE:
             rp = {"reply_to_message_id": reply, "allow_sending_without_reply": True} if reply else {}
             if ok != "ok":
                 tg("sendMessage", {"chat_id": dest, "text": f"리포트 생성 실패({card['code']}). 처리 중 오류가 났습니다(기록해 두었습니다). 잠시 뒤 다시 눌러 주세요.", **rp}); continue
-            fn, blob, ok_ai = res[:3]
+            fn, blob, ok_ai = res
             if not ok_ai:
                 with _key2(): out = ai_out_until(heavy=True)
                 if out: defer_ai(st, "rep", j["cid"], dest, reply, out); continue   # 만드는 도중 한도가 끝남 → 풀린 뒤 다시
@@ -1565,36 +1548,6 @@ class _DONE:
             log("리포트 보냄", card["code"], dest, "AI 포함" if ok_ai else "AI 빠짐", "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:80]}")
             if r.get("ok") and ok_ai:
                 card["rep_file"] = ((r.get("result") or {}).get("document") or {}).get("file_id")
-        # IR 발표 자료 한국어 번역본: 리포트를 먼저 보내고 이어서 만듦(쪽 수에 따라 1~4분)
-        if ok != "ok": return
-        deck = res[3] if len(res) > 3 else None
-        ws = [(d, r_) for d, r_ in j["waiters"] if not send_deck(card, d, r_)]
-        if not ws: return
-        if not deck:
-            card["deck_none"] = True
-            for d, r_ in ws:
-                tg("sendMessage", {"chat_id": d, "text": f"🇰🇷 {card['code']}: 이번 분기 IR 발표 자료(설명 자료 PDF)를 찾지 못해 번역본은 없습니다(결산단신만 낸 회사일 수 있음).",
-                                   **({"reply_to_message_id": r_, "allow_sending_without_reply": True} if r_ else {})})
-            return
-        same = _running("deck", j["cid"])
-        if same: same[0]["waiters"] += ws; return
-        _submit("deck", _deck_build, _copy.deepcopy(card), *deck, key2=True, cid=j["cid"], waiters=ws); log("IR 번역본 시작", card["code"])
-
-    @staticmethod
-    def deck(st, j, ok, res):
-        card = st.get("cards", {}).get(j["cid"])
-        if not card: return
-        for dest, reply in j["waiters"]:
-            rp = {"reply_to_message_id": reply, "allow_sending_without_reply": True} if reply else {}
-            if ok != "ok" or not res:
-                tg("sendMessage", {"chat_id": dest, "text": f"🇰🇷 {card['code']}: IR 발표 자료 번역에 실패했습니다(AI 한도·자료 문제). 📄 리포트를 다시 누르면 번역을 다시 시도합니다.", **rp}); continue
-            if send_deck(card, dest, reply): continue
-            fn, blob, done, n_all = res
-            cap = (f"🇰🇷 {card.get('name_ko') or card['name']}({card['code']}) IR 발표 자료 한국어 번역본 — 쪽마다 원문 이미지 + 번역"
-                   + (f"\n(전체 {n_all}쪽 중 {done}쪽 번역)" if done < n_all else ""))
-            r = tg("sendDocument", {"chat_id": dest, "caption": cap, **rp}, files={"document": (fn, blob, "text/html")}, timeout=120)
-            log("IR 번역본 보냄", card["code"], dest, "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:80]}")
-            if r.get("ok"): card["deck_file"] = ((r.get("result") or {}).get("document") or {}).get("file_id")
 
 def finish_jobs(st, timeout=300):
     """실행을 마치기 전: 돌던 작업을 최대 timeout초 기다려 반영, 그래도 안 끝난 건 대기열에 되돌려 다음 실행이 이어서 처리"""
@@ -1603,7 +1556,7 @@ def finish_jobs(st, timeout=300):
         if j["kind"] in ("analyze", "card"): st.setdefault("ask_q", []).insert(0, j["job"])
         else:
             for dest, reply in j["waiters"]:
-                st.setdefault("rep_q" if j["kind"] in ("rep", "deck") else "ir_q", []).insert(0, {"cid": j["cid"], "chat": dest, "reply": reply})
+                st.setdefault("rep_q" if j["kind"] == "rep" else "ir_q", []).insert(0, {"cid": j["cid"], "chat": dest, "reply": reply})
         log("미완료 작업 되돌림", j["kind"])
     JOBS.clear()
     POOL.shutdown(wait=False, cancel_futures=True)
