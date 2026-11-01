@@ -2,7 +2,7 @@
 키는 저장소 비밀값 WATCH_KEY(공시 채널 봇·실적 봇·상태 감시가 함께 씀). 키가 없으면 암호화하지 않음."""
 import os, json, hmac, base64, hashlib
 
-PRIV = ("owner", "watch")   # 공시 채널 봇(jpall) state.json 에서 가리는 항목
+PRIV = ("owner", "watch", "subs_bak", "owner_cands")   # subs_bak: japan stock 봇 사용자별 구독 백업   # 공시 채널 봇(jpall) state.json 에서 가리는 항목
 
 def _key():
     k = os.environ.get("WATCH_KEY", "")

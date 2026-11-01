@@ -1318,6 +1318,13 @@ def _fallback_why(st, src):
     pick = [z for z in sents if re.search(r"増収|減収|増益|減益|上回|下回|増加|減少|伸長|好調|低調|不振|寄与|影響|ため|により", z) and "経済" not in z]
     z = (pick or sents or [""])[0]
     return (translate(st, [z]).get(z) or "") if z else ""
+def bump(st, key, n=1):
+    """하루 단위 작동 기록(KST) — 봇 상태 감시가 '돌기는 하는데 결과가 비는' 조용한 고장을 잡는 데 씀. 최근 10일만"""
+    d = now().strftime("%Y%m%d")
+    c = st.setdefault("cnt", {})
+    c.setdefault(d, {})[key] = c.get(d, {}).get(key, 0) + n
+    for k in sorted(c)[:-10]: c.pop(k, None)
+
 def ai_batch(st, tasks):
     """사유·핵심 수치 AI를 최대 AI_BATCH건씩 묶어 호출. 결과는 공시 id별로 저장해 재처리·19시 요약에서 재사용 → {id: {"facts", "why"}}"""
     cache = st.setdefault("aic", {})
@@ -1339,6 +1346,7 @@ def ai_batch(st, tasks):
             else:  # AI 실패: 사유만 번역으로(저장하지 않아 다음에 다시 시도하지는 않음 — 게시는 한 번뿐)
                 r = {"facts": [], "why": _fallback_why(st, t["src"]) if t["mode"] == "why" else "", "ts": time.time(), "fb": True}
             out[t["id"]] = r
+            bump(st, "ai"); bump(st, "ai_fail") if r.get("fb") else None
             if not r.get("fb"): cache[t["id"]] = r
     if len(cache) > 800:
         for k in sorted(cache, key=lambda k: cache[k].get("ts", 0))[:300]: cache.pop(k, None)
@@ -2046,10 +2054,16 @@ WATCH_URL = os.environ.get("WATCH_URL", "https://jp-disclosure-bot.ssamgij.worke
 WATCH_KEY = os.environ.get("WATCH_KEY", "")
 def watch_sync(st):
     # 30분마다 읽음(japan stock 봇에서 구독하면 30분 안에 ⭐ 반영). 키가 없으면 /add 목록 사용
-    if not (WATCH_URL and WATCH_KEY) or time.time() - (st.get("watch_ts") or 0) < 1800: return
+    if not (WATCH_URL and WATCH_KEY) or (time.time() - (st.get("watch_ts") or 0) < 1800 and not st.get("_priv_locked")): return
     st["watch_ts"] = time.time(); st.pop("watch_date", None)
     j = json.loads(http(WATCH_URL, timeout=20, headers={"x-watch-key": WATCH_KEY, **UA}))
     codes = [nfkc(str(c)).upper()[:4] for c in (j.get("codes") or [])]
+    if st.get("_priv_locked"):  # WATCH_KEY를 바꿔 예전 개인 항목을 못 푸는 상태: 새 키가 맞는 것은 확인됐으니 예전 것은 버리고 새로 시작
+        st.pop("_priv_locked", None); st["owner"] = None
+        st["owner_cands"] = [str(x) for x in (j.get("owners") or [])]   # japan stock 봇 허용 사용자만 주인으로 다시 등록 가능
+        log("키 변경 감지: 주인은 다음 개인 명령(/list 등)으로 다시 등록")
+    if j.get("users"):  # japan stock 봇 사용자별 구독 백업(암호화돼 저장 · 워커 데이터베이스가 지워졌을 때 복구용)
+        st["subs_bak"] = {"ts": int(time.time()), "users": j["users"]}
     old = st.get("watch", {})
     st["watch"] = {c: old.get(c, time.time()) for c in codes}
     if set(old) != set(codes): log("watchlist synced", len(codes))
@@ -2071,7 +2085,9 @@ def tg_commands(st, names):
         m = u.get("message") or {}
         chat = (m.get("chat") or {}); text = (m.get("text") or "").strip()
         if chat.get("type") != "private" or not text.startswith("/"): continue
-        if st.get("owner") is None: st["owner"] = chat["id"]; log("owner set", chat["id"])
+        if st.get("owner") is None:
+            if st.get("owner_cands") and str(chat["id"]) not in st["owner_cands"]: tg_reply(chat["id"], "이 봇은 개인용입니다."); continue
+            st["owner"] = chat["id"]; st.pop("owner_cands", None); log("owner set", chat["id"])
         if chat["id"] != st["owner"]: tg_reply(chat["id"], "이 봇은 개인용입니다."); continue
         cmd, *args = text.split()
         cmd = cmd.split("@")[0].lower()
@@ -2236,6 +2252,7 @@ def main():
             wait = SEND_GAP - (time.time() - last_send)
             if wait > 0: time.sleep(wait)
             ok = tg_send(msg) if msg else True
+            if ok and msg: bump(st, "post")
             if ok and msg and chart:  # 차트는 본문 바로 뒤에 이미지로
                 tg_photo(chart)
             last_send = time.time()
