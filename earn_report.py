@@ -459,6 +459,88 @@ def cons_fy(code):
         out["eps"] = float(ee.loc["0y", "avg"]); out["eps_n"] = int(ee.loc["0y", "numberOfAnalysts"] or 0)
     return out
 
+# ───────────────────────── 비즈니스 심층: 사업 구조·밸류체인·경쟁 구도·선행지표 ─────────────────────────
+BIZ_PROMPT = """너는 일본 중소형주를 깊게 보는 한국 바이사이드 애널리스트다. {name}({code}, 업종 {sector})의 사업을 처음 공부하는 운용역이 구조를 한 번에 이해하도록
+첨부 IR 자료(첨부 목록: {docs})와 아래 회사 개요·결산단신 본문을 읽고 한국어 JSON으로 정리하라.
+규칙
+- 각 항목에 src를 단다: "자료"(첨부·본문에 근거) 또는 "일반"(자료에 없고 일반적으로 알려진 업계 지식). 숫자는 자료에 있는 것만 쓰고, 일반 지식에는 숫자를 쓰지 않는다.
+- 확실하지 않은 경쟁사·고객 이름은 넣지 않는다. 일본어를 그대로 쓰지 말 것(회사명은 한국어 통용 표기, 일본 상장사는 4자리 종목코드).
+- model.flow: 돈이 도는 구조를 화살표 한 줄씩 3~5줄(예: "원료 조달 → 정제·가공 → 반도체 웨이퍼 연마재로 판매 → 고객: 웨이퍼·소자 업체").
+- model.mix: 사업·제품·용도별 매출 비중(자료에 있을 때만, share는 % 숫자).
+- value_chain: 이 회사가 속한 산업의 단계 4~6개. 각 {{"stage": 단계, "what": 하는 일, "players": [대표 기업 2~4개], "role": "이 회사의 위치(해당 없으면 빈 문자열)", "src": ""}}.
+- competitors: 주요 경쟁사 3~6개. {{"name": "", "code": "일본 상장사면 4자리, 아니면 null", "country": "", "overlap": "겹치는 제품·시장", "edge": "이 회사 대비 강점·약점 한 줄", "src": ""}}.
+- position: 시장 내 위치·점유율·진입장벽(자료 근거 우선) 2~3문장. strengths/weaknesses: 각 2~4개 짧은 문장(src 포함 객체 {{"t": "", "src": ""}}).
+- leading: 실적을 앞서 보여주는 선행지표 2~3개 {{"name": "", "why": "왜 실적에 앞서는지", "where": "어디서 확인하는지(월간 공시·업계 통계 등)"}}.
+출력: {{"model": {{"flow": [""], "mix": [{{"name": "", "share": 0}}], "mix_src": "", "mix_period": ""}}, "value_chain": [], "competitors": [],
+ "position": "", "strengths": [], "weaknesses": [], "leading": []}}
+
+회사 개요(일본어): {profile}
+결산단신 본문(일부): {qual}
+"""
+
+def biz_section(plt, card, name, code, pdfs, pnames):
+    """→ HTML 또는 "" — 설명 자료·참고 자료가 있으면 그 PDF와 함께, 없으면 개요·본문만으로"""
+    idx = [i for i, (nm, _) in enumerate(pnames) if "결산단신" not in nm and "질의응답" not in nm and "수정 공시" not in nm][:2]
+    prompt = BIZ_PROMPT.format(name=name, code=code, sector=E.SECTOR_KO.get(card["sector"], card["sector"]), profile=card.get("profile", "")[:600],
+                               qual=card.get("qual", "")[:3000], docs="; ".join(f"{k}. {pnames[i][0]}" for k, i in enumerate(idx, 1)) or "없음")
+    b = (gemini_pdf(prompt, [pdfs[i] for i in idx], max_tokens=8000) if idx else gemini_json(prompt, timeout=150)) or {}
+    if isinstance(b, list): b = b[0] if b and isinstance(b[0], dict) else {}
+    if not b: return ""
+    tag = lambda x: ' <span class=tag>일반 지식</span>' if str((x or {}).get("src", "")).startswith("일반") else ""
+    H = ["<h2>비즈니스 심층 — 사업 구조 · 밸류체인 · 경쟁 구도</h2>",
+         "<p class=muted>IR 자료·결산단신을 바탕으로 Gemini가 정리. <span class=tag>일반 지식</span> 표시는 자료에 없고 업계에 일반적으로 알려진 내용(검증 필요).</p>"]
+    m = b.get("model") or {}
+    flow = [str(x) for x in (m.get("flow") or []) if str(x).strip()][:5]
+    if flow:
+        H.append("<h3>돈이 도는 구조</h3><div class=card>" + "".join(f"<div class=flow>{esc(x)}</div>" for x in flow) + "</div>")
+    mix = [x for x in (m.get("mix") or []) if isinstance(x, dict) and num(x.get("share"))]
+    if len(mix) >= 2:
+        try:
+            fig, ax = plt.subplots(figsize=(8, 0.5 + 0.42 * len(mix)))
+            mix = sorted(mix, key=lambda x: num(x["share"]))
+            ax.barh([str(x.get("name"))[:22] for x in mix], [num(x["share"]) for x in mix], color=E.BLUE)
+            for i, x in enumerate(mix): ax.text(num(x["share"]), i, f" {num(x['share']):.0f}%", va="center", fontsize=9)
+            ax.set_title("매출 구성" + (f" ({m.get('mix_period')})" if m.get("mix_period") else ""), loc="left", fontsize=12, fontweight="bold")
+            for sp in ("top", "right"): ax.spines[sp].set_visible(False)
+            fig.tight_layout(); H.append(f'<figure><img src="{b64png(fig)}"></figure>')
+        except Exception as e: E.log("mix chart error", e)
+    vc = [x for x in (b.get("value_chain") or []) if isinstance(x, dict) and x.get("stage")]
+    if vc:
+        H.append("<h3>밸류체인</h3><div class=scroll><table><tr><th>단계</th><th>하는 일</th><th>대표 기업</th><th>이 회사의 위치</th></tr>" +
+                 "".join(f"<tr{' class=cur' if x.get('role') else ''}><td>{esc(x['stage'])}</td><td style='white-space:normal'>{esc(x.get('what'))}</td>"
+                         f"<td style='white-space:normal'>{esc(', '.join(map(str, x.get('players') or [])))}</td><td style='white-space:normal'>{esc(x.get('role'))}{tag(x)}</td></tr>" for x in vc)
+                 + "</table></div>")
+    comp = [x for x in (b.get("competitors") or []) if isinstance(x, dict) and x.get("name")][:6]
+    if comp:
+        rows = []
+        for x in comp:
+            c = re.sub(r"\D", "", str(x.get("code") or ""))
+            nums_ = ""
+            if len(c) == 4 and c != code:
+                try:   # 일본 상장 경쟁사: 가부탄 3개월 실적으로 최근 분기 성장률·이익률·시총
+                    kq = E.kb_finance(c)["q"]; qq = kq[-1]; pq = next((z for z in kq if z["end"] == E.ym_add(qq["end"], -12)), {})
+                    ry, _ = E.yoy(qq.get("rev"), pq.get("rev")); oy, ost = E.yoy(qq.get("op"), pq.get("op"))
+                    cap, _ = E.kb_profile(c)
+                    opm = qq["op"] / qq["rev"] * 100 if qq.get("op") is not None and qq.get("rev") else None
+                    nums_ = (f"{qq['end'][2:].replace('-', '/')} 매출 {fmt(ry)}% · 영익 {E.yoy_txt(oy, ost)} · 영업이익률 {fmt(opm)}%"
+                             + (f" · 시총 {cap:,.0f}억 엔" if cap else ""))
+                except Exception as e:
+                    E.log("peer error", c, e)
+            rows.append(f"<tr><td>{esc(x['name'])}{f' ({c})' if len(c) == 4 else ''}<br><small>{esc(x.get('country'))}</small></td>"
+                        f"<td style='white-space:normal'>{esc(x.get('overlap'))}</td><td style='white-space:normal'>{esc(x.get('edge'))}{tag(x)}</td>"
+                        f"<td style='white-space:normal'><small>{esc(nums_) or '—'}</small></td></tr>")
+        H.append("<h3>경쟁 구도</h3>" + (f"<div class=card>{esc(b.get('position'))}</div>" if b.get("position") else "")
+                 + "<div class=scroll><table><tr><th>경쟁사</th><th>겹치는 영역</th><th>비교</th><th>최근 분기(일본 상장사, 가부탄)</th></tr>" + "".join(rows) + "</table></div>")
+    sw = [(k, [x for x in (b.get(k) or []) if isinstance(x, dict) and x.get("t")]) for k in ("strengths", "weaknesses")]
+    if any(v for _, v in sw):
+        H.append("<h3>강점 · 약점</h3><div class=card>" + "".join(
+            f"<p><b>{'강점' if k == 'strengths' else '약점'}</b></p><ul>" + "".join(f"<li>{esc(x['t'])}{tag(x)}</li>" for x in v) + "</ul>" for k, v in sw if v) + "</div>")
+    ld = [x for x in (b.get("leading") or []) if isinstance(x, dict) and x.get("name")][:3]
+    if ld:
+        H.append("<h3>선행지표 — 다음 실적을 먼저 보여주는 것</h3><div class=card><ul>" + "".join(
+            f"<li><b>{esc(x['name'])}</b> — {esc(x.get('why'))}<br><small class=muted>확인: {esc(x.get('where'))}</small></li>" for x in ld) + "</ul></div>")
+    return "".join(H) if len(H) > 2 else ""
+
 # ───────────────────────── 캐파(생산능력)·증설 자료 따로 찾기 ─────────────────────────
 CAPA_RE = re.compile(r"캐파|생산능력|생산 능력|증설|설비 능력|가동률|라인 증설|공장 신설|생산 체제")
 CAPA_PROMPT = """첨부 PDF는 일본 상장사 {name}({code})의 IR 자료다(첨부 목록: {docs}). 생산능력(캐파)·증설과 관련된 숫자만 찾아 한국어 JSON으로.
@@ -698,6 +780,8 @@ def build(card):
 
     try: guide_html = guide_section(plt, card, kb)
     except Exception as e: E.log("guide section error", e); guide_html = ""
+    try: bizdeep_html = biz_section(plt, card, name, code, pdfs, pnames)
+    except Exception as e: E.log("biz section error", e); bizdeep_html = ""
     # 6) IR 자료에서 고른 핵심 데이터
     ins_html = ""
     base_pdf = mat_pdf or tan_pdf
@@ -868,6 +952,7 @@ th:first-child,td:first-child{{text-align:left}} th{{background:#f0f3f8;font-wei
 details{{background:#fff;border-radius:10px;margin:10px 0;padding:8px 12px}} summary{{cursor:pointer;font-weight:600}} details img{{width:100%;margin-top:6px;border:1px solid #eee}}
 figure{{margin:10px 0;background:#fff;border-radius:10px;padding:8px}} figure img{{width:100%}} figcaption{{font-size:12px;color:#6b7280;padding:2px 6px}}
 .muted,small{{color:#6b7280}} a{{color:#2f6fd6}} .rx{{background:#fff7ed;border-radius:8px;padding:6px 10px}}
+.flow{{padding:6px 10px;margin:4px 0;background:#f0f6ff;border-left:3px solid #2f6fd6;border-radius:4px}} .tag{{font-size:11px;background:#fde68a;color:#78350f;border-radius:4px;padding:0 4px;margin-left:4px}}
 </style></head><body><main>
 <h1>{esc(name)} <small>({code} JP · {esc(E.SECTOR_KO.get(card['sector'], card['sector']))})</small></h1>
 <p class=muted>{lab}({months}) 실적 · 발표 {card['d'][:4]}-{card['d'][4:6]}-{card['d'][6:]} {card['t']} JST · {' · '.join(card.get('hit') or []) or '요청 분석'}</p>
@@ -878,6 +963,7 @@ figure{{margin:10px 0;background:#fff;border-radius:10px;padding:8px}} figure im
 {guide_html}
 {biz_html}
 {reg_html}
+{bizdeep_html}
 {ins_html}
 {qa_html}
 {op_html}

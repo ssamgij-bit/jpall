@@ -515,6 +515,23 @@ def ref_label(t):
 def latest_refs(card, skip=(), days=400, limit=2, budget=8_000_000):
     """이번 결산 전 약 1년 안의 가장 최근 IR 발표 자료·중기 경영계획·설비투자 공시 PDF → [(bytes, url, 제목, YYYY-MM-DD)]
     찾는 곳: 가부탄 공시 목록(TDnet 사본) → 회사 IR 홈페이지. 발표 자료(설명회·중기계획)를 먼저, 설비투자 공시는 그다음."""
+    # 같은 결산에 대해 7일 안에 이미 찾았으면 그 목록을 다시 씀(IR 홈페이지 탐색·브라우저 실행이 가장 무거움) — PDF만 다시 받음
+    cpath = os.path.join(E.STATE_DIR, "refcache.json")
+    try: cache = json.load(open(cpath))
+    except Exception: cache = {}
+    ck = f"{card['code']}:{card['d']}"
+    hit = cache.get(ck)
+    if hit and time.time() - hit.get("t", 0) < 7 * 86400:
+        out, total = [], 0
+        for u, lab, d in hit.get("items") or []:
+            if u in skip: continue
+            try: b = http(u, timeout=60)
+            except Exception: continue
+            if b"%PDF" in b[:1024] and total + len(b) <= budget:
+                out.append((b, u, lab, d)); total += len(b)
+            if len(out) >= limit: break
+        if out or not hit.get("items"):
+            E.log("최근 IR 참고 자료(저장분)", card["code"], len(out)); return out
     d0 = dt.datetime.strptime(card["d"], "%Y%m%d")
     lo = (d0 - dt.timedelta(days=days)).strftime("%Y%m%d")
     cand = []
@@ -553,6 +570,12 @@ def latest_refs(card, skip=(), days=400, limit=2, budget=8_000_000):
         out.append((b, u, ref_label(t), f"{day[:4]}-{day[4:6]}-{day[6:]}" if len(day) == 8 else f"{day[:4]}-{day[4:6]}" if len(day) == 6 else "날짜 미상")); total += len(b)
         if len(out) >= limit: break
     if out: E.log("최근 IR 참고 자료", card["code"], " / ".join(f"{t[:20]}({d})" for _, _, t, d in out))
+    try:
+        cache[ck] = {"t": time.time(), "items": [[u, t, d] for _, u, t, d in out]}
+        cache = {k: v for k, v in cache.items() if time.time() - v.get("t", 0) < 14 * 86400}
+        os.makedirs(E.STATE_DIR, exist_ok=True); json.dump(cache, open(cpath, "w"), ensure_ascii=False)
+    except Exception as e:
+        E.log("refcache save error", e)
     return out
 
 def kabutan_docs(card):

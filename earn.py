@@ -366,7 +366,7 @@ QRULE = """- 기간 기준: 이번 3개월 분기(예: 2Q(7~9월))가 기본이�
   자료에 누적(반기·1~3Q 누적)만 있으면, 같은 자료에 직전 분기 누적도 있을 때만 '이번 누적 − 직전 분기 누적'으로 분기 숫자를 계산해 쓰고,
   그럴 수 없으면 누적 숫자를 쓰되 반드시 '(누적 n~m월)'이라고 붙인다. 누적 숫자를 분기 숫자처럼 쓰지 말 것.
 """
-REP_VER = 3   # 리포트 내용·구성을 바꾸면 올림 → 예전에 만든 리포트를 다시 보내지 않고 새로 만듦
+REP_VER = 4   # 리포트 내용·구성을 바꾸면 올림 → 예전에 만든 리포트를 다시 보내지 않고 새로 만듦
 QBASIS_VER = 1   # 올리면 예전 기준으로 만든 리포트·IR 요약 저장분을 버리고 새로 만듦
 
 def read_tanshin(row):
@@ -952,7 +952,8 @@ def reaction(card):
             "close": (day["c"] / base - 1) * 100, "mkt": mkt, "vol": day["v"] / (sum(vols) / len(vols)) if vols else None}
 
 def reaction_line(rx):
-    s = f"다음 날({int(rx['day'][5:7])}/{int(rx['day'][8:])}) 시가 {rx['open']:+.1f}% → 종가 <b>{rx['close']:+.1f}%</b>\n({rx['base']} 대비"
+    kind = ("갭 상승 후 유지" if rx["close"] >= rx["open"] else "갭 상승 후 되돌림") if rx["open"] >= 3 else ("갭 하락" if rx["open"] <= -3 else "")
+    s = f"다음 날({int(rx['day'][5:7])}/{int(rx['day'][8:])}) 시가 {rx['open']:+.1f}% → 종가 <b>{rx['close']:+.1f}%</b>" + (f" · {kind}" if kind else "") + f"\n({rx['base']} 대비"
     if rx["mkt"] is not None: s += f", TOPIX {rx['mkt']:+.1f}%"
     if rx["vol"]: s += f", 거래량 평소의 {rx['vol']:.1f}배"
     return s + ")"
@@ -1488,6 +1489,19 @@ def monthly_scorecard(st):
         g = [p for p in pl if r is None or r in (p.get("hit") or [])]
         if not g: continue
         L += [f"<b>{lab}</b> {len(g)}건", f"  다음 날 {stat(g, 'd1x')}", f"  1주 {stat(g, 'w1x')}", f"  1개월 {stat(g, 'm1x')}"]
+    # 발표 다음 날 반응 유형별: 갭 상승 후 유지(종가 ≥ 시가) / 갭 상승 후 되돌림 / 갭 하락 → 이후 1주·1개월 초과수익
+    cards_ = st.get("cards") or {}
+    def rx_of(p):
+        rx = (cards_.get(p.get("cid")) or {}).get("rx")
+        return rx if isinstance(rx, dict) and rx.get("open") is not None and rx.get("close") is not None else None
+    gu_keep = [p for p in pl if (rx := rx_of(p)) and rx["open"] >= 3 and rx["close"] >= rx["open"]]
+    gu_fade = [p for p in pl if (rx := rx_of(p)) and rx["open"] >= 3 and rx["close"] < rx["open"]]
+    gd = [p for p in pl if (rx := rx_of(p)) and rx["open"] <= -3]
+    if gu_keep or gu_fade or gd:
+        L += ["", "<b>다음 날 반응 유형별</b>(시가 갭 ±3% 기준, 이후 초과수익)",
+              f"  갭 상승 후 유지(종가 ≥ 시가) 1주 {stat(gu_keep, 'w1x')} · 1개월 {stat(gu_keep, 'm1x')}",
+              f"  갭 상승 후 되돌림(종가 < 시가) 1주 {stat(gu_fade, 'w1x')} · 1개월 {stat(gu_fade, 'm1x')}",
+              f"  갭 하락 1주 {stat(gd, 'w1x')} · 1개월 {stat(gd, 'm1x')}"]
     big = [p for p in pl if (p.get("cap") or 0) >= 1000]; small = [p for p in pl if 0 < (p.get("cap") or 0) < 1000]
     L += ["", "<b>시총별</b>(1개월)", f"  1,000억엔↑ {stat(big, 'm1x')}", f"  1,000억엔 미만 {stat(small, 'm1x')}"]
     done = sorted([p for p in pl if p.get("m1x") is not None], key=lambda p: p["m1x"])

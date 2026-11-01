@@ -280,11 +280,26 @@ def consensus_work(st, limit=60):
     for k in [k for k, v in cons.items() if time.time() - v["ts"] > 86400 * 10]: cons.pop(k)
 
 # ───────────────────────── 가부탄 분기 실적 ─────────────────────────
+def kget(url, timeout=20):
+    """가부탄 PC판 받기 — 해외 서버 접속을 가끔 막음(405·403·429) → 잠시 뒤 다른 브라우저 이름으로 한 번 더, 그래도 막히면 실적 봇의 즉시 응답 관문(있을 때)"""
+    last = None
+    for k, ua in enumerate((None, {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36", "Accept-Language": "ja,en;q=0.8"})):
+        try:
+            return http(url, timeout=timeout, **({"headers": ua} if ua else {}))
+        except Exception as e:
+            last = e
+            if getattr(e, "code", None) not in (403, 405, 429): raise
+            time.sleep(3 + 5 * k)
+    gw, key = os.environ.get("EARN_GATEWAY_URL") or os.environ.get("GATEWAY_URL"), os.environ.get("EARN_GATEWAY_KEY") or os.environ.get("GATEWAY_KEY")
+    if gw and key and gw != "off":
+        return http(gw.rstrip("/") + "/fetch?u=" + urllib.parse.quote(url, safe=""), timeout=timeout + 20, headers={"x-key": key})
+    raise last
+
 _KB = {}
 def kabutan_html(code):
     c = _KB.get(code)
     if c and time.time() - c[0] < 3600: return c[1]
-    s = http(f"https://kabutan.jp/stock/finance?code={code}", timeout=20).decode("utf-8", "ignore")
+    s = kget(f"https://kabutan.jp/stock/finance?code={code}", timeout=20).decode("utf-8", "ignore")
     _KB[code] = (time.time(), s)
     if len(_KB) > 400:
         for k in sorted(_KB, key=lambda k: _KB[k][0])[:100]: _KB.pop(k, None)
@@ -1237,7 +1252,7 @@ def biz_line(st, code):
     if c and time.time() - c[0] < 30 * 86400: return c[1]
     ko = ""
     try:
-        h = http(f"https://kabutan.jp/stock/?code={code}", timeout=20).decode("utf-8", "ignore")
+        h = kget(f"https://kabutan.jp/stock/?code={code}", timeout=20).decode("utf-8", "ignore")
         m = re.search(r"<th[^>]*>概要</th>\s*<td[^>]*>(.*?)</td>", h, re.S)
         jp = nfkc(re.sub(r"<[^>]+>", "", m.group(1))).strip() if m else ""
         if jp: ko = (translate(st, [jp]).get(jp) or "").strip()
