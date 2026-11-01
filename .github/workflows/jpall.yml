@@ -61,7 +61,8 @@ jobs:
       - name: 공시 게시
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.JPALL_GEMINI_KEY || secrets.GEMINI_API_KEY }}   # 공시 채널 전용 키(있으면) — 없으면 공용 키
+          GEMINI_API_KEY_FALLBACK: ${{ secrets.GEMINI_API_KEY }}   # 전용 키 한도가 차면 공용 키로
           WATCH_KEY: ${{ secrets.WATCH_KEY }}
           RUN_SECONDS: "1680"
         run: python jpall.py

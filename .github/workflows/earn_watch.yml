@@ -23,7 +23,7 @@ jobs:
         run: |
           python3 - <<'PY'
           import json, os, time, urllib.request, urllib.error, datetime as dt
-          repo = os.environ["REPO"]; tok = os.environ.get("EARN_TOKEN", "")
+          repo = os.environ["REPO"]; tok = os.environ.get("EARN_TOKEN", ""); DRY = os.environ.get("DRY_RUN") == "1"
           def get(u, auth=True):
               h = {"User-Agent": "watch"}
               if auth and "api.github.com" in u: h["Authorization"] = "Bearer " + os.environ["GH_TOKEN"]
@@ -94,18 +94,29 @@ jobs:
               except Exception as e:
                   print(f, "error", e)
           t_now = time.time()
+          alerted = {k: v for k, v in alerted.items() if k.startswith("_") or isinstance(v, (int, float))}
           new = [k for k in stale if t_now - alerted.get(k, 0) > 86400]   # 처음 생긴 문제, 또는 하루 넘게 계속되는 문제
-          back = [k for k in list(alerted) if k in checked and k not in stale]   # 알렸던 문제 중 이제 정상인 것
+          back = [k for k in list(alerted) if not k.startswith("_") and k in checked and k not in stale]   # 알렸던 문제 중 이제 정상인 것
           NAMEK = {"earn-state": "실적 스크리닝 봇", "state": "일본공시봇(JP_ALL)", "jpstock": "japan stock 봇", "naver": "네이버 프리미엄 요약 봇(맥)", **NAMES}
           lines = [stale[k] for k in new] + [f"✅ 복구: {NAMEK.get(k, k)}" for k in back]
           sent = False
-          if lines and owner and tok:
+          if lines and owner and tok and not DRY:
               msg = ("⚠️ 봇 상태 감시\n" if new else "") + "\n".join(lines) + ("\nGitHub Actions·Cloudflare 실행 상태를 확인해 주세요." if new else "")
               urllib.request.urlopen(urllib.request.Request(f"https://api.telegram.org/bot{tok}/sendMessage",
                   data=json.dumps({"chat_id": owner, "text": msg}).encode(), headers={"content-type": "application/json"}), timeout=30)
               print("alert sent", new, back); sent = True
           for k in new: alerted[k] = t_now
           for k in back: alerted.pop(k, None)
+          # 매일 아침 7시 이후 첫 감시: 문제가 없어도 한 줄 요약(조용한 고장·감시 자체의 멈춤을 알아채기 위해)
+          kst = now + dt.timedelta(hours=9)
+          if kst.hour >= 7 and alerted.get("_daily") != kst.strftime("%Y%m%d") and owner and tok and not DRY:
+              okn = [NAMEK.get(k, k) for k in sorted(checked) if k not in stale]
+              bad = [stale[k] for k in stale]
+              msg = (f"🟢 봇 상태 아침 점검: {len(okn)}개 모두 정상" if not bad else f"🟡 봇 상태 아침 점검: 정상 {len(okn)}개 · 문제 {len(bad)}개\n" + "\n".join(bad))
+              msg += "\n(" + ", ".join(okn) + ")" if okn and not bad else ""
+              urllib.request.urlopen(urllib.request.Request(f"https://api.telegram.org/bot{tok}/sendMessage",
+                  data=json.dumps({"chat_id": owner, "text": msg, "disable_notification": not bad}).encode(), headers={"content-type": "application/json"}), timeout=30)
+              alerted["_daily"] = kst.strftime("%Y%m%d"); print("daily summary sent")
           json.dump(alerted, open("/tmp/watch.json", "w"))
           print("stale", list(stale), "alerted", list(alerted))
           PY
