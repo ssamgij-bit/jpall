@@ -1370,7 +1370,7 @@ def build(row, st, names, quotes, trmap, tasks=None):
     mc = mcap_txt(quotes.get(code))
     d = row["d"]
     head = (["⭐ 관심 종목"] if code in st.get("watch", {}) else []) + [f"{d[:4]}.{d[4:6]}.{d[6:]} {row['t']}",
-            f"기업명: {name_ko}" + (f"(시가총액: {mc})" if mc else "") + f" {code}" + (f" [{mk}]" if mk else ""),
+            f"기업명: {esc(name_ko)}" + (f"(시가총액: {mc})" if mc else "") + f" {vd(code)}" + (f" [{mk}]" if mk else ""),
             f"보고서명: {trmap.get(row['title']) or row['title']}"]
     body = None
     title = row["title"]
@@ -1699,14 +1699,14 @@ def fallback_reasons(st, items):
 def digest_text(items, day, reasons=None, top=None):
     reasons = reasons or {}; top = top or []
     wd = "월화수목금토일"[day.weekday()]
-    out = [f"📊 <b>{day.month}/{day.day}({wd}) 일본 공시 하이라이트</b>", f"<i>{DIGEST_HOUR}:00 기준 · 섹션별 서프라이즈·수정 폭 큰 순 · 기업명 누르면 공시 원문</i>"]
+    out = [f"📊 <b>{day.month}/{day.day}({wd}) 일본 공시 하이라이트</b>", f"<i>{DIGEST_HOUR}:00 기준 · 섹션별 서프라이즈·수정 폭 큰 순 · 기업명 누르면 공시 원문 · 코드 누르면 밸류 데스크</i>"]
     if not items:
         return "\n".join(out + ["", "오늘은 기준에 맞는 공시가 없습니다."])
     if top:
         out += ["", "<b>⭐ 오늘의 핵심</b>"]
         for i, why in top:
             if 0 <= i < len(items):
-                x = items[i]; out.append(f"• <a href=\"{x['pdf']}\">{esc(x['name'])}</a> {x['code']} — {esc(why)}")
+                x = items[i]; out.append(f"• <a href=\"{x['pdf']}\">{esc(x['name'])}</a> {vd(x['code'])} — {esc(why)}")
     idx = {id(x): i for i, x in enumerate(items)}
     up_codes = {x["code"] for x in items if x["sec"] == "up"}
     for sec, lab in SECTIONS:
@@ -1723,7 +1723,7 @@ def digest_text(items, day, reasons=None, top=None):
         if not uniq: continue
         out += ["", f"<b>{lab} ({len(uniq)}건)</b>"]
         for x in uniq[:20]:
-            out.append(f"• <a href=\"{x['pdf']}\">{esc(x['name'])}</a>" + (f"({x['mct']})" if x["mct"] else "") + f" {x['code']}\n   {x['txt']}")
+            out.append(f"• <a href=\"{x['pdf']}\">{esc(x['name'])}</a>" + (f"({x['mct']})" if x["mct"] else "") + f" {vd(x['code'])}\n   {x['txt']}")
             rs = (x.get("mon") if sec == "mon" else None) or reasons.get(idx[id(x)])
             if rs and sec != "watch": out.append(f"   └ {'수치' if sec == 'mon' else '내용' if sec == 'evt' else '이유'}: {esc(rs)}")
         if len(uniq) > 20: out.append(f"   …외 {len(uniq) - 20}건")
@@ -1756,7 +1756,7 @@ def maybe_followup(st):
         for c, x in xs:
             if x["code"] in seen: continue
             seen.add(x["code"])
-            lines.append(f"{'🔺' if c > 0 else '🔻' if c < 0 else '▪'} {c:+.1f}% <a href=\"{x['pdf']}\">{esc(x['name'])}</a> {x['code']}")
+            lines.append(f"{'🔺' if c > 0 else '🔻' if c < 0 else '▪'} {c:+.1f}% <a href=\"{x['pdf']}\">{esc(x['name'])}</a> {vd(x['code'])}")
         if lines: out += ["", f"<b>{lab}</b>"] + lines[:25] + ([f"   …외 {len(lines) - 25}건"] if len(lines) > 25 else [])
     out += ["", "<i>장중 공시는 공시 당일에 이미 일부 반영됐을 수 있음 · 시세: Yahoo Finance</i>"]
     for part in split_msg("\n".join(out)):
@@ -1894,7 +1894,7 @@ def hold_work(st, names):
                    "sent": False, "src": "", "score": 100 if alert else (r.get("delta") or 5), "noai": True})
         if alert:
             msg = (f"🦈 <b>대량보유 보고 · {'행동주의(경영 제안 목적)' if '행동주의' in (r.get('purpose') or '') else '주요 투자자'}</b>\n"
-                   f"{r['d']}\n기업명: {esc(nm)}" + (f"(시가총액: {mcap_txt(q)})" if mcap_txt(q) else "") + f" {r['code']}" + (f" [{n['mkt']}]" if n.get("mkt") else "") +
+                   f"{r['d']}\n기업명: {esc(nm)}" + (f"(시가총액: {mcap_txt(q)})" if mcap_txt(q) else "") + f" {vd(r['code'])}" + (f" [{n['mkt']}]" if n.get("mkt") else "") +
                    f"\n보유자: {esc(r.get('holder_ko') or '')}" + (f" 외 공동보유 {r['joint'] - 1}" if (r.get("joint") or 1) > 1 else "") +
                    f"\n보유 비율: {ratio} ({ch})\n보유 목적: {r.get('purpose') or '—'}\n\n공시링크: {r['url']}\n회사정보: https://kabutan.jp/stock/?code={r['code']}")
             tg_send(msg); time.sleep(SEND_GAP)
@@ -2149,6 +2149,8 @@ def tg_photo(path, caption=""):
 
 # ───────────────────────── 메인 ─────────────────────────
 def esc(s): return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+VD_URL = "https://claude.ai/artifact/6gMrLe6Ue3ezG3HEu1ACvE"   # 밸류 데스크(종목 페이지 = VD_URL#코드)
+def vd(code): return f'<a href="{VD_URL}#{code}">{code}</a>'   # 종목 코드 → 밸류 데스크 종목 페이지
 
 def collect(st):
     """새 공시를 대기열에 추가"""

@@ -14,6 +14,7 @@ import os, sys, re, io, json, time, html, base64, zipfile, datetime as dt, urlli
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import xbrl as X
 from jpall import http, nfkc, scan_tdnet, gemini_json, JST
+VD_URL = "https://claude.ai/artifact/6gMrLe6Ue3ezG3HEu1ACvE"   # 밸류 데스크(종목 페이지 = VD_URL#코드)
 from jp2ko import jp2ko
 
 STATE_DIR = os.environ.get("STATE_DIR", "estate")
@@ -643,7 +644,7 @@ def card_text(a, ai, row):
     py = m["py"] or {}
     name = name_of(a["code"], a["name"], ai)
     t = row["t"]; d = row["d"]
-    L = [f"{'🔎' if a.get('ondemand') else '📌'} <b>{esc(name)} ({a['code']})</b> · {int(d[4:6])}/{int(d[6:])}" + (f" {t}" if t else "")]
+    L = [f"{'🔎' if a.get('ondemand') else '📌'} <b>{esc(name)}</b> (<a href=\"{VD_URL}#{a['code']}\">{a['code']}</a>) · {int(d[4:6])}/{int(d[6:])}" + (f" {t}" if t else "")]
     fc = r.get("fc") or {}
     per = ""
     if a.get("cap") and fc.get("ni") and fc["ni"] > 0:
@@ -1276,6 +1277,64 @@ def jp_summaries():
     if not key or time.time() - _JPSUM["t"] < 60 or (_JPSUM["run"] and not _JPSUM["run"].done()): return
     _JPSUM["t"] = time.time()
     _JPSUM["run"] = POOL.submit(_jps_job, key)
+
+_JPFIND = {"t": 0, "run": None}
+def _find_job(key, st):
+    """japan stock 봇 /find(찾기) 요청 → 종목 통합 보기를 만들어 돌려줌(earn_find.py)"""
+    import earn_find
+    from jpall import MON_MODELS, UA
+    try:
+        reqs = json.loads(http(JPS_URL + "/findq", timeout=20, headers={"x-watch-key": key}))
+    except Exception as e:
+        log("jps findq error", str(e)[:80]); return
+    H = {"get": lambda u: http(u, timeout=20, headers=UA), "daily": naver_daily, "label": label_of, "esc": esc,
+         "gemini": gemini_json, "models": MON_MODELS, "jp_state": jp_state, "now": now}
+    for r in reqs[:3]:
+        try:
+            parts = earn_find.build(str(r["code"]), st, H)
+        except Exception as e:
+            traceback.print_exc()
+            parts = [f"{esc(label_of(str(r['code'])))} 통합 보기를 만들지 못했습니다({esc(str(e)[:80])}). 잠시 뒤 다시 시도해 주세요."]
+        try:
+            http(JPS_URL + "/findr", timeout=30, data=json.dumps({"id": r["id"], "parts": parts}, ensure_ascii=False).encode(),
+                 headers={"x-watch-key": key, "content-type": "application/json"})
+            log("japan stock /find 응답", r["code"], len(parts), "개 메시지")
+        except Exception as e:
+            log("jps findr error", str(e)[:80])
+
+def jp_find(st):
+    """30초마다: japan stock 봇 /find 요청 확인(작업 스레드에서 처리)"""
+    key = os.environ.get("WATCH_KEY")
+    if not key or time.time() - _JPFIND["t"] < 30 or (_JPFIND["run"] and not _JPFIND["run"].done()): return
+    _JPFIND["t"] = time.time()
+    _JPFIND["run"] = POOL.submit(_find_job, key, st)
+
+def monthly_scorecard(st):
+    """매달 1일 16시 이후 한 번: 스크리닝 규칙별 성적표(통과 종목의 발표 후 1일·1주·1개월 TOPIX 대비 초과수익)를 주인에게"""
+    n = now(); ym = n.strftime("%Y-%m")
+    if n.day > 7 or n.hour < 16 or st.get("score_month") == ym or not st.get("owner"): return
+    st["score_month"] = ym
+    pl = [p for p in st.get("perf_log", []) if p["d"] >= (n - dt.timedelta(days=150)).strftime("%Y%m%d")]
+    def stat(g, k):
+        xs = [p[k] for p in g if p.get(k) is not None]
+        if not xs: return "—"
+        xs.sort(); med = xs[len(xs) // 2]
+        return f"{sum(xs) / len(xs):+.1f}%p(중앙 {med:+.1f}·승률 {sum(1 for x in xs if x > 0) / len(xs) * 100:.0f}%·{len(xs)}건)"
+    L = [f"📈 <b>실적 스크리닝 규칙 성적표</b> ({n.strftime('%Y-%m')} · 최근 150일 통과 {len(pl)}종목)",
+         "발표 전 종가 기준 TOPIX 대비 초과수익 평균(중앙값·플러스 비율·건수)", ""]
+    for r, lab in (("매출 성장", "매출·이익 성장"), ("매출 고성장", "매출 고성장"), ("성장 가속", "성장 가속"), ("턴어라운드", "턴어라운드"), (None, "전체")):
+        g = [p for p in pl if r is None or r in (p.get("hit") or [])]
+        if not g: continue
+        L += [f"<b>{lab}</b> {len(g)}건", f"  다음 날 {stat(g, 'd1x')}", f"  1주 {stat(g, 'w1x')}", f"  1개월 {stat(g, 'm1x')}"]
+    big = [p for p in pl if (p.get("cap") or 0) >= 1000]; small = [p for p in pl if 0 < (p.get("cap") or 0) < 1000]
+    L += ["", "<b>시총별</b>(1개월)", f"  1,000억엔↑ {stat(big, 'm1x')}", f"  1,000억엔 미만 {stat(small, 'm1x')}"]
+    done = sorted([p for p in pl if p.get("m1x") is not None], key=lambda p: p["m1x"])
+    if done:
+        f = lambda p: f"{esc(p.get('name') or p['code'])}({p['code']}) {p['m1x']:+.1f}%p"
+        L += ["", "<b>1개월 최고</b> " + ", ".join(f(p) for p in done[::-1][:3]), "<b>1개월 최저</b> " + ", ".join(f(p) for p in done[:3])]
+    L += ["", "<i>규칙을 다듬는 참고용 기록입니다. 표본이 적으면(10건 미만) 해석에 주의. 투자 권유 아님.</i>"]
+    tg("sendMessage", {"chat_id": st["owner"], "text": "\n".join(L), "parse_mode": "HTML", "disable_web_page_preview": True})
+    log("monthly scorecard sent", len(pl))
 
 def do_reports(st):
     AI_OUT.update(st.get("ai_out") or {})
@@ -2392,6 +2451,8 @@ def main():
             do_reports(st)
             try: jp_summaries()   # 부가 기능: 실패해도 아래 결산 판별을 막지 않음
             except Exception: traceback.print_exc()
+            try: jp_find(st)   # japan stock 봇 /find 종목 통합 보기
+            except Exception: traceback.print_exc()
             if time.time() - last_scan > 90:
                 last_scan = time.time()
                 for back in (1, 0):
@@ -2399,6 +2460,9 @@ def main():
                 update_reactions(st)
                 fanout_personal(st)
                 perf_update(st)
+                if not DRY:
+                    try: monthly_scorecard(st)   # 매달 첫 주: 규칙 성적표(주인에게)
+                    except Exception: traceback.print_exc()
                 # weekly_post(st)   # 주간 정리 글은 보내지 않음(사용자 요청, 2026-10-31)
                 if not DRY:
                     try: weekly_top5(st)   # 대신 토요일 오전 투자 검토 후보 탑 5
