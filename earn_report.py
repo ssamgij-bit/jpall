@@ -104,7 +104,7 @@ def attachments(xbrl_url=None, blob=None):
     blob = blob or http(xbrl_url, timeout=60)
     zf = zipfile.ZipFile(io.BytesIO(blob))
     labels = _labels(zf)
-    out = {"pl": {}, "seg": [], "kind": ""}
+    out = {"pl": {}, "seg": [], "kind": "", "cf": {}}
     for n in zf.namelist():
         if not n.endswith("ixbrl.htm") or "/Attachment/" not in n: continue
         kind = re.search(r"/\d+-([a-z]+)\d*-", n)
@@ -116,6 +116,13 @@ def attachments(xbrl_url=None, blob=None):
                 slot = 1 if cid.startswith("Prior1") else 0 if not cid.startswith("Prior") else None
                 if slot is None: continue
                 cur = out["pl"].setdefault(name, [None, None])
+                if cur[slot] is None: cur[slot] = v
+        elif kind.endswith("cf"):  # 현금흐름표(배당금 지급·자기주식 취득 → 주주환원)
+            for name, cid, v in facts:
+                if "_" in cid: continue
+                slot = 1 if cid.startswith("Prior1") else 0 if not cid.startswith("Prior") else None
+                if slot is None: continue
+                cur = out["cf"].setdefault(name, [None, None])
                 if cur[slot] is None: cur[slot] = v
         elif kind.endswith("sg"):  # 세그먼트 정보
             seg = {}
@@ -459,6 +466,35 @@ def cons_fy(code):
         out["eps"] = float(ee.loc["0y", "avg"]); out["eps_n"] = int(ee.loc["0y", "numberOfAnalysts"] or 0)
     return out
 
+# ───────────────────────── 주주환원: 배당성향 · 총주주환원율 ─────────────────────────
+def ret_section(card, kb, att):
+    ret = card.get("ret")
+    if not ret:   # 예전 카드: 결산단신 XBRL 현금흐름표로 다시 계산
+        r = dict(card["r"])
+        cf = att.get("cf") or {}
+        pick = lambda rx: next((v for k, v in cf.items() if rx.fullmatch(k) and "NonControlling" not in k), None)
+        r["cf"] = {"div": pick(E.CF_DIV), "buy": pick(E.CF_BUY)}
+        ret = E.shareholder_return(card["code"], r, kb, card["d"])
+    if not ret: return ""
+    rows = []
+    fy_lab = lambda e: f"FY{int(e[5:7])}/{e[2:4]}" if e else ""
+    if ret.get("payout_fc") is not None:
+        rows.append(f"<tr><td>배당성향(회사 예상, {fy_lab(ret.get('fy_end'))})</td><td><b>{ret['payout_fc']:.1f}%</b></td><td>주당배당 {fmt(ret.get('dps_fc'))}엔 ÷ 주당순이익 {fmt(ret.get('eps_fc'))}엔</td></tr>")
+    if ret.get("payout_last") is not None:
+        rows.append(f"<tr><td>배당성향(최근 실적, {fy_lab(ret.get('last_end'))})</td><td>{ret['payout_last']:.1f}%</td><td>주당배당 {fmt(ret.get('dps_last'))}엔</td></tr>")
+    if ret.get("total_fc") is not None:
+        rows.append(f"<tr><td>총주주환원율(회사 예상 기준)</td><td><b>{ret['total_fc']:.1f}%</b></td><td>(예상 배당 총액 {E.oku(ret.get('div_total_fc'))} + 이번 회계연도 자사주 매입 결정 {E.oku(ret.get('buy_fy'))}) ÷ 예상 순이익</td></tr>")
+    if ret.get("ytd_ratio") is not None:
+        rows.append(f"<tr><td>올해 누적 실제 환원율</td><td>{ret['ytd_ratio']:.1f}%</td><td>(배당금 지급 {E.oku(ret.get('ytd_div'))} + 자사주 취득 {E.oku(ret.get('ytd_buy'))}) ÷ 누적 순이익 {E.oku(ret.get('ytd_ni'))}</td></tr>")
+    buys = ret.get("buys") or []
+    if buys:
+        rows.append("<tr><td>자사주 매입 결정(최근 1년)</td><td>" + f"{len(buys)}건</td><td>" + " · ".join(
+            f"{x['d'][2:4]}/{x['d'][4:6]}/{x['d'][6:]} {('상한 ' + E.oku(x['amt'])) if x.get('amt') else '(금액 확인 못 함)'}" for x in buys) + "</td></tr>")
+    if not rows: return ""
+    return ("<h2>주주환원</h2><p class=muted>배당성향 = 주당배당 ÷ 주당순이익(가부탄 연간 실적·예상, 분할 반영) · 총주주환원율 = (배당 + 자사주 매입) ÷ 순이익 · "
+            "올해 누적은 결산단신 현금흐름표의 실제 지급액 · 자사주 매입 금액은 결정 공시의 취득 총액 상한(실제 매입액과 다를 수 있음)</p>"
+            "<div class=scroll><table><tr><th>항목</th><th>값</th><th>계산</th></tr>" + "".join(rows) + "</table></div>")
+
 # ───────────────────────── 비즈니스 심층: 사업 구조·밸류체인·경쟁 구도·선행지표 ─────────────────────────
 BIZ_PROMPT = """너는 일본 중소형주를 깊게 보는 한국 바이사이드 애널리스트다. {name}({code}, 업종 {sector})의 사업을 처음 공부하는 운용역이 구조를 한 번에 이해하도록
 첨부 IR 자료(첨부 목록: {docs})와 아래 회사 개요·결산단신 본문을 읽고 한국어 JSON으로 정리하라.
@@ -780,6 +816,8 @@ def build(card):
 
     try: guide_html = guide_section(plt, card, kb)
     except Exception as e: E.log("guide section error", e); guide_html = ""
+    try: ret_html = ret_section(card, kb, att)
+    except Exception as e: E.log("ret section error", e); ret_html = ""
     try: bizdeep_html = biz_section(plt, card, name, code, pdfs, pnames)
     except Exception as e: E.log("biz section error", e); bizdeep_html = ""
     # 6) IR 자료에서 고른 핵심 데이터
@@ -961,6 +999,7 @@ figure{{margin:10px 0;background:#fff;border-radius:10px;padding:8px}} figure im
 {f"<div class=head><b>{esc(headline)}</b><p>{esc(ai.get('narrative'))}</p></div>" if headline else ''}
 {f"<div class=card><ul>{why}</ul>{rx_html}</div>" if (why or rx_html) else ''}
 {guide_html}
+{ret_html}
 {biz_html}
 {reg_html}
 {bizdeep_html}

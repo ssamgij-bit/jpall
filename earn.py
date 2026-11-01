@@ -348,10 +348,16 @@ CUM_DIR = os.path.join(STATE_DIR, "cum")
 def cum_load(code):
     try: return json.load(open(os.path.join(CUM_DIR, f"{code}.json")))
     except Exception: return {}
+CF_DIV = re.compile(r"(Cash)?DividendsPaid\w*|PaymentsOfDividends\w*|DividendsPaidToOwnersOfParent\w*|CashDividendsPaid\w*")
+CF_BUY = re.compile(r"PurchaseOfTreasury(Stock|Shares)\w*|PaymentsFor(Purchase|Repurchase|Acquisition)OfTreasury\w*|PaymentsForPurchaseOfOwnShares\w*")
 def cum_save(code, r, blob):
     try:
         import earn_report as R
         att = R.attachments(blob=blob)
+        cf = att.get("cf") or {}
+        pick = lambda rx: next((v for k, v in cf.items() if rx.fullmatch(k) and "NonControlling" not in k), None)
+        dv, bb = pick(CF_DIV), pick(CF_BUY)
+        r["cf"] = {"div": dv, "buy": bb}   # [올해 누적, 작년 같은 기간] 엔(현금 유출은 음수일 수 있음)
         d = cum_load(code)
         d[r["end"][:7]] = {"q": r.get("q"), "pl": R.pl_compact(att["pl"]),
                            "seg": [[x["key"], x["name"], x["rev"], x["rev_py"], x["op"], x["op_py"]] for x in att["seg"]]}
@@ -366,7 +372,7 @@ QRULE = """- 기간 기준: 이번 3개월 분기(예: 2Q(7~9월))가 기본이�
   자료에 누적(반기·1~3Q 누적)만 있으면, 같은 자료에 직전 분기 누적도 있을 때만 '이번 누적 − 직전 분기 누적'으로 분기 숫자를 계산해 쓰고,
   그럴 수 없으면 누적 숫자를 쓰되 반드시 '(누적 n~m월)'이라고 붙인다. 누적 숫자를 분기 숫자처럼 쓰지 말 것.
 """
-REP_VER = 4   # 리포트 내용·구성을 바꾸면 올림 → 예전에 만든 리포트를 다시 보내지 않고 새로 만듦
+REP_VER = 5   # 리포트 내용·구성을 바꾸면 올림 → 예전에 만든 리포트를 다시 보내지 않고 새로 만듦
 QBASIS_VER = 1   # 올리면 예전 기준으로 만든 리포트·IR 요약 저장분을 버리고 새로 만듦
 
 def read_tanshin(row):
@@ -748,6 +754,8 @@ def analyze(row, rows, st):
         rv = find_revision_pdf(rows, code)
     if not rv: rv = hist_revision(code, row["d"], r.get("fc_end"))   # 결산단신에만 '수정 있음'(별도 수정 공시 없음)
     res.update(profile=profile, qual=qual, rev=rv, mat=find_material(rows, code))
+    try: res["ret"] = shareholder_return(code, r, kb, row["d"])
+    except Exception as e: log("ret error", code, e)
     return res
 
 def fy_end_month_of(r):
@@ -819,6 +827,7 @@ def card_text(a, ai, row):
         prog = progress(series, r, fem)
         L.append(g_line + (f" · 진척률 {prog[0]:.0f}%" + (f"(작년 {prog[1]:.0f}%)" if prog[1] is not None else "") if prog else ""))
     if a.get("oneoff"): L.append(a["oneoff"])
+    if ret_line(a.get("ret")): L.append(ret_line(a.get("ret")))
     L.append("")
     if ai:
         L.append(("▶️ <b>왜 좋았나</b>" if not a.get("ondemand") or a.get("pass") else "▶️ <b>실적 요인</b>")
@@ -830,6 +839,71 @@ def card_text(a, ai, row):
         L.append("")
     L.append("▶️ <b>주가</b> 다음 거래일 장 마감 후 업데이트")
     return "\n".join(L)
+
+def shareholder_return(code, r, kb, day):
+    """주주환원: 배당성향(회사 예상·최근 실적), 올해 누적 실제 환원(배당금 지급 + 자사주 취득) ÷ 순이익, 최근 1년 자사주 매입 결정 공시와 금액,
+    회사 예상 기준 총주주환원율(예상 배당 총액 + 이번 회계연도 자사주 매입 결정액) ÷ 예상 순이익. 금액 백만 엔"""
+    out = {}
+    ys = kb.get("y") or []
+    fy = next((y for y in ys if y["fc"]), None); last = next((y for y in reversed(ys) if not y["fc"]), None)
+    if fy and fy.get("dps") is not None and fy.get("eps"): out["payout_fc"] = fy["dps"] / fy["eps"] * 100 if fy["eps"] > 0 else None
+    if last and last.get("dps") is not None and last.get("eps"): out["payout_last"] = last["dps"] / last["eps"] * 100 if last["eps"] > 0 else None
+    if fy: out.update(dps_fc=fy.get("dps"), eps_fc=fy.get("eps"), fy_end=fy["end"])
+    if last: out.update(dps_last=last.get("dps"), last_end=last["end"])
+    cf = r.get("cf") or {}
+    dv, bb = (cf.get("div") or [None])[0], (cf.get("buy") or [None])[0]
+    ni = r.get("ni")
+    if (dv is not None or bb is not None) and ni:
+        d_, b_ = abs(dv or 0) / 1e6, abs(bb or 0) / 1e6
+        out.update(ytd_div=d_, ytd_buy=b_, ytd_ni=ni / 1e6, ytd_ratio=(d_ + b_) / (ni / 1e6) * 100 if ni > 0 else None)
+    # 최근 1년 자사주 매입 결정 공시(가부탄 공시 목록 → TDnet 사본 PDF에서 취득 총액 상한)
+    buys = []
+    try:
+        import earn_ir, subprocess, tempfile
+        lo = (dt.datetime.strptime(day, "%Y%m%d") - dt.timedelta(days=365)).strftime("%Y%m%d")
+        for d_, did, title in earn_ir.kabutan_list(code, lo, pages=10):
+            t = nfkc(html.unescape(title))
+            if not (lo <= d_ <= day) or re.search(r"[A-Za-z]{6}", t) or "訂正" in t: continue
+            if not re.search(r"自己株式の?取得に(係る|関する)事項の決定|自己株式の?取得(及び|および)", t) or re.search(r"状況|結果|終了|完了", t): continue
+            amt = None
+            try:
+                b = http(f"https://tdnet-pdf.kabutan.jp/{d_}/{did}.pdf", timeout=40)
+                with tempfile.NamedTemporaryFile(suffix=".pdf") as f:
+                    f.write(b); f.flush()
+                    tx = nfkc(subprocess.run(["pdftotext", "-layout", f.name, "-"], capture_output=True, text=True, timeout=60).stdout)
+                m = re.search(r"取得価額の総額[^\d]{0,30}([\d,.]+)\s*(億|百万|千)?円", tx)
+                if m:
+                    v = float(m.group(1).replace(",", "")); u = m.group(2)
+                    amt = v * 100 if u == "億" else v if u == "百万" else v / 1000 if u == "千" else v / 1e6
+            except Exception as e:
+                log("buyback pdf error", code, e)
+            if (d_, amt) not in [(x["d"], x["amt"]) for x in buys]: buys.append({"d": d_, "amt": amt})
+    except Exception as e:
+        log("buyback list error", code, e)
+    if buys: out["buys"] = sorted(buys, key=lambda x: x["d"])
+    # 회사 예상 기준 총주주환원율: 예상 배당 총액(예상 주당배당 × 발행주식수−자기주식) + 이번 회계연도 안의 매입 결정액
+    try:
+        sh = r.get("shares"); fni = (r.get("fc") or {}).get("ni")
+        if fy and fy.get("dps") is not None and sh and fni and fni > 0:
+            st_ = ym_add(fy["end"], -11).replace("-", "") + "01"
+            bsum = sum(x["amt"] or 0 for x in buys if x["d"] >= st_)
+            divt = fy["dps"] * sh / 1e6
+            out.update(total_fc=(divt + bsum) / (fni / 1e6) * 100, div_total_fc=divt, buy_fy=bsum)
+    except Exception as e:
+        log("total return error", code, e)
+    return out
+
+def ret_line(ret):
+    """카드용 한 줄: 배당성향 · 총주주환원율"""
+    if not ret: return ""
+    p = []
+    if ret.get("payout_fc") is not None: p.append(f"배당성향(회사 예상) <b>{ret['payout_fc']:.0f}%</b>")
+    elif ret.get("payout_last") is not None: p.append(f"배당성향(최근 실적) {ret['payout_last']:.0f}%")
+    if ret.get("total_fc") is not None: p.append(f"총주주환원율(예상) <b>{ret['total_fc']:.0f}%</b>")
+    if ret.get("ytd_ratio") is not None:
+        p.append(f"올해 누적 환원 {ret['ytd_ratio']:.0f}%(배당 {oku(ret['ytd_div'])}" + (f"·자사주 {oku(ret['ytd_buy'])}" if (ret.get("ytd_buy") or 0) >= 50 else "") + ")")
+    if ret.get("buys"): p.append(f"자사주 매입 결정 {len(ret['buys'])}건(최근 1년)")
+    return "▶️ <b>주주환원</b> " + " · ".join(p) if p else ""
 
 def fy_base(series, r, m):
     """예상 회계연도의 1년 전 연간 실적(백만 엔) = 그 해 4개 분기 합(분기 시계열에서)"""
@@ -1810,6 +1884,8 @@ def analyze_code(code):
         else:
             rv = find_revision_pdf(rows, code)
         a.update(rev=rv or hist_revision(code, row["d"], r.get("fc_end")), mat=find_material(rows, code))
+    try: a["ret"] = shareholder_return(code, r, kb, row.get("d") or now().strftime("%Y%m%d"))
+    except Exception as e: log("ret error", code, e)
     if "name" not in row: row["name"] = jp
     return a, row
 
@@ -2310,7 +2386,7 @@ def finish_card(st, cid, a, row, prep, chat=None):
             "code": a["code"], "name": a["name"], "name_ko": name_of(a["code"], a["name"], ai), "d": row["d"], "t": row.get("t") or "15:30", "msg": msg,
             "caption": cap, "ts": time.time(), "sector": a["sector"], "cap": a.get("cap"), "pdf": row.get("pdf"), "xbrl": row.get("xbrl"),
             "mat": mat_url, "mat_src": mat_src, "fem": fem, "series": a["series"][-8:], "hit": a["hit"],
-            "r": {k: a["r"].get(k) for k in ("q", "start", "end", "fc", "fc_end", "rev", "op", "ni", "scope")},
+            "r": {k: a["r"].get(k) for k in ("q", "start", "end", "fc", "fc_end", "rev", "op", "ni", "scope", "shares", "cf")}, "ret": a.get("ret"),
             "ai": ai, "profile": a.get("profile", "")[:600], "qual": a.get("qual", "")[:8000], "chat": str(chat or CHANNEL)}
         return msg
 
