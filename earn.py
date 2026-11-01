@@ -1176,6 +1176,53 @@ JPS_SYS = """당신은 한국 자산운용사 애널리스트를 돕는 리서�
 [공시] 제목: {title}
 본문:
 {body}"""
+JPS_NEWS_SYS = """당신은 한국 자산운용사 애널리스트를 돕는 리서치 보조입니다. 일본어 기사 본문을 읽고, 기사를 직접 열어 보지 않아도 내용을 알 수 있게 한국어로 요약합니다.
+출력 규칙:
+- 반드시 한국어로만 쓴다. 일본어 문장·가나를 남기지 않는다. 회사명·인명도 한국어 음역 또는 영문으로.
+- 2~3줄. 각 줄은 70자 이내의 한 문장, '~함/~했음' 보고서체.
+- 첫 줄: 무슨 일인지(누가, 무엇을, 얼마나, 언제). 둘째·셋째 줄: 배경·이유·수치·회사 측 설명 등 기사에 적힌 중요한 내용.
+- 숫자·금액·비율·날짜는 기사 그대로(億円→억엔, 前年同期比→전년 동기 대비).
+- 기사에 없는 해석·전망·투자 판단은 쓰지 않는다.
+- 본문이 광고·로그인 안내뿐이거나 비었으면 lines를 빈 목록으로.
+출력은 JSON만: {{"lines": ["첫 줄", "둘째 줄", "셋째 줄"]}}
+
+[기사] 제목: {title}
+본문:
+{body}"""
+
+def _gn_decode(link):
+    """Google News RSS 링크 → 원문 URL(실패하면 원래 링크)"""
+    if "news.google.com" not in link: return link
+    try:
+        gid = urllib.parse.urlparse(link).path.split("/")[-1]
+        h = http(f"https://news.google.com/rss/articles/{gid}", timeout=15).decode("utf-8", "ignore")
+        sg = re.search(r'data-n-a-sg="([^"]+)"', h); ts = re.search(r'data-n-a-ts="([^"]+)"', h)
+        if not (sg and ts): return link
+        req = [["Fbv4je", f'["garturlreq",[["X","X",["X","X"],null,null,1,1,"US:en",null,1,null,null,null,'
+                          f'null,null,0,1],"X","X",1,[1,1,1],1,1,null,0,0,null,0],"{gid}",{ts.group(1)},"{sg.group(1)}"]']]
+        r = http("https://news.google.com/_/DotsSplashUi/data/batchexecute", timeout=15,
+                 data=("f.req=" + urllib.parse.quote(json.dumps([req]))).encode(),
+                 headers={"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"}).decode("utf-8", "ignore")
+        url = json.loads(json.loads(r.split("\n\n", 1)[1])[0][2])[1]
+        return url if url.startswith("http") else link
+    except Exception:
+        return link
+
+def _article_text(url):
+    """기사 본문(문단 <p>) → 텍스트. 문단이 거의 없으면 og:description"""
+    raw = http(url, timeout=20)
+    m = re.search(rb'charset=["\']?([\w-]+)', raw[:3000])
+    try: h = raw.decode((m.group(1).decode() if m else "utf-8"), "ignore")
+    except LookupError: h = raw.decode("utf-8", "ignore")
+    h = re.sub(r"(?is)<(script|style|noscript|header|footer|nav|aside)[^>]*>.*?</\1>", " ", h)
+    ps = [html.unescape(re.sub(r"<[^>]+>", "", p)).strip() for p in re.findall(r"(?is)<p[^>]*>(.*?)</p>", h)]
+    ps = [p for p in ps if len(p) >= 25 and not re.search(r"Copyright|無断転載|ログイン|会員登録|cookie", p, re.I)]
+    t = re.sub(r"\s+", " ", " ".join(ps))
+    if len(t) < 150:
+        d = re.search(r'<meta[^>]+(?:property|name)="og:description"[^>]+content="([^"]*)"', h) or re.search(r'<meta[^>]+content="([^"]*)"[^>]+(?:property|name)="og:description"', h)
+        if d: t = (t + " " + html.unescape(d.group(1))).strip()
+    return t
+
 _JPSUM = {"t": 0, "run": None}   # (이름 주의: _JPS 는 아래 japan stock 상태 캐시가 씀)
 def _jps_job(key):
     from jpall import pdf_text, MON_MODELS
@@ -1184,8 +1231,21 @@ def _jps_job(key):
     except Exception as e:
         log("jps pend error", str(e)[:80]); return
     out = []
-    for x in items[:6]:
+    for x in items[:10]:
         ko = ""
+        if x.get("kind") == "news":  # 관심 종목 뉴스: 기사 본문 2~3줄 요약(뉴스봇과 같은 방식)
+            try:
+                real = _gn_decode(x["url"])
+                body = _article_text(real)
+                if len(body) > 120:
+                    j = gemini_json(JPS_NEWS_SYS.format(title=x["title"], body=body[:3500]), timeout=60, models=MON_MODELS) or {}
+                    lines = [re.sub(r"^\s*(?:[•\-*・]|\d{1,2}[.)])\s*", "", str(l)).strip() for l in (j.get("lines") or [])][:3]
+                    lines = [l for l in lines if re.search(r"[가-힣]", l) and len(re.findall(r"[\u3040-\u30ff]", l)) <= len(l) * 0.2]
+                    ko = "\n".join("• " + l for l in lines)
+            except Exception as e:
+                log("jps news sum error", x.get("code"), str(e)[:80])
+            out.append({"id": x["id"], "ko": ko})
+            continue
         try:
             body = re.sub(r"\s+", " ", pdf_text(x["url"]))
             k = body.replace(" ", "").find(re.sub(r"\s", "", x["title"])[:12])
