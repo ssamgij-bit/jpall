@@ -57,6 +57,7 @@ jobs:
           TEST_DAY: ${{ github.event.inputs.test_day }}
           TEST_REPORT: ${{ github.event.inputs.test_report }}
           RUN_SECONDS: "900"   # 한 번 실행 15분: 코드 수정이 빨리 반영되도록
+          GH_TOKEN: ${{ github.token }}   # 1분마다 main 최신 커밋 확인 → 새 코드가 배포되면 이번 실행을 마치고 다음 실행이 새 코드로 이어받음
         run: python earn.py
 
       - name: 상태 저장(earn-state 브랜치에 덮어쓰기)
