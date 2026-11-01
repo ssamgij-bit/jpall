@@ -1626,7 +1626,7 @@ HELP_TXT = ("일본 실적 스크리닝 봇 사용법\n"
             "스크리닝 기준을 통과한 종목은 지금처럼 채널에 올라갑니다.")
 
 
-GUIDE_VER = 8  # 공지 문구를 바꾸면 올림 → 고정 공지를 새 내용으로 수정
+GUIDE_VER = 9  # 공지 문구를 바꾸면 올림 → 고정 공지를 새 내용으로 수정
 def guide_text(me):
     R = RULES
     sec = ", ".join(sorted(dict.fromkeys(SECTOR_KO.get(x, x) for x in EXCL_SECTORS)))
