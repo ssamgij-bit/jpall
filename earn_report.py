@@ -466,6 +466,43 @@ def cons_fy(code):
         out["eps"] = float(ee.loc["0y", "avg"]); out["eps_n"] = int(ee.loc["0y", "numberOfAnalysts"] or 0)
     return out
 
+# ───────────────────────── 심층 추출 한 번에: 캐파 · 비즈니스 심층 · 주주환원 목표 ─────────────────────────
+# 같은 IR 자료를 세 번 읽던 것을 한 번의 AI 호출로 합침(한도·시간 절약). 비즈니스 심층은 분기마다 크게 안 바뀌어 종목별 90일 저장
+def deep_extract(card, name, code, pdfs, pnames):
+    import hashlib
+    idx = [i for i, (nm, _) in enumerate(pnames) if "결산단신" not in nm and "질의응답" not in nm and "수정 공시" not in nm][:2]
+    cpath = os.path.join(E.STATE_DIR, "deepcache.json")
+    try: cache = json.load(open(cpath))
+    except Exception: cache = {}
+    old = cache.get(code) or {}
+    reuse_biz = bool(old.get("biz")) and time.time() - old.get("t", 0) < 90 * 86400
+    docs = "; ".join(f"{k}. {pnames[i][0]}" for k, i in enumerate(idx, 1)) or "없음"
+    parts = [CAPA_PROMPT.split("출력:")[0].format(name=name, code=code, docs=docs).strip(),
+             "- 주주환원 목표: " + POLICY_PROMPT.split("출력:")[0].split("\n- ", 1)[1].format(docs=docs, name=name, code=code).strip()]
+    schema = ['"capa": {"found": false} 또는 {"found": true, "title": "", "doc": 첨부 번호, "page": 쪽, "why": "", "takeaway": "", "chart": {"type": "bar", "unit": "", "labels": [], "series": [{"name": "", "values": []}]}}',
+              '"policy": [{"metric": "배당성향|총주주환원율|DOE|누진배당|자사주|기타", "target": "", "period": "", "src": ""}]']
+    if not reuse_biz:
+        parts.append("- 비즈니스 심층(아래 규칙):\n" + BIZ_PROMPT.split("규칙", 1)[1].split("출력:")[0].strip().replace("{{", "{").replace("}}", "}"))
+        schema.append('"biz": {"model": {"flow": [""], "mix": [{"name": "", "share": 0}], "mix_src": "", "mix_period": ""}, "value_chain": [], "competitors": [], "position": "", "strengths": [], "weaknesses": [], "leading": []}')
+    prompt = (f"너는 일본 중소형주를 깊게 보는 한국 바이사이드 애널리스트다. {name}({code}, 업종 {E.SECTOR_KO.get(card['sector'], card['sector'])})의 첨부 IR 자료(첨부 목록: {docs})와 "
+              "아래 회사 개요·결산단신 본문을 읽고 세 가지를 한 번에 한국어 JSON으로 정리하라. 자료에 없는 숫자는 쓰지 말 것. 일본어를 그대로 쓰지 말 것.\n\n"
+              + "\n\n".join(parts) + "\n\n출력(JSON 하나): {" + ", ".join(schema) + "}\n\n"
+              + f"회사 개요(일본어): {card.get('profile', '')[:600]}\n결산단신 본문(일부): {(card.get('qual') or '')[:3500]}")
+    out = (gemini_pdf(prompt, [pdfs[i] for i in idx], max_tokens=9000) if idx else gemini_json(prompt, timeout=150)) or {}
+    if isinstance(out, list): out = out[0] if out and isinstance(out[0], dict) else {}
+    if reuse_biz: out["biz"] = old["biz"]; out["_biz_cached"] = old.get("t")
+    elif out.get("biz"):
+        cache[code] = {"t": time.time(), "biz": out["biz"]}
+        try:
+            cache = {k: v for k, v in cache.items() if time.time() - v.get("t", 0) < 120 * 86400}
+            os.makedirs(E.STATE_DIR, exist_ok=True); json.dump(cache, open(cpath, "w"), ensure_ascii=False)
+        except Exception as e: E.log("deepcache save error", e)
+    c = out.get("capa")
+    if isinstance(c, dict) and c.get("found") and idx:
+        try: c["doc"] = idx[int(c.get("doc") or 1) - 1] + 1
+        except Exception: c["doc"] = idx[0] + 1
+    return out
+
 # ───────────────────────── 주주환원: 배당성향 · 총주주환원율 ─────────────────────────
 POLICY_PROMPT = """첨부 IR 자료(첨부 목록: {docs})와 아래 결산단신 본문에서 {name}({code})이 밝힌 주주환원 정책·목표만 찾아 한국어 JSON으로.
 - 찾을 것: 배당성향 목표, 총주주환원율(총환원성향) 목표, DOE(자기자본배당률) 목표, 누진배당(감배하지 않음) 방침, 자사주 매입 방침·규모, 적용 기간(예: 중기계획 기간 FY3/27~FY3/31).
@@ -511,7 +548,7 @@ def ret_hist_chart(plt, rows):
     fig.tight_layout()
     return f'<figure><img src="{b64png(fig)}"></figure>'
 
-def ret_section(card, kb, att, plt=None, pdfs=(), pnames=()):
+def ret_section(card, kb, att, plt=None, policy=None):
     ret = card.get("ret")
     if not ret:   # 예전 카드: 결산단신 XBRL 현금흐름표로 다시 계산
         r = dict(card["r"])
@@ -537,7 +574,7 @@ def ret_section(card, kb, att, plt=None, pdfs=(), pnames=()):
     # 회사가 밝힌 주주환원 목표(가이던스)
     pol_html = ""
     try:
-        pol = ret_policy(card, list(pdfs), list(pnames))
+        pol = [x for x in (policy or []) if isinstance(x, dict) and x.get("target")]
         if pol:
             pol_html = ("<div class=card><b>회사가 밝힌 주주환원 목표</b><ul>" + "".join(
                 f"<li><b>{esc(x.get('metric'))}</b> {esc(x.get('target'))}" + (f" · {esc(x['period'])}" if x.get("period") else "")
@@ -552,12 +589,12 @@ def ret_section(card, kb, att, plt=None, pdfs=(), pnames=()):
         import earn_edinet
         hist, note = earn_edinet.history(card["code"], card.get("fem") or 3)
         if hist:
-            trs = "".join(f"<tr><td>FY{int(h['fy'][5:7])}/{h['fy'][2:4]}</td><td>{fmt(h.get('dps'))}엔</td><td>{E.oku(h.get('div'))}</td><td>{E.oku(h.get('buy'))}</td>"
+            trs = "".join(f"<tr><td>FY{int(h['fy'][5:7])}/{h['fy'][2:4]}</td><td>{fmt(h.get('dps'))}엔{f"<br><small>(당시 {fmt(h.get('dps_raw'))}엔, 1:{h['split']:g} 분할 조정)</small>" if (h.get('split') or 1) > 1 else ""}</td><td>{E.oku(h.get('div'))}</td><td>{E.oku(h.get('buy'))}</td>"
                           f"<td>{E.oku(h.get('ni'))}</td><td>{fmt(h.get('payout'))}%</td><td><b>{fmt(h.get('total'))}%</b></td></tr>" for h in hist)
             hist_html = ((ret_hist_chart(plt, hist) if plt else "") +
                          "<div class=scroll><table><tr><th>회계연도</th><th>주당배당</th><th>배당금 지급</th><th>자사주 매입</th><th>순이익</th><th>배당성향</th><th>총주주환원율</th></tr>"
                          + trs + "</table></div><p class=muted>출처: EDINET 유가증권보고서(주요 경영지표 추이·현금흐름표). 배당금·자사주는 그해 실제 지급액(현금 기준), "
-                         "총주주환원율 = (배당금 지급 + 자사주 매입) ÷ 지배주주 순이익. 주당배당은 당시 기준(주식분할 전 숫자일 수 있음)."
+                         "총주주환원율 = (배당금 지급 + 자사주 매입) ÷ 지배주주 순이익. 주당배당은 발행주식수 변화로 주식분할을 찾아 지금 기준으로 조정(조정한 해는 당시 숫자 병기)."
                          + (f" {esc(note)}" if note else "") + "</p>")
         elif note:
             hist_html = f"<p class=muted>10년 추이: {esc(note)}</p>"
@@ -587,17 +624,13 @@ BIZ_PROMPT = """너는 일본 중소형주를 깊게 보는 한국 바이사이�
 결산단신 본문(일부): {qual}
 """
 
-def biz_section(plt, card, name, code, pdfs, pnames):
-    """→ HTML 또는 "" — 설명 자료·참고 자료가 있으면 그 PDF와 함께, 없으면 개요·본문만으로"""
-    idx = [i for i, (nm, _) in enumerate(pnames) if "결산단신" not in nm and "질의응답" not in nm and "수정 공시" not in nm][:2]
-    prompt = BIZ_PROMPT.format(name=name, code=code, sector=E.SECTOR_KO.get(card["sector"], card["sector"]), profile=card.get("profile", "")[:600],
-                               qual=card.get("qual", "")[:3000], docs="; ".join(f"{k}. {pnames[i][0]}" for k, i in enumerate(idx, 1)) or "없음")
-    b = (gemini_pdf(prompt, [pdfs[i] for i in idx], max_tokens=8000) if idx else gemini_json(prompt, timeout=150)) or {}
-    if isinstance(b, list): b = b[0] if b and isinstance(b[0], dict) else {}
-    if not b: return ""
+def biz_section(plt, card, name, code, b, cached_t=None):
+    """심층 추출 결과(b) → HTML 또는 """""
+    if not isinstance(b, dict) or not b: return ""
     tag = lambda x: ' <span class=tag>일반 지식</span>' if str((x or {}).get("src", "")).startswith("일반") else ""
     H = ["<h2>비즈니스 심층 — 사업 구조 · 밸류체인 · 경쟁 구도</h2>",
-         "<p class=muted>IR 자료·결산단신을 바탕으로 Gemini가 정리. <span class=tag>일반 지식</span> 표시는 자료에 없고 업계에 일반적으로 알려진 내용(검증 필요).</p>"]
+         "<p class=muted>IR 자료·결산단신을 바탕으로 Gemini가 정리. <span class=tag>일반 지식</span> 표시는 자료에 없고 업계에 일반적으로 알려진 내용(검증 필요)."
+         + (f" 사업 구조는 분기마다 크게 바뀌지 않아 {time.strftime('%Y-%m-%d', time.localtime(cached_t))}에 정리한 내용을 다시 씀(90일마다 새로 정리)." if cached_t else "") + "</p>"]
     m = b.get("model") or {}
     flow = [str(x) for x in (m.get("flow") or []) if str(x).strip()][:5]
     if flow:
@@ -832,22 +865,18 @@ def build(card):
     ai = (gemini_pdf(prompt, pdfs, max_tokens=16000) if pdfs else gemini_json(prompt, timeout=180)) or {}
     card["_ai_ok"] = bool(ai)
     if isinstance(ai, list): ai = ai[0] if ai and isinstance(ai[0], dict) else {}
-    # 4-2) 캐파·증설 자료를 AI 선택에만 맡기지 않음: 핵심 데이터에 없으면 설명 자료·참고 자료에서 따로 한 번 더 찾아 맨 앞에 넣음
-    capa_hit = False
+    # 4-2) 캐파·비즈니스 심층·주주환원 목표를 한 번의 호출로(캐파는 핵심 데이터에 없을 때만 맨 앞에 넣음)
+    capa_hit, deep = False, {}
     try:
         ins = [x for x in (ai.get("insights") or []) if isinstance(x, dict)]
         capa_hit = any(CAPA_RE.search(f"{x.get('title', '')} {x.get('takeaway', '')}") for x in ins)
-        cdocs = [i for i, (nm, _) in enumerate(pnames) if "결산단신" not in nm and "질의응답" not in nm and "수정 공시" not in nm]
-        if ai and not capa_hit and cdocs:
-            cp_ = gemini_pdf(CAPA_PROMPT.format(name=name, code=code, docs="; ".join(f"{k}. {pnames[i][0]}" for k, i in enumerate(cdocs, 1))),
-                             [pdfs[i] for i in cdocs], max_tokens=4000) or {}
-            if isinstance(cp_, dict) and cp_.get("found") and cp_.get("title"):
-                try: cp_["doc"] = cdocs[int(cp_.get("doc") or 1) - 1] + 1   # 이 호출의 첨부 번호 → 전체 첨부 번호
-                except Exception: cp_["doc"] = cdocs[0] + 1
-                ai["insights"] = [cp_] + ins[:5]; capa_hit = True
-                E.log("캐파 자료 따로 찾음", code, cp_.get("title", "")[:30])
+        if ai: deep = deep_extract(card, name, code, pdfs, pnames)
+        cp_ = deep.get("capa")
+        if not capa_hit and isinstance(cp_, dict) and cp_.get("found") and cp_.get("title"):
+            ai["insights"] = [cp_] + ins[:5]; capa_hit = True
+            E.log("캐파 자료 따로 찾음", code, cp_.get("title", "")[:30])
     except Exception as e:
-        E.log("capa extract error", e)
+        E.log("deep extract error", e)
     trm = {w: KO_COMMON[w] for w in words if w in KO_COMMON}
     trm.update({k: v for k, v in (ai.get("tr") or {}).items() if v})
     miss = [w for w in words if w not in trm or re.search(r"[぀-ヿ一-鿿]", trm.get(w) or "")]
@@ -889,9 +918,9 @@ def build(card):
 
     try: guide_html = guide_section(plt, card, kb)
     except Exception as e: E.log("guide section error", e); guide_html = ""
-    try: ret_html = ret_section(card, kb, att, plt, pdfs, pnames)
+    try: ret_html = ret_section(card, kb, att, plt, deep.get("policy"))
     except Exception as e: E.log("ret section error", e); ret_html = ""
-    try: bizdeep_html = biz_section(plt, card, name, code, pdfs, pnames)
+    try: bizdeep_html = biz_section(plt, card, name, code, deep.get("biz"), deep.get("_biz_cached"))
     except Exception as e: E.log("biz section error", e); bizdeep_html = ""
     # 6) IR 자료에서 고른 핵심 데이터
     ins_html = ""
@@ -1050,6 +1079,36 @@ def build(card):
     if ai.get("guidance") or ai.get("risks") or watch:
         tail = ("<h2>가이던스 · 리스크 · 다음에 확인할 점</h2><div class=card>" + (f"<p><b>가이던스</b> {esc(ai.get('guidance'))}</p>" if ai.get("guidance") else "")
                 + (f"<p><b>리스크</b> {esc(ai.get('risks'))}</p>" if ai.get("risks") else "") + (f"<ul>{watch}</ul>" if watch else "") + "</div>")
+    # 한눈에 보기: 실적 한 줄 · 가이던스 · 주주환원 · 핵심 포인트 3개 (휴대폰에서 먼저 읽을 것)
+    glance = []
+    try:
+        ry, rst = E.yoy(q.get("rev"), py.get("rev")); oy, ost = E.yoy(q.get("op"), py.get("op"))
+        glance.append(f"<b>실적</b> {esc(lab_q)}({esc(months_q)}) 매출 {E.oku(q.get('rev'))}({E.yoy_txt(ry, rst)}) · 영업이익 {E.oku(q.get('op'))}({E.yoy_txt(oy, ost)})")
+        if fc.get("op"):
+            ly = E.fy_base(card["series"], r, "op") or E.fy_base(allq, r, "op")
+            rv_ = card.get("rev") or {}
+            o0 = (rv_.get("op") or (None, None))[0]
+            glance.append(f"<b>가이던스</b> {E.fy_label_end(r.get('fc_end'))} 영업이익 예상 {E.oku(fc['op'] / 1e6)}"
+                          + (f"(전년 대비 {(fc['op'] / 1e6 / ly - 1) * 100:+.0f}%)" if ly and ly > 0 else "")
+                          + (f" · 이번에 {E.oku(o0)}에서 {'상향' if fc['op'] / 1e6 > o0 else '하향'}" if o0 and abs(fc['op'] / 1e6 - o0) > 0.5 else ""))
+        rl = E.ret_line(card.get("ret"))
+        if rl: glance.append(rl.replace("▶️ ", ""))
+        pts = [x for x in (ai.get("insights") or []) if isinstance(x, dict) and (x.get("takeaway") or x.get("title"))][:3]
+        if pts: glance.append("<b>핵심 포인트</b><ul>" + "".join(f"<li>{esc(x.get('takeaway') or x.get('title'))}</li>" for x in pts) + "</ul>")
+    except Exception as e:
+        E.log("glance error", e)
+    glance_html = ("<div class=glance><div class=gt>한눈에 보기</div>" + "".join(f"<div>{g}</div>" for g in glance) + "</div>") if glance else ""
+
+    def fold(h, open_=False):
+        """<h2>로 시작하는 섹션을 접을 수 있게(제목을 누르면 펼침)"""
+        if not h: return ""
+        m = re.match(r"\s*<h2>(.*?)</h2>", h, re.S)
+        if not m: return h
+        return f"<details class=sec{' open' if open_ else ''}><summary><span class=h2>{m.group(1)}</span></summary>{h[m.end():]}</details>"
+    tables_html = (f"<h2>분기·연간 실적 표와 차트</h2><h3>분기 실적 (3개월 단독, {esc(r.get('scope') or '')})</h3><div class=scroll><table>"
+                   "<tr><th>분기</th><th>발표일</th><th>매출</th><th>YoY</th><th>영업이익</th><th>YoY</th><th>영업이익률</th><th>순이익</th><th>YoY</th></tr>" + "".join(qrows) + "</table></div>"
+                   + pl_html + "<h3>연간 실적</h3><div class=scroll><table><tr><th>회계연도</th><th>매출</th><th>영업이익</th><th>영업이익률</th><th>순이익</th><th>EPS</th><th>배당</th></tr>"
+                   + "".join(yrows) + "</table></div>" + "".join(f'<figure><img src="{c}"></figure>' for c in charts))
     doc = f"""<!doctype html><html lang=ko><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>{esc(name)}({code}) 실적 리포트</title><style>
 body{{font-family:-apple-system,'Apple SD Gothic Neo','Noto Sans KR','Malgun Gothic',sans-serif;margin:0;background:#f6f7f9;color:#1f2328;line-height:1.55}}
@@ -1063,28 +1122,28 @@ th:first-child,td:first-child{{text-align:left}} th{{background:#f0f3f8;font-wei
 details{{background:#fff;border-radius:10px;margin:10px 0;padding:8px 12px}} summary{{cursor:pointer;font-weight:600}} details img{{width:100%;margin-top:6px;border:1px solid #eee}}
 figure{{margin:10px 0;background:#fff;border-radius:10px;padding:8px}} figure img{{width:100%}} figcaption{{font-size:12px;color:#6b7280;padding:2px 6px}}
 .muted,small{{color:#6b7280}} a{{color:#2f6fd6}} .rx{{background:#fff7ed;border-radius:8px;padding:6px 10px}}
+.glance{{background:#fff;border:2px solid #2f6fd6;border-radius:12px;padding:12px 16px;margin:12px 0}} .glance .gt{{font-weight:700;color:#2f6fd6;margin-bottom:6px}} .glance>div{{margin:4px 0}} .glance ul{{margin:4px 0 0 0;padding-left:18px}}
+details.sec{{padding:0 12px 8px}} details.sec>summary{{list-style:none;padding:10px 0}} details.sec>summary::-webkit-details-marker{{display:none}}
+.h2{{font-size:17px;font-weight:700;border-left:4px solid #2f6fd6;padding-left:8px}} details.sec>summary .h2:after{{content:" ▸";color:#6b7280;font-size:13px}} details.sec[open]>summary .h2:after{{content:" ▾"}}
 .flow{{padding:6px 10px;margin:4px 0;background:#f0f6ff;border-left:3px solid #2f6fd6;border-radius:4px}} .tag{{font-size:11px;background:#fde68a;color:#78350f;border-radius:4px;padding:0 4px;margin-left:4px}}
 </style></head><body><main>
 <h1>{esc(name)} <small>({code} JP · {esc(E.SECTOR_KO.get(card['sector'], card['sector']))})</small></h1>
 <p class=muted>{lab}({months}) 실적 · 발표 {card['d'][:4]}-{card['d'][4:6]}-{card['d'][6:]} {card['t']} JST · {' · '.join(card.get('hit') or []) or '요청 분석'}</p>
 {f"<div class=card>{esc(ai.get('overview') or cardai.get('bm'))}</div>" if (ai.get('overview') or cardai.get('bm')) else ''}
 <div class=kpi>{''.join(f'<div><span>{k}</span><b>{v}</b></div>' for k, v in kpi)}</div>
+{glance_html}
 {f"<div class=head><b>{esc(headline)}</b><p>{esc(ai.get('narrative'))}</p></div>" if headline else ''}
 {f"<div class=card><ul>{why}</ul>{rx_html}</div>" if (why or rx_html) else ''}
-{guide_html}
-{ret_html}
-{biz_html}
-{reg_html}
-{bizdeep_html}
-{ins_html}
-{qa_html}
-{op_html}
-<h2>분기 실적 (3개월 단독, {esc(r.get('scope') or '')})</h2><div class=scroll><table>
-<tr><th>분기</th><th>발표일</th><th>매출</th><th>YoY</th><th>영업이익</th><th>YoY</th><th>영업이익률</th><th>순이익</th><th>YoY</th></tr>{''.join(qrows)}</table></div>
-{pl_html}
-<h2>연간 실적</h2><div class=scroll><table><tr><th>회계연도</th><th>매출</th><th>영업이익</th><th>영업이익률</th><th>순이익</th><th>EPS</th><th>배당</th></tr>{''.join(yrows)}</table></div>
-{''.join(f'<figure><img src="{c}"></figure>' for c in charts)}
-{tail}
+{fold(guide_html, True)}
+{fold(ins_html, True)}
+{fold(biz_html, True)}
+{fold(ret_html)}
+{fold(reg_html)}
+{fold(bizdeep_html)}
+{fold(qa_html)}
+{fold(op_html)}
+{fold(tables_html)}
+{fold(tail, True)}
 {holder_html}
 <h2>원문</h2><p>{' · '.join(links)}</p>
 <p class=muted>출처: TDnet(결산단신 XBRL·PDF, 설명 자료), 회사 IR 홈페이지, 로그미 파이낸스, 가부탄(실적·시가총액·대주주), 네이버 증권(주가). 금액 억 엔(원자료 백만 엔 환산).

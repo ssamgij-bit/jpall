@@ -17,6 +17,8 @@ IR_PROMPT = """첨부 PDF는 일본 상장사 {name}({code})의 이번 결산 �
 한국 애널리스트용 '실적 발표 IR·경영진 Q&A 요약'을 한국어 JSON으로 써라.
 규칙
 - 자료에 있는 내용만 쓴다. 추측·외부 지식 금지. 자료에 없으면 빈 문자열 또는 빈 배열.
+- 원문에 없는 강조·평가 수식어를 붙이지 않는다(예: 원문이 "계획을 웃돌았다"면 "크게·대폭·압도적으로 웃돌았다"로 쓰지 말 것). 정도 표현은 원문 그대로, 숫자가 있으면 숫자로.
+- message는 질의응답·설명회 자료가 있을 때만 경영진 발언으로 쓰고, 없으면 결산단신·설명 자료에 적힌 회사 설명을 그대로 요약한다(발언처럼 꾸미지 말 것).
 - 일본어를 그대로 쓰지 말고 전부 한국어로 번역(인명·제품명은 한글 발음 또는 통용 영문).
 - 금액은 자료 단위 그대로 쓰되 억 엔으로 바꿀 수 있으면 억 엔(1억 엔=100백만 엔). 전년 대비는 YoY.
 {qrule}- key 첫 줄은 아래 '이번 3개월 분기 수치'를 그대로 쓰고, 부문 숫자도 3개월 분기 기준(없으면 '(누적 n~m월)' 표시).
@@ -670,7 +672,9 @@ def render(card, o, has_qa, names, links=None):
     L.append("")
     if o.get("overview"): L += ["📮 <b>기업 개요</b>", _e(o["overview"]), ""]
     if o.get("key"): L += ["📊 <b>핵심 실적</b>"] + [f"- {_e(x)}" for x in o["key"]] + ["<i>(TDnet 결산단신·설명 자료 기준, Gemini 추출)</i>", ""]
-    if o.get("message"): L += ["🗣 <b>경영진 핵심 메시지</b>", _e(o["message"]), ""]
+    if o.get("message"):
+        mlab = "경영진 핵심 메시지" if has_qa else ("회사 설명 요지(결산 설명 자료 기준)" if any("설명 자료" in str(n) for n in names) else "회사 설명 요지(결산단신 기준)")
+        L += [f"🗣 <b>{mlab}</b>", _e(o["message"]), ""]
     if o.get("surprise"): L += ["🔥 <b>서프라이즈 포인트</b>"] + [f"- <b>[{_e(s.get('title'))}]</b> {_e(s.get('body'))}" for s in o["surprise"] if isinstance(s, dict)] + [""]
     if o.get("kpi"): L += ["📝 <b>특이사항 &amp; 핵심 KPI</b>"] + [f"- {_e(x)}" for x in o["kpi"]] + [""]
     if o.get("guidance"): L += ["🚀 <b>가이던스</b>", _e(o["guidance"]), ""]

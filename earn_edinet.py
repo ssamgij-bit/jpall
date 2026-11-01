@@ -65,6 +65,7 @@ def _find_doc(sec, fy_end, budget):
 SUM_DPS = re.compile(r"DividendPaidPerShare\w*SummaryOfBusinessResults")
 SUM_PAY = re.compile(r"PayoutRatio\w*SummaryOfBusinessResults")
 SUM_NI = re.compile(r"ProfitLossAttributableToOwnersOfParent\w*SummaryOfBusinessResults|NetIncomeLoss\w*SummaryOfBusinessResults|ProfitLoss\w*SummaryOfBusinessResults")
+SUM_SH = re.compile(r"TotalNumberOfIssuedShares\w*SummaryOfBusinessResults|NumberOfIssuedSharesAsOfFiscalYearEnd\w*SummaryOfBusinessResults")
 CF_DIV = re.compile(r"(Cash)?DividendsPaid\w*FinCF\w*|PaymentsOfDividends\w*FinCF\w*")
 CF_BUY = re.compile(r"PurchaseOfTreasury(Stock|Shares)\w*FinCF\w*|PaymentsForPurchaseOfTreasury\w*")
 
@@ -99,6 +100,7 @@ def _parse(doc, period_end):
     put(SUM_DPS, "dps", cons_first=False)
     put(SUM_PAY, "payout", scale=100.0, cons_first=True, sign=0)
     put(SUM_NI, "ni", scale=1e-6, sign=0)
+    put(SUM_SH, "shares", cons_first=False, sign=0)
     put(CF_DIV, "div", scale=1e-6)
     put(CF_BUY, "buy", scale=1e-6)
     for v in out.values():   # 배당성향이 0~1(소수)로 올 수도, 이미 %로 올 수도 있음
@@ -142,8 +144,18 @@ def history(code, fem, budget_s=90):
     os.makedirs(os.path.dirname(p), exist_ok=True)
     json.dump(c, open(p, "w"), ensure_ascii=False)
     rows = []
-    for y in sorted(c["years"])[-10:]:
+    yrs = sorted(c["years"])[-10:]
+    # 주식분할 조정: 최근 발행주식수 ÷ 그해 발행주식수가 흔한 분할 비율(1.5·2·3·4·5·10…배)에 가까우면 그해 주당배당을 지금 기준으로 나눔
+    last_sh = next((c["years"][y]["shares"] for y in reversed(yrs) if c["years"][y].get("shares")), None)
+    def adj(v):
+        if not last_sh or not v.get("shares") or v.get("dps") is None: return v.get("dps"), 1
+        r = last_sh / v["shares"]
+        for k in (100, 50, 20, 10, 5, 4, 3, 2.5, 2, 1.5):
+            if abs(r / k - 1) < 0.04: return v["dps"] / k, k
+        return v.get("dps"), 1
+    for y in yrs:
         v = c["years"][y]
         tot = ((v.get("div") or 0) + (v.get("buy") or 0)) / v["ni"] * 100 if v.get("ni") and v["ni"] > 0 and (v.get("div") is not None or v.get("buy") is not None) else None
-        rows.append({"fy": y, **{k: v.get(k) for k in ("dps", "payout", "ni", "div", "buy")}, "total": tot})
+        dps_adj, split = adj(v)
+        rows.append({"fy": y, **{k: v.get(k) for k in ("payout", "ni", "div", "buy")}, "dps": dps_adj, "dps_raw": v.get("dps"), "split": split, "total": tot})
     return rows, note
