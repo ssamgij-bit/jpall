@@ -500,6 +500,61 @@ def prev_tanshin_pdf(card):
             except Exception as e: E.log("prev tanshin error", e)
     return None, None
 
+# 이번 분기 설명 자료가 없거나 그 자료에 빠진 구조 자료(생산능력·증설·수주잔고·제품별 매출·중기 목표)를 보완할 '최근 IR 자료'
+REF_LINK = re.compile(MAT_LINK.pattern + r"|中期経営計画|中長期経営計画|経営計画|事業説明会|成長戦略|IR\s*Day|Investor\s*Day|会社説明会|個人投資家", re.I)
+REF_TDNET = re.compile(r"決算説明|説明会資料|説明資料|プレゼンテーション|決算補足|補足資料|中期経営計画|中長期経営計画|経営計画|事業説明会|成長戦略|設備投資|増設|生産能力|資本コスト")
+def ref_label(t):
+    """참고 자료 제목(일본어) → 한국어 종류 이름"""
+    t = nfkc(t)
+    for pat, ko in ((r"中期経営計画|中長期|経営計画", "중기 경영계획"), (r"決算説明|決算補足|説明会資料|説明資料|決算資料|プレゼン|Presentation", "결산 설명회 자료"),
+                    (r"事業説明会|IR\s*Day|Investor\s*Day|会社説明会|個人投資家", "사업·회사 설명회 자료"), (r"設備投資|増設|生産能力", "설비투자 공시"),
+                    (r"資本コスト", "자본비용·주가 대응 자료"), (r"成長戦略", "성장 전략 자료"), (r"ファクトブック|Fact ?Book|データブック", "팩트북")):
+        if re.search(pat, t, re.I): return ko
+    return "IR 자료"
+
+def latest_refs(card, skip=(), days=400, limit=2, budget=8_000_000):
+    """이번 결산 전 약 1년 안의 가장 최근 IR 발표 자료·중기 경영계획·설비투자 공시 PDF → [(bytes, url, 제목, YYYY-MM-DD)]
+    찾는 곳: 가부탄 공시 목록(TDnet 사본) → 회사 IR 홈페이지. 발표 자료(설명회·중기계획)를 먼저, 설비투자 공시는 그다음."""
+    d0 = dt.datetime.strptime(card["d"], "%Y%m%d")
+    lo = (d0 - dt.timedelta(days=days)).strftime("%Y%m%d")
+    cand = []
+    try:
+        for day, did, title in kabutan_list(card["code"], lo, pages=15):
+            t = nfkc(html.unescape(title))
+            if not (lo <= day <= card["d"]) or "訂正" in t or re.search(r"[A-Za-z]{6}", t) or not REF_TDNET.search(t): continue
+            pri = 0 if re.search(r"説明|プレゼン|補足|経営計画|成長戦略|資本コスト", t) else 1
+            cand.append((pri, day, f"https://tdnet-pdf.kabutan.jp/{day}/{did}.pdf", t))
+    except Exception as e:
+        E.log("ref kabutan error", e)
+    try:
+        for t, u, d in ir_site_docs(card["code"], lo, limit=4, pat=REF_LINK):
+            day = (d or "").replace("-", "")[:8]
+            if day and day > card["d"]: continue
+            cand.append((0, day or "0", u, t))
+    except Exception as e:
+        E.log("ref ir site error", e)
+    import hashlib
+    def ok_day(d):
+        try: dt.datetime.strptime(d, "%Y%m%d"); return d
+        except Exception: return d[:6] if re.fullmatch(r"20\d\d(0[1-9]|1[0-2])\d*", d or "") else ""
+    out, total, seen = [], 0, set(skip)
+    for pri, day, u, t in sorted(cand, key=lambda x: (x[0], -int(x[1] or 0))):
+        k = re.sub(r"\s+", "", t)[:20]
+        if u in seen or k in seen: continue
+        seen.update((u, k))
+        try:
+            kind, b = fetch_doc(u, pat=REF_LINK)
+        except Exception as e:
+            E.log("ref fetch error", e); continue
+        if kind != "pdf": continue
+        hk = hashlib.md5(b).hexdigest()
+        if hk in seen or total + len(b) > budget: continue
+        seen.add(hk); day = ok_day(day)
+        out.append((b, u, ref_label(t), f"{day[:4]}-{day[4:6]}-{day[6:]}" if len(day) == 8 else f"{day[:4]}-{day[4:6]}" if len(day) == 6 else "날짜 미상")); total += len(b)
+        if len(out) >= limit: break
+    if out: E.log("최근 IR 참고 자료", card["code"], " / ".join(f"{t[:20]}({d})" for _, _, t, d in out))
+    return out
+
 def kabutan_docs(card):
     """TDnet 보관 기간(약 1개월)이 지난 결산: 가부탄 공시 목록의 TDnet 사본 PDF 주소 → {"pdf": 결산단신, "mat": 설명 자료}"""
     out = {}

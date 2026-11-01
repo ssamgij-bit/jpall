@@ -743,8 +743,12 @@ def card_text(a, ai, row):
     if v.get("cons_rev") and q.get("rev"):
         cr = v["cons_rev"] / 1e6
         L.append(f" 매출 컨센서스 {oku(cr)} 대비 <b>{(q['rev'] / cr - 1) * 100:+.1f}%</b> (Yahoo 애널리스트 {v.get('cons_n') or '?'}명 평균)")
+    if g_line and r["q"] < 4:   # 수정된 예상: 전년 실적 대비 성장률도
+        ly = fy_base(series, r, "op")
+        if ly and ly > 0: g_line += f" · 전년 대비 <b>{(rv['op'][1] / ly - 1) * 100:+.0f}%</b>"
     if not g_line and fc.get("op") and r["q"] < 4:
-        g_line = f"{fy_label_end(r.get('fc_end'))} 영업이익 예상 {oku(fc['op'] / 1e6)}"
+        ly = fy_base(series, r, "op")
+        g_line = f"{fy_label_end(r.get('fc_end'))} 영업이익 예상 {oku(fc['op'] / 1e6)}" + (f"(전년 대비 <b>{(fc['op'] / 1e6 / ly - 1) * 100:+.0f}%</b>)" if ly and ly > 0 else "")
     elif not g_line and fc.get("op") and r["q"] == 4:
         base = r.get("op")
         g_line = f"{fy_label_end(r.get('fc_end'))} 영업이익 예상 {oku(fc['op'] / 1e6)}" + (f"(올해 대비 {(fc['op'] / base - 1) * 100:+.0f}%)" if base and base > 0 else "")
@@ -763,6 +767,15 @@ def card_text(a, ai, row):
         L.append("")
     L.append("▶️ <b>주가</b> 다음 거래일 장 마감 후 업데이트")
     return "\n".join(L)
+
+def fy_base(series, r, m):
+    """예상 회계연도의 1년 전 연간 실적(백만 엔) = 그 해 4개 분기 합(분기 시계열에서)"""
+    try:
+        fe = (r.get("fc_end") or "")[:7]; by_end = {s["end"]: s for s in series}
+        qs = [by_end.get(ym_add(fe, -12 - 3 * k)) for k in range(4)]
+        return sum(x[m] for x in qs) if all(x and x.get(m) is not None for x in qs) else None
+    except Exception:
+        return None
 
 def fy_label_end(end):
     try: return f"FY{int(end[5:7])}/{end[2:4]}"

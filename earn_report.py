@@ -179,9 +179,12 @@ IR_PROMPT = """너는 일본 중소형주를 깊게 보는 한국 바이사이�
   · 두 표 모두 business/region 항목 값은 숫자(억 엔), 모르면 null. period는 두 숫자의 기간.
 - insights: 투자 판단에 의미 있는 자료를 네가 골라 3~6개. 우선순위: 수주·수주잔고·BB, 용도·고객 산업별 매출, 가격·물량·환율 요인(영업이익 증감 분석),
   핵심 KPI 추이(점포 수·단가·가동률·고객 수·ARR 등), 가이던스 수정 내역, 주주환원. 매출/이익 합계를 다시 보여주는 것은 제외.
-  각 항목: title, page(원문 PDF 쪽 번호, 첫 PDF 기준 1부터), why(왜 의미 있는지 한 줄), takeaway(숫자로 된 결론 한 줄),
+  각 항목: title, doc(그 자료가 있는 첨부 번호, 1부터 — 아래 '첨부 목록' 기준), page(그 첨부 PDF의 쪽 번호, 1부터), why(왜 의미 있는지 한 줄), takeaway(숫자로 된 결론 한 줄),
   chart: {{"type": "bar" 또는 "line" 또는 "waterfall", "unit": "", "labels": [], "series": [{{"name": "", "values": [숫자]}}]}}
   (waterfall은 labels=[시작, 요인1, 요인2, ..., 끝], series 하나, 시작·끝은 수준값, 가운데는 증감값)
+- '이전 IR 참고 자료'(첨부 목록에 표시)는 이번 분기 이전에 나온 자료다. 이번 분기 자료에 없는 구조 자료 — 생산능력(캐파)과 증설 일정·투자액,
+  수주잔고, 제품·용도별 매출 구성, 중기 목표·KPI — 는 여기서 골라 insights에 넣는다(최대 3개). 같은 내용이 이번 분기 자료에 있으면 이번 것을 쓴다.
+  참고 자료에서 고른 항목의 why에는 그 자료가 언제 기준인지 밝히고, 이번 실적과 엮어 지금 어디쯤인지 한 줄로 말한다.
 - qa: 설명회 기록·질의응답이 있으면 투자 판단에 중요한 것만 중요한 순서로 3~6개 {{"q": "", "a": "2~3문장", "who": "답변자 직함(있으면)"}}
   우선순위: 가이던스 전제·상향 여지 > 수주·수요 지속성 > 가격·원가·마진 > 일회성/구조적 구분 > 투자·M&A > 자본 정책 > 경영진이 인정한 리스크. 인사말·단순 확인·숫자 반복·홍보성 답변은 뺀다. 답변의 숫자는 그대로, 답을 피한 부분도 그대로.
 - headline: 이번 실적 한 줄 결론(40자, 숫자 포함). narrative: 왜 그렇게 됐는지 3~5문장(사업부·지역 숫자, 가격·물량·비용 요인, 가이던스 변화).
@@ -358,6 +361,59 @@ def seg_section(plt, title, rows, period, source, check_total=None):
     if c2: charts.append(("막대 = (그 구분의 이번 − 전년 영업이익) ÷ 전년 영업이익 합계(본사 비용·조정 전).", c2))
     return html_ + "".join(f'<figure><img src="{c}">' + (f'<figcaption>{esc(cap)}</figcaption>' if cap else '') + '</figure>' for cap, c in charts), charts
 
+# ───────────────────────── 연간 가이던스: 전년 대비 성장률(수정이 있으면 수정 전·후를 함께) ─────────────────────────
+def guide_section(plt, card, kb):
+    """→ HTML(표 + 차트) 또는 "" — 회사 연간 예상이 있는 모든 카드. 금액 백만 엔"""
+    r = card["r"]; fc = r.get("fc") or {}; fc_end = (r.get("fc_end") or "")[:7]
+    if not fc_end or not any(fc.get(m) for m in ("rev", "op", "ni")): return ""
+    new = {m: fc[m] / 1e6 if fc.get(m) is not None else None for m in ("rev", "op", "ni")}
+    # 전년 실적: 4분기 결산이면 이번 결산 숫자, 아니면 가부탄 연간 실적에서 예상 회계연도의 1년 전
+    if (r.get("q") or 0) == 4 and fc_end > r["end"][:7]:
+        base = {m: r[m] / 1e6 if r.get(m) is not None else None for m in ("rev", "op", "ni")}
+    else:
+        y = next((y for y in kb.get("y") or [] if not y["fc"] and y["end"] == E.ym_add(fc_end, -12)), None)
+        base = {m: (y or {}).get(m) for m in ("rev", "op", "ni")}
+    rv = card.get("rev") or {}
+    old = {m: (rv.get(m) or (None, None))[0] for m in ("rev", "op")}
+    revised = any(old.get(m) is not None and new.get(m) is not None and abs(old[m] - new[m]) > 0.5 for m in ("rev", "op"))
+    lab_fy = E.fy_label_end(r.get("fc_end"))
+    names = {"rev": "매출", "op": "영업이익", "ni": "순이익"}
+    g = lambda a, b: (a / b - 1) * 100 if a is not None and b not in (None, 0) and b > 0 else None
+    rows, ch = [], []
+    for m in ("rev", "op", "ni"):
+        if new.get(m) is None: continue
+        g_new, g_old = g(new[m], base.get(m)), g(old.get(m), base.get(m)) if revised else None
+        rows.append(f"<tr><td>{names[m]}</td><td>{E.oku(base.get(m))}</td>"
+                    + (f"<td>{E.oku(old.get(m))}</td><td>{fmt(g_old)}%</td>" if revised else "")
+                    + f"<td><b>{E.oku(new[m])}</b></td><td><b>{fmt(g_new)}%</b></td></tr>")
+        ch.append((names[m], g_old, g_new))
+    if not rows: return ""
+    img = ""
+    if any(x[2] is not None for x in ch):
+        import numpy as np
+        fig, ax = plt.subplots(figsize=(8, 3.2))
+        x = np.arange(len(ch)); w = 0.36 if revised else 0.5
+        sets = ([("수정 전 예상", [c[1] for c in ch], "#b9b6ae", -w / 2), ("수정 후 예상", [c[2] for c in ch], E.BLUE, w / 2)] if revised
+                else [("회사 예상", [c[2] for c in ch], E.BLUE, 0)])
+        for nm, vals, col, off in sets:
+            vv = [v if v is not None else 0 for v in vals]
+            bars = ax.bar(x + off, vv, w, color=col, label=nm)
+            for b_, v in zip(bars, vals):
+                if v is not None:
+                    ax.text(b_.get_x() + b_.get_width() / 2, v, f"{v:+.1f}%", ha="center", va="bottom" if v >= 0 else "top", fontsize=10, fontweight="bold", color=col)
+        ax.axhline(0, color="#999", lw=0.8)
+        ax.set_xticks(x); ax.set_xticklabels([c[0] for c in ch], fontsize=11)
+        ax.set_ylabel("전년 대비 %", fontsize=9)
+        ax.set_title(f"{lab_fy} 회사 예상: 전년 실적 대비 성장률" + (" (수정 전 → 수정 후)" if revised else ""), loc="left", fontsize=12, fontweight="bold")
+        if revised: ax.legend(fontsize=9, frameon=False, loc="upper left")
+        for sp in ("top", "right"): ax.spines[sp].set_visible(False)
+        lo, hi = ax.get_ylim(); ax.set_ylim(min(lo, 0) * 1.15, max(hi, 0) * 1.2)
+        fig.tight_layout(); img = f'<figure><img src="{b64png(fig)}"></figure>'
+    head = ("<tr><th>항목</th><th>전년 실적</th>" + ("<th>수정 전 예상</th><th>YoY</th>" if revised else "") + "<th>회사 예상</th><th>YoY</th></tr>")
+    note = (" · 이번 발표에서 수정됨(수정 전 순이익은 공시에 없어 생략)" if revised else "")
+    return (f"<h2>연간 가이던스 ({esc(lab_fy)})</h2><p class=muted>금액 억 엔 · 전년 실적 대비 · 출처: 결산단신(회사 예상), 가부탄·결산단신(전년 실적){note}</p>"
+            f"<div class=scroll><table>{head}{''.join(rows)}</table></div>{img}")
+
 # ───────────────────────── 분기 단독(3개월) 계산 ─────────────────────────
 PREV_PROMPT = """첨부 PDF는 일본 상장사 {name}({code})의 직전 분기 결산단신이다. PDF 표에 적힌 숫자만 읽어 JSON으로 출력하라. 추측 금지, 없으면 null.
 단위는 모두 백만 엔으로 바꿔라(표가 천 엔이면 ÷1000, 엔이면 ÷1,000,000). 손실·마이너스는 음수.
@@ -504,10 +560,18 @@ def build(card):
                 rev_pdf = b; rec_links.append((f"이후 업적 예상 수정({day[:4]}-{day[4:6]}-{day[6:]})", u))
                 rev_note = f"\n참고: 첨부 중 하나는 이번 결산 발표 뒤 {day[:4]}-{day[4:6]}-{day[6:]}에 나온 업적 예상 수정 공시다. 가이던스(guidance) 서술에는 이 최신 수정치와 날짜를 반드시 반영하라."
         except Exception as e: E.log("revision pdf error", e)
-    pdfs, total = [], 0
-    for p_ in [mat_pdf, rec_pdfs[0] if rec_pdfs else None, tan_pdf if not mat_pdf else None, tan_pdf if mat_pdf else None, rev_pdf]:
+    pdfs, total, pnames = [], 0, []
+    for p_, nm in [(mat_pdf, "이번 결산 설명 자료"), (rec_pdfs[0] if rec_pdfs else None, "설명회 질의응답 기록"), (tan_pdf, "이번 결산단신"), (rev_pdf, "이후 업적 예상 수정 공시")]:
         if p_ and p_ not in pdfs and total + len(p_) <= 12_000_000:  # Gemini 요청 한도(약 20MB, base64 포함) 안으로
-            pdfs.append(p_); total += len(p_)
+            pdfs.append(p_); total += len(p_); pnames.append((nm, None))
+    # 3-2) 최근 IR 참고 자료: 이번 분기 설명 자료가 없으면 최근 1년 안의 발표 자료·중기 경영계획·설비투자 공시로 구조 자료(캐파·증설·수주잔고 등)를 보완
+    refs = []
+    try:
+        refs = earn_ir.latest_refs(card, skip=(mat_url,) if mat_url else (), limit=1 if mat_pdf else 2, budget=12_000_000 - total)
+    except Exception as e: E.log("latest refs error", e)
+    for b_, u_, t_, d_ in refs:
+        pdfs.append(b_); total += len(b_); pnames.append((f"이전 IR 참고 자료: {t_} ({d_} 발표)", (u_, t_, d_)))
+    ref_note = "\n첨부 목록: " + "; ".join(f"{i}. {nm}" for i, (nm, _) in enumerate(pnames, 1)) if pdfs else ""
     # 4) Gemini 분석(설명 자료 + 결산단신 + 기록)
     lab_q, months_q = E.qlabel(q, fem)
     nums = (f"이번 3개월 분기({lab_q} {months_q}) 매출 {E.oku(q.get('rev'))}(전년 {E.oku(py.get('rev'))}), 영업이익 {E.oku(q.get('op'))}(전년 {E.oku(py.get('op'))}), "
@@ -518,7 +582,7 @@ def build(card):
                               nums=nums, segs=seg_txt or "없음", qrule=E.QRULE,
                               seg_basis=f"이번 3개월 분기 {lab_q}({months_q}), 누적 − 직전 분기 누적" if seg_q else "회계연도 누적 — 분기 숫자 아님", words=json.dumps(words, ensure_ascii=False), qual=card.get("qual", "")[:5000],
                               extra=("설명회 기록(웹):\n" + "\n\n".join(rec_texts)) if rec_texts else "")
-    prompt += rev_note
+    prompt += rev_note + ref_note
     ai = (gemini_pdf(prompt, pdfs, max_tokens=16000) if pdfs else gemini_json(prompt, timeout=180)) or {}
     card["_ai_ok"] = bool(ai)
     if isinstance(ai, list): ai = ai[0] if ai and isinstance(ai[0], dict) else {}
@@ -561,20 +625,32 @@ def build(card):
     if not biz_html: biz_html = "<h2>사업부별 실적</h2><p class=muted>결산단신·설명 자료에 사업부 구분 숫자가 없습니다(단일 사업 회사일 수 있음).</p>"
     if not reg_html: reg_html = "<h2>지역별 실적</h2><p class=muted>결산단신·설명 자료에 지역 구분 숫자가 없습니다.</p>"
 
+    try: guide_html = guide_section(plt, card, kb)
+    except Exception as e: E.log("guide section error", e); guide_html = ""
     # 6) IR 자료에서 고른 핵심 데이터
     ins_html = ""
     base_pdf = mat_pdf or tan_pdf
+    used_refs = []
     for it in (ai.get("insights") or [])[:6]:
         if not isinstance(it, dict) or not it.get("title"): continue
         img = insight_chart(plt, it.get("chart") or {}, it["title"])
-        pg = page_image(base_pdf, it.get("page")) if base_pdf and it.get("page") else None
-        ins_html += (f"<div class=card><h3>{esc(it['title'])}</h3>" + (f"<p><b>{esc(it.get('takeaway'))}</b></p>" if it.get("takeaway") else "")
+        try: di = int(it.get("doc") or 0) - 1
+        except Exception: di = -1
+        src_pdf, ref = (pdfs[di], pnames[di][1]) if 0 <= di < len(pdfs) else (base_pdf, None)
+        pg = page_image(src_pdf, it.get("page")) if src_pdf and it.get("page") else None
+        tag = ""
+        if ref:
+            tag = f' <small class=muted>({esc(ref[2])} 발표 「<a href="{esc(ref[0])}">{esc(ref[1][:30])}</a>」 기준)</small>'
+            if ref not in used_refs: used_refs.append(ref)
+        ins_html += (f"<div class=card><h3>{esc(it['title'])}{tag}</h3>" + (f"<p><b>{esc(it.get('takeaway'))}</b></p>" if it.get("takeaway") else "")
                      + (f"<p class=muted>왜 중요한가: {esc(it.get('why'))}</p>" if it.get("why") else "")
                      + (f'<img src="{img}">' if img else "")
                      + (f"<details><summary>원문 {esc(it.get('page'))}쪽 보기</summary><img src=\"{pg}\"></details>" if pg else "") + "</div>")
     if ins_html:
         ins_html = (f"<h2>IR 자료에서 고른 핵심 데이터</h2><p class=muted>출처: {esc(src_name)}({esc(mat_src if mat_pdf else 'TDnet')}) — Gemini가 의미 있는 표를 골라 숫자를 뽑고, "
-                    "한국어 차트로 다시 그렸습니다. 숫자는 원문 쪽 이미지로 확인하세요.</p>" + ins_html)
+                    "한국어 차트로 다시 그렸습니다. 숫자는 원문 쪽 이미지로 확인하세요."
+                    + (" 이번 분기 설명 자료에 없는 구조 자료(캐파·증설·수주잔고·중기 목표 등)는 최근 IR 자료에서 가져왔고, 제목 옆에 그 자료의 발표일을 적었습니다." if used_refs else "")
+                    + "</p>" + ins_html)
     qa_html = ""
     qa = [x for x in (ai.get("qa") or []) if isinstance(x, dict) and x.get("q")]
     if qa:
@@ -695,6 +771,7 @@ def build(card):
     watch = "".join(f"<li>{esc(w)}</li>" for w in (ai.get("watch") or []))
     links = [f"<a href='{card['pdf']}'>결산단신(PDF)</a>" if card.get("pdf") else f"<a href='https://s.kabutan.jp/stocks/{code}/finance/'>가부탄 실적</a>"]
     if mat_url: links.append(f"<a href='{esc(mat_url)}'>결산 설명 자료({esc(mat_src)})</a>")
+    links += [f"<a href='{esc(u_)}'>참고: {esc(t_[:30])}({esc(d_)})</a>" for _, u_, t_, d_ in refs]
     links += [f"<a href='{esc(u)}'>{esc(n)}</a>" for n, u in rec_links]
     headline = ai.get("headline") or cardai.get("summary") or ""
     lab, months = E.qlabel(s[-1], fem)
@@ -722,6 +799,7 @@ figure{{margin:10px 0;background:#fff;border-radius:10px;padding:8px}} figure im
 <div class=kpi>{''.join(f'<div><span>{k}</span><b>{v}</b></div>' for k, v in kpi)}</div>
 {f"<div class=head><b>{esc(headline)}</b><p>{esc(ai.get('narrative'))}</p></div>" if headline else ''}
 {f"<div class=card><ul>{why}</ul>{rx_html}</div>" if (why or rx_html) else ''}
+{guide_html}
 {biz_html}
 {reg_html}
 {ins_html}
