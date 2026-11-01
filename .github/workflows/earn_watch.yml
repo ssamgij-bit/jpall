@@ -149,6 +149,13 @@ jobs:
                       n_log = sum(1 for x in (es.get("log") or []) if x and x[0] == yd)
                       cards = ((es.get("stats") or {}).get(yd) or {}).get("cards", 0)
                       act.append(f"• 실적 스크리닝: 검토 {n_log}종목 · 채널 카드 {cards}건")
+                      rs = (es.get("stats") or {}).get(yd) or {}
+                      rb = rs.get("rep_built", 0)
+                      if rb:
+                          act.append(f"• 실적 리포트: 생성 {rb}건(AI 실패 {rs.get('rep_ai_fail', 0)}) · 이번 분기 설명 자료 {rs.get('rep_mat', 0)} · "
+                                     f"이전 IR 참고 {rs.get('rep_refs', 0)}개 · 캐파 자료 {rs.get('rep_capa', 0)} · 분기 분리 실패 {rs.get('rep_qfail', 0)}")
+                          if rb >= 4 and rs.get("rep_ai_fail", 0) / rb >= 0.5: bad.append(f"실적 리포트: AI 실패 {rs.get('rep_ai_fail', 0)}/{rb}(AI 키 한도 의심)")
+                          if rb >= 4 and rs.get("rep_qfail", 0) / rb >= 0.5: bad.append(f"실적 리포트: 3개월 사업부 분리 실패 {rs.get('rep_qfail', 0)}/{rb}")
                   ms = raw(f"https://raw.githubusercontent.com/{owner_}/jpnews/state/morning_state.json", f"https://raw.githubusercontent.com/{owner_}/jpnews/main/morning_state.json")
                   if y.weekday() < 5 and ms:
                       ok_m = ms.get("sent") == y.strftime("%Y-%m-%d") or ms.get("sent", "") > y.strftime("%Y-%m-%d")
