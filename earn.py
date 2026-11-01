@@ -372,7 +372,7 @@ QRULE = """- 기간 기준: 이번 3개월 분기(예: 2Q(7~9월))가 기본이�
   자료에 누적(반기·1~3Q 누적)만 있으면, 같은 자료에 직전 분기 누적도 있을 때만 '이번 누적 − 직전 분기 누적'으로 분기 숫자를 계산해 쓰고,
   그럴 수 없으면 누적 숫자를 쓰되 반드시 '(누적 n~m월)'이라고 붙인다. 누적 숫자를 분기 숫자처럼 쓰지 말 것.
 """
-REP_VER = 5   # 리포트 내용·구성을 바꾸면 올림 → 예전에 만든 리포트를 다시 보내지 않고 새로 만듦
+REP_VER = 6   # 리포트 내용·구성을 바꾸면 올림 → 예전에 만든 리포트를 다시 보내지 않고 새로 만듦
 QBASIS_VER = 1   # 올리면 예전 기준으로 만든 리포트·IR 요약 저장분을 버리고 새로 만듦
 
 def read_tanshin(row):
@@ -606,6 +606,7 @@ CARD_PROMPT = """너는 일본 중소형주를 보는 한국 애널리스트다.
 출력: {{"name_ko": "회사명(한국어 표기)", "bm": "무엇을 만들어/팔아 누구에게 파는 회사인지", "summary": "이번 3개월 분기 실적이 좋았던 핵심 이유 한 줄",
  "P": "...", "Q": "...", "C": "...", "etc": "...",
  "oneoff": {{"what": "요인(없으면 빈 문자열)", "amt": 0, "main": false}},
+ "ret_policy": "회사가 자료에 밝힌 주주환원 목표 한 줄(예: 총주주환원율 50% 이상·DOE 4%, 기간 포함). 자료에 없으면 빈 문자열",
  "rev_oneoff": {{"what": "요인(없으면 빈 문자열)", "adj_yoy": null}}}}
 
 회사: {name} ({code}) · 업종: {sector}
@@ -827,7 +828,7 @@ def card_text(a, ai, row):
         prog = progress(series, r, fem)
         L.append(g_line + (f" · 진척률 {prog[0]:.0f}%" + (f"(작년 {prog[1]:.0f}%)" if prog[1] is not None else "") if prog else ""))
     if a.get("oneoff"): L.append(a["oneoff"])
-    if ret_line(a.get("ret")): L.append(ret_line(a.get("ret")))
+    if ret_line(a.get("ret")): L.append(ret_line(a.get("ret")) + (f"\n 회사 목표: {esc(ai['ret_policy'])}" if ai and str(ai.get("ret_policy") or "").strip() else ""))
     L.append("")
     if ai:
         L.append(("▶️ <b>왜 좋았나</b>" if not a.get("ondemand") or a.get("pass") else "▶️ <b>실적 요인</b>")
