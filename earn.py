@@ -35,6 +35,7 @@ RULES = {
     "R4_turn_yoy": 20.0,      # R4 턴어라운드: 전년 동기 영업적자→흑자, 또는 2개 분기 연속 감익 뒤 영업이익 YoY ≥ 20%
     "R5_rev_only_yoy": 20.0,  # R5 매출 고성장: 분기 매출 YoY ≥ 20% 그리고 영업이익이 전년 동기보다 개선(적자여도 적자 폭이 줄면 인정)
     "X5_min_cap_oku": 300.0,  # X5 시가총액 300억 엔 미만 제외
+    "X7_min_rev_yoy": 5.0,    # X7 분기 매출 YoY 5% 미만 제외(사업부 매각·연결 제외 등 일회성 요인 때문이면 예외, 2026-11-01)
 }
 # X4 제외 업종(도쿄증권거래소 33업종)
 EXCL_SECTORS = {"建設業", "不動産業", "電気・ガス業", "海運業", "石油・石炭製品", "鉱業", "銀行業", "証券、商品先物取引業", "証券・商品先物取引業", "保険業", "その他金融業", "医薬品", "鉄鋼", "パルプ・紙"}
@@ -502,9 +503,14 @@ CARD_PROMPT = """너는 일본 중소형주를 보는 한국 애널리스트다.
   제외: 특별이익·영업외 수익(영업이익에 안 들어감), 환율, 가격 인상, 해마다 받는 보조금(예: 미국 IRA 생산 세액공제)처럼 계속되는 것.
   amt = 그 금액(억 엔, 숫자, 1억 엔=100백만 엔). 이번 3개월 분기분을 우선, 분기 구분이 안 되면 누적 금액. 금액이 자료에 없으면 null, 없으면 0.
   main = 이 요인을 빼면 영업이익이 전년 동기보다 늘지 않았거나 증가분의 절반 이상이 이 요인인가(true/false).
+- rev_oneoff: 매출 증가율을 이번 분기에 일시적으로 끌어내린 요인만 적는다(자료에 적힌 것만).
+  해당: 사업부·자회사 매각·양도, 연결 범위에서 제외, 수익 인식 기준 변경(총액→순액 등), 결산기 변경으로 비교 기간 불일치, 전년 동기의 대형 일회성 매출(기저 효과).
+  제외: 수요 감소, 가격 인하, 환율, 경쟁 심화처럼 본업의 흐름인 것.
+  adj_yoy = 그 요인을 뺀 매출 증가율(%, 자료에 숫자나 계산 근거가 있을 때만, 없으면 null).
 출력: {{"name_ko": "회사명(한국어 표기)", "bm": "무엇을 만들어/팔아 누구에게 파는 회사인지", "summary": "이번 분기 실적이 좋았던 핵심 이유 한 줄",
  "P": "...", "Q": "...", "C": "...", "etc": "...",
- "oneoff": {{"what": "요인(없으면 빈 문자열)", "amt": 0, "main": false}}}}
+ "oneoff": {{"what": "요인(없으면 빈 문자열)", "amt": 0, "main": false}},
+ "rev_oneoff": {{"what": "요인(없으면 빈 문자열)", "adj_yoy": null}}}}
 
 회사: {name} ({code}) · 업종: {sector}
 회사 개요(가부탄): {profile}
@@ -591,6 +597,27 @@ def oneoff_check(a, ai):
         adj_txt = f" · 빼면 영업이익 {oku(adj)}엔({yoy_txt(ay, ast)})"
     amt_txt = f" 약 {amt:,.1f}억 엔" if amt else " (금액 미공개)"
     return excl, f"⚠️ <b>일회성 요인</b> {esc(what)}{amt_txt}{adj_txt}"
+
+# ───────────────────────── X7 매출 증가율 5% 미만(일회성 예외) ─────────────────────────
+DIVEST_RE = re.compile(r"(事業|子会社|株式)[^。]{0,20}(譲渡|売却)|連結(の範囲|子会社)?から除外|連結除外|収益認識[^。]{0,30}(変更|純額)|決算期[^。]{0,10}変更")
+
+def low_rev_check(a, ai):
+    """분기 매출 YoY < 5%면 제외. 다만 사업부 매각 등 일회성 요인 때문이면(빼면 5% 이상이거나 금액 미상) 남김
+    → (제외할지, 카드에 붙일 설명 한 줄 또는 '')"""
+    m = metrics(a["series"], len(a["series"]) - 1)
+    rg = m.get("rev_yoy")
+    th = RULES["X7_min_rev_yoy"]
+    if rg is None or rg >= th: return False, ""
+    o = (ai or {}).get("rev_oneoff") if isinstance((ai or {}).get("rev_oneoff"), dict) else {}
+    what = str(o.get("what") or "").strip()
+    try: adj = float(o.get("adj_yoy")) if o.get("adj_yoy") not in (None, "") else None
+    except (TypeError, ValueError): adj = None
+    if not what and ai is None:   # AI 확인 실패: 결산단신 본문에 매출 관련 사업 양도·연결 제외 문장이 있으면 일회성으로 봄
+        for sen in re.split(r"(?<=。)", a.get("qual") or ""):
+            if "売上" in sen and DIVEST_RE.search(sen): what = "사업 양도·연결 제외(본문 언급)"; break
+    if what and (adj is None or adj >= th):
+        return False, f"ℹ️ <b>매출 {rg:+.1f}%</b>는 일회성 요인({esc(what)}) 때문" + (f" · 빼면 {adj:+.1f}%" if adj is not None else "")
+    return True, f"X7 매출 증가율 {th:.0f}% 미만({rg:+.1f}%)"
 
 # ───────────────────────── 카드 ─────────────────────────
 def analyze(row, rows, st):
@@ -1626,7 +1653,7 @@ HELP_TXT = ("일본 실적 스크리닝 봇 사용법\n"
             "스크리닝 기준을 통과한 종목은 지금처럼 채널에 올라갑니다.")
 
 
-GUIDE_VER = 9  # 공지 문구를 바꾸면 올림 → 고정 공지를 새 내용으로 수정
+GUIDE_VER = 10  # 공지 문구를 바꾸면 올림 → 고정 공지를 새 내용으로 수정
 def guide_text(me):
     R = RULES
     sec = ", ".join(sorted(dict.fromkeys(SECTOR_KO.get(x, x) for x in EXCL_SECTORS)))
@@ -1645,7 +1672,8 @@ def guide_text(me):
             f"❌ 시가총액 {R['X5_min_cap_oku']:,.0f}억 엔 미만\n"
             f"❌ 업종: {sec}\n"
             "※ 영업이익 항목이 없는 기업(IFRS 종합상사 등)은 영업이익 대신 순이익으로 판별\n"
-            "❌ 관세 환급·회계 변경 등 일회성 요인을 빼면 조건에 못 미치거나, 이익 증가분의 절반 이상이 일회성\n\n"
+            "❌ 관세 환급·회계 변경 등 일회성 요인을 빼면 조건에 못 미치거나, 이익 증가분의 절반 이상이 일회성\n"
+            f"❌ 분기 매출 증가율 +{R['X7_min_rev_yoy']:.0f}% 미만(사업부 매각·연결 제외 등 일회성 요인 때문이면 다른 조건 충족 시 통과)\n\n"
             "<b>② 카드 버튼</b>\n"
             "📄 리포트: 사업부·지역별 상세 분석, 시장 반응(note·야후 게시판·증권사 목표주가)\n"
             "🗣 IR·Q&amp;A: 실적 설명회 질의응답 요약\n"
@@ -2078,6 +2106,15 @@ def prepare_card(a, row):
                 if a.get("ondemand"): a["pass"] = False; a["why"] = skip
         except Exception as e:
             log("oneoff check error", a.get("code"), e)
+        try:
+            lo, txt = low_rev_check(a, ai)
+            if lo and a.get("pass") and not skip:
+                skip = txt
+                if a.get("ondemand"): a["pass"] = False; a["why"] = skip
+            elif txt and not lo:
+                a["oneoff"] = (a.get("oneoff") + "\n" if a.get("oneoff") else "") + txt
+        except Exception as e:
+            log("low rev check error", a.get("code"), e)
         if skip and not a.get("ondemand"):
             return {"skip": skip}
         cap = card_text(a, ai, row)
