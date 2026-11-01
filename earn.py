@@ -164,8 +164,27 @@ def kb_finance(code):
     return out
 
 def kb_fc_hist(code):
-    """가부탄 '수정 이력'(期初·修正·実績) → {"2027-03": [{"d": "2026-10-30", "k": "초|수|실", "rev", "op", "ord", "ni"}]} 금액 백만 엔"""
+    """가부탄 '결산·수정 이력'(期初·修正·実績) → {"2027-03": [{"d": "2026-10-30", "k": "초|수|실", "rev", "op", "ord", "ni"}]} 금액 백만 엔
+    모바일판(GitHub 서버에서도 열림)을 먼저, 안 되면 PC판. 유료 회원 전용으로 가려진 회계연도(가짜 숫자)는 버림"""
     out = {}
+    try:
+        s = mget(f"https://s.kabutan.jp/stocks/{code}/finance/")
+        tb = next((t for t in re.findall(r"<table.*?</table>", s, re.S) if "修正日" in t and "期初" in t), "")
+        fy, bad = None, False
+        for tr in re.findall(r"<tr.*?</tr>", tb, re.S):
+            raw = text_of(tr)
+            c = [text_of(x) for x in re.findall(r"<t[hd][^>]*>(.*?)</t[hd]>", tr, re.S)]
+            if not c: continue
+            m = re.match(r"(\d{4})\.\s*(\d{1,2})", c[0])
+            if m: fy, bad = f"{m.group(1)}-{int(m.group(2)):02d}", "プレミアム" in raw
+            k = "초" if "期初" in c[0] else "수" if c[0].startswith("修") else "실" if c[0].startswith("実") else None
+            dm = re.search(r"(\d\d)/(\d\d)/(\d\d)", raw)
+            if not fy or bad or not k or not dm: continue
+            v = [_num(x) for x in c[2:6]] if re.fullmatch(r"\d\d/\d\d/\d\d", c[1]) else [_num(x) for x in c[-6:-2]]
+            out.setdefault(fy, []).append({"d": f"20{dm.group(1)}-{dm.group(2)}-{dm.group(3)}", "k": k, "rev": v[0], "op": v[1], "ord": v[2], "ni": v[3]})
+        if out: return out
+    except Exception as e:
+        log("fc hist(mobile) error", code, e)
     try:
         s = mget(f"https://kabutan.jp/stock/finance?code={code}")
         i = s.find("修正日"); j = s.find("「初」", i)
@@ -337,6 +356,7 @@ QRULE = """- 기간 기준: 이번 3개월 분기(예: 2Q(7~9월))가 기본이�
   자료에 누적(반기·1~3Q 누적)만 있으면, 같은 자료에 직전 분기 누적도 있을 때만 '이번 누적 − 직전 분기 누적'으로 분기 숫자를 계산해 쓰고,
   그럴 수 없으면 누적 숫자를 쓰되 반드시 '(누적 n~m월)'이라고 붙인다. 누적 숫자를 분기 숫자처럼 쓰지 말 것.
 """
+REP_VER = 2   # 리포트 내용·구성을 바꾸면 올림 → 예전에 만든 리포트를 다시 보내지 않고 새로 만듦
 QBASIS_VER = 1   # 올리면 예전 기준으로 만든 리포트·IR 요약 저장분을 버리고 새로 만듦
 
 def read_tanshin(row):
@@ -1491,7 +1511,7 @@ def _start_jobs(st):
         if not card: q.pop(0); continue
         rp = {"reply_to_message_id": reply, "allow_sending_without_reply": True} if reply else {}
         cap = f"📄 {card.get('name_ko') or card['name']}({card['code']}) 리포트 — 파일을 열어 보세요"
-        if card.get("rep_file"):  # 이미 만든 리포트는 텔레그램 파일을 그대로 다시 보냄
+        if card.get("rep_file") and card.get("rep_ver") == REP_VER:  # 이미 만든 리포트(같은 리포트 버전)는 텔레그램 파일을 그대로 다시 보냄
             r = tg("sendDocument", {"chat_id": dest, "caption": cap, "document": card["rep_file"], **rp})
             log("리포트 재전송", card["code"], dest, "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:80]}")
             if r.get("ok"): q.pop(0); continue
@@ -1587,13 +1607,13 @@ class _DONE:
                 if out: defer_ai(st, "rep", j["cid"], dest, reply, out); continue   # 만드는 도중 한도가 끝남 → 풀린 뒤 다시
             cap = f"📄 {card.get('name_ko') or card['name']}({card['code']}) 리포트 — 파일을 열어 보세요"
             if not ok_ai: cap += "\n⚠️ AI 분석(결론·사업부·IR 핵심 데이터·Q&A)이 빠졌습니다. " + FAIL_TXT.get(FAIL.get(card["code"]), FAIL_TXT[None]) + " 📄 리포트를 다시 누르면 새로 만듭니다."
-            if card.get("rep_file"):
+            if card.get("rep_file") and card.get("rep_ver") == REP_VER:
                 r = tg("sendDocument", {"chat_id": dest, "caption": cap, "document": card["rep_file"], **rp})
                 if r.get("ok"): continue
             r = tg("sendDocument", {"chat_id": dest, "caption": cap, **rp}, files={"document": (fn, blob, "text/html")}, timeout=90)
             log("리포트 보냄", card["code"], dest, "AI 포함" if ok_ai else "AI 빠짐", "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:80]}")
             if r.get("ok") and ok_ai:
-                card["rep_file"] = ((r.get("result") or {}).get("document") or {}).get("file_id")
+                card["rep_file"] = ((r.get("result") or {}).get("document") or {}).get("file_id"); card["rep_ver"] = REP_VER
 
 def finish_jobs(st, timeout=300):
     """실행을 마치기 전: 돌던 작업을 최대 timeout초 기다려 반영, 그래도 안 끝난 건 대기열에 되돌려 다음 실행이 이어서 처리"""
