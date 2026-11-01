@@ -373,45 +373,54 @@ def guide_section(plt, card, kb):
     else:
         y = next((y for y in kb.get("y") or [] if not y["fc"] and y["end"] == E.ym_add(fc_end, -12)), None)
         base = {m: (y or {}).get(m) for m in ("rev", "op", "ni")}
+    # 비교할 예상들: 期初(연초) 예상 → 직전 예상(이번에 수정됐으면) → 현재 예상. 가부탄 수정 이력 + 같은 날 수정 공시
     rv = card.get("rev") or {}
-    old = {m: (rv.get(m) or (None, None))[0] for m in ("rev", "op")}
-    revised = any(old.get(m) is not None and new.get(m) is not None and abs(old[m] - new[m]) > 0.5 for m in ("rev", "op"))
+    hist = []
+    try: hist = E.kb_fc_hist(card["code"]).get(fc_end) or []
+    except Exception: pass
+    same = lambda a, b: all(a.get(m) is None or b.get(m) is None or abs(a[m] - b[m]) < 0.5 for m in ("rev", "op", "ni"))
+    sets = []
+    init = hist[0] if hist and hist[0]["k"] == "초" else (rv.get("init") or None)
+    if init and not same(init, new): sets.append((f"기초 예상({init['d'][5:].replace('-', '/')})", init, "#d6d3cc"))
+    old = {m: (rv.get(m) or (None, None))[0] for m in ("rev", "op", "ni")}
+    if any(v is not None for v in old.values()) and not same(old, new) and not (init and same(init, old)):
+        sets.append(("직전 예상", old, "#9aa0a6"))
+    revised = bool(sets)
+    sets.append(("현재 예상" if revised else "회사 예상", new, E.BLUE))
     lab_fy = E.fy_label_end(r.get("fc_end"))
     names = {"rev": "매출", "op": "영업이익", "ni": "순이익"}
     g = lambda a, b: (a / b - 1) * 100 if a is not None and b not in (None, 0) and b > 0 else None
-    rows, ch = [], []
-    for m in ("rev", "op", "ni"):
-        if new.get(m) is None: continue
-        g_new, g_old = g(new[m], base.get(m)), g(old.get(m), base.get(m)) if revised else None
-        rows.append(f"<tr><td>{names[m]}</td><td>{E.oku(base.get(m))}</td>"
-                    + (f"<td>{E.oku(old.get(m))}</td><td>{fmt(g_old)}%</td>" if revised else "")
-                    + f"<td><b>{E.oku(new[m])}</b></td><td><b>{fmt(g_new)}%</b></td></tr>")
-        ch.append((names[m], g_old, g_new))
-    if not rows: return ""
+    ms = [m for m in ("rev", "op", "ni") if new.get(m) is not None]
+    if not ms: return ""
+    rows = []
+    for m in ms:
+        cells = "".join((f"<td><b>{E.oku(d.get(m))}</b></td><td><b>{fmt(g(d.get(m), base.get(m)))}%</b></td>" if k == len(sets) - 1 else
+                         f"<td>{E.oku(d.get(m))}</td><td>{fmt(g(d.get(m), base.get(m)))}%</td>") for k, (_, d, _) in enumerate(sets))
+        rows.append(f"<tr><td>{names[m]}</td><td>{E.oku(base.get(m))}</td>{cells}</tr>")
     img = ""
-    if any(x[2] is not None for x in ch):
+    if any(g(new.get(m), base.get(m)) is not None for m in ms):
         import numpy as np
-        fig, ax = plt.subplots(figsize=(8, 3.2))
-        x = np.arange(len(ch)); w = 0.36 if revised else 0.5
-        sets = ([("수정 전 예상", [c[1] for c in ch], "#b9b6ae", -w / 2), ("수정 후 예상", [c[2] for c in ch], E.BLUE, w / 2)] if revised
-                else [("회사 예상", [c[2] for c in ch], E.BLUE, 0)])
-        for nm, vals, col, off in sets:
-            vv = [v if v is not None else 0 for v in vals]
-            bars = ax.bar(x + off, vv, w, color=col, label=nm)
+        fig, ax = plt.subplots(figsize=(8, 3.3))
+        x = np.arange(len(ms)); w = 0.8 / len(sets)
+        for k, (nm, d, col) in enumerate(sets):
+            vals = [g(d.get(m), base.get(m)) for m in ms]
+            bars = ax.bar(x - 0.4 + w * (k + 0.5), [v if v is not None else 0 for v in vals], w * 0.92, color=col, label=nm)
             for b_, v in zip(bars, vals):
                 if v is not None:
-                    ax.text(b_.get_x() + b_.get_width() / 2, v, f"{v:+.1f}%", ha="center", va="bottom" if v >= 0 else "top", fontsize=10, fontweight="bold", color=col)
+                    ax.text(b_.get_x() + b_.get_width() / 2, v, f"{v:+.1f}%", ha="center", va="bottom" if v >= 0 else "top",
+                            fontsize=9 if len(sets) > 2 else 10, fontweight="bold", color=col if col != "#d6d3cc" else "#8a877f")
         ax.axhline(0, color="#999", lw=0.8)
-        ax.set_xticks(x); ax.set_xticklabels([c[0] for c in ch], fontsize=11)
-        ax.set_ylabel("전년 대비 %", fontsize=9)
-        ax.set_title(f"{lab_fy} 회사 예상: 전년 실적 대비 성장률" + (" (수정 전 → 수정 후)" if revised else ""), loc="left", fontsize=12, fontweight="bold")
-        if revised: ax.legend(fontsize=9, frameon=False, loc="upper left")
+        ax.set_xticks(x); ax.set_xticklabels([names[m] for m in ms], fontsize=11)
+        ax.set_ylabel("전년 실적 대비 %", fontsize=9)
+        ax.set_title(f"{lab_fy} 회사 예상의 전년 대비 성장률" + (" — 수정 경과" if revised else ""), loc="left", fontsize=12, fontweight="bold")
+        if revised: ax.legend(fontsize=9, frameon=False, loc="upper left", ncol=len(sets))
         for sp in ("top", "right"): ax.spines[sp].set_visible(False)
-        lo, hi = ax.get_ylim(); ax.set_ylim(min(lo, 0) * 1.15, max(hi, 0) * 1.2)
+        lo, hi = ax.get_ylim(); ax.set_ylim(min(lo, 0) * 1.15, max(hi, 0) * 1.25)
         fig.tight_layout(); img = f'<figure><img src="{b64png(fig)}"></figure>'
-    head = ("<tr><th>항목</th><th>전년 실적</th>" + ("<th>수정 전 예상</th><th>YoY</th>" if revised else "") + "<th>회사 예상</th><th>YoY</th></tr>")
-    note = (" · 이번 발표에서 수정됨(수정 전 순이익은 공시에 없어 생략)" if revised else "")
-    return (f"<h2>연간 가이던스 ({esc(lab_fy)})</h2><p class=muted>금액 억 엔 · 전년 실적 대비 · 출처: 결산단신(회사 예상), 가부탄·결산단신(전년 실적){note}</p>"
+    head = "<tr><th>항목</th><th>전년 실적</th>" + "".join(f"<th>{esc(nm)}</th><th>YoY</th>" for nm, _, _ in sets) + "</tr>"
+    hist_txt = " → ".join(f"{x['d'][2:].replace('-', '/')} {'기초' if x['k'] == '초' else '수정'}" for x in hist if x["k"] in ("초", "수")) if len(hist) > 1 else ""
+    note = (f" · 수정 경과: {hist_txt}" if hist_txt else "")
+    return (f"<h2>연간 가이던스 ({esc(lab_fy)})</h2><p class=muted>금액 억 엔 · 전년 실적 대비 · 출처: 결산단신(회사 예상), 가부탄(수정 이력·전년 실적){note}</p>"
             f"<div class=scroll><table>{head}{''.join(rows)}</table></div>{img}")
 
 # ───────────────────────── 분기 단독(3개월) 계산 ─────────────────────────

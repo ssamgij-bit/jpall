@@ -163,6 +163,38 @@ def kb_finance(code):
     out.pop("_ytb", None)
     return out
 
+def kb_fc_hist(code):
+    """가부탄 '수정 이력'(期初·修正·実績) → {"2027-03": [{"d": "2026-10-30", "k": "초|수|실", "rev", "op", "ord", "ni"}]} 금액 백만 엔"""
+    out = {}
+    try:
+        s = mget(f"https://kabutan.jp/stock/finance?code={code}")
+        i = s.find("修正日"); j = s.find("「初」", i)
+        if i < 0: return out
+        fy = None
+        for m in re.finditer(r'rowspan="\d+">\s*(\d{4})\.(\d\d)\s*</td>|<td class="tac fs14">(\d\d)/(\d\d)/(\d\d)</td>\s*<td class="tal fs12">(初|修|実)</td>(.*?)</tr>\s*(?=<tr|</tbody)', s[i:j], re.S):
+            if m.group(1): fy = f"{m.group(1)}-{m.group(2)}"; continue
+            if not fy: continue
+            body = re.sub(r'<td>\s*<table class="arrow">.*?</table>\s*</td>', "", m.group(7), flags=re.S)
+            v = [_num(text_of(x)) for x in re.findall(r"<td[^>]*>(.*?)</td>", body, re.S)]
+            if len(v) < 4: continue
+            out.setdefault(fy, []).append({"d": f"20{m.group(3)}-{m.group(4)}-{m.group(5)}", "k": {"初": "초", "修": "수", "実": "실"}[m.group(6)],
+                                           "rev": v[0], "op": v[1], "ord": v[2], "ni": v[3]})
+    except Exception as e:
+        log("fc hist error", code, e)
+    return out
+
+def hist_revision(code, day, fc_end):
+    """결산단신과 같은 날 회사 예상이 바뀌었으면(별도 수정 공시 없이 결산단신에만 '수정 있음'인 경우 포함) 가부탄 수정 이력으로
+    → {"rev": (직전, 수정 후), "op": (...), "ni": (...), "init": {期初 예상}} 또는 None"""
+    h = kb_fc_hist(code).get((fc_end or "")[:7]) or []
+    d = f"{day[:4]}-{day[4:6]}-{day[6:]}"
+    for k, x in enumerate(h):
+        if x["d"] == d and x["k"] == "수" and k > 0:
+            p = h[k - 1]
+            if any(p.get(m) != x.get(m) for m in ("rev", "op", "ni")):
+                return {m: (p.get(m), x.get(m)) for m in ("rev", "op", "ni")} | {"init": h[0] if h[0]["k"] == "초" else None, "src": "kabutan"}
+    return None
+
 def kb_profile(code):
     """시가총액(억엔), 회사 개요(일본어 원문)"""
     s = mget(f"https://s.kabutan.jp/stocks/{code}/")
@@ -684,6 +716,7 @@ def analyze(row, rows, st):
               "op": (rv["rows"]["op"][0] / 1e6 if rv["rows"]["op"][0] is not None else None, rv["rows"]["op"][1] / 1e6 if rv["rows"]["op"][1] is not None else None)}
     else:
         rv = find_revision_pdf(rows, code)
+    if not rv: rv = hist_revision(code, row["d"], r.get("fc_end"))   # 결산단신에만 '수정 있음'(별도 수정 공시 없음)
     res.update(profile=profile, qual=qual, rev=rv, mat=find_material(rows, code))
     return res
 
@@ -1681,7 +1714,7 @@ def analyze_code(code):
                   "op": (rv["rows"]["op"][0] / 1e6 if rv["rows"]["op"][0] is not None else None, rv["rows"]["op"][1] / 1e6 if rv["rows"]["op"][1] is not None else None)}
         else:
             rv = find_revision_pdf(rows, code)
-        a.update(rev=rv, mat=find_material(rows, code))
+        a.update(rev=rv or hist_revision(code, row["d"], r.get("fc_end")), mat=find_material(rows, code))
     if "name" not in row: row["name"] = jp
     return a, row
 
