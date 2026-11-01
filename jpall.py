@@ -266,6 +266,10 @@ def consensus_work(st, limit=60):
                 rec["rev"] = float(re_.loc["0q", "avg"]); rec["rev_n"] = int(re_.loc["0q", "numberOfAnalysts"] or 0)
             if ee is not None and "0q" in ee.index and ee.loc["0q", "avg"] == ee.loc["0q", "avg"]:
                 rec["eps"] = float(ee.loc["0q", "avg"]); rec["eps_n"] = int(ee.loc["0q", "numberOfAnalysts"] or 0)
+            if re_ is not None and "0y" in re_.index and re_.loc["0y", "avg"] == re_.loc["0y", "avg"]:   # 이번 회계연도(실적 리포트의 '회사 예상 vs 컨센서스')
+                rec["rev_y0"] = float(re_.loc["0y", "avg"]); rec["rev_y0_n"] = int(re_.loc["0y", "numberOfAnalysts"] or 0)
+            if ee is not None and "0y" in ee.index and ee.loc["0y", "avg"] == ee.loc["0y", "avg"]:
+                rec["eps_y0"] = float(ee.loc["0y", "avg"]); rec["eps_y0_n"] = int(ee.loc["0y", "numberOfAnalysts"] or 0)
             if re_ is not None and "+1y" in re_.index and re_.loc["+1y", "avg"] == re_.loc["+1y", "avg"]:
                 rec["rev_y1"] = float(re_.loc["+1y", "avg"])
             if ee is not None and "+1y" in ee.index and ee.loc["+1y", "avg"] == ee.loc["+1y", "avg"]:

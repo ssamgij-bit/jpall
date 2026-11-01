@@ -25,6 +25,7 @@ CHANNEL = os.environ.get("EARN_CHANNEL", "")
 TEST_DAY = os.environ.get("TEST_DAY", "")
 TEST_REPORT = os.environ.get("TEST_REPORT", "")  # 종목 코드: 요청 분석 카드 + 리포트를 바로 만들어 봄(테스트용)
 OUT_DIR = os.environ.get("OUT_DIR", "earn_out")  # DRY_RUN일 때 카드 이미지·리포트 저장 위치
+UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 Safari/605.1.15", "Accept-Language": "ja,en;q=0.8"}
 MUA = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148"}
 
 # ───────────────────────── 스크리닝 규칙(사용자와 합의, 2026-10-27) ─────────────────────────
@@ -113,6 +114,15 @@ def save(st):
     json.dump(out, open(os.path.join(STATE_DIR, "earn.json"), "w"), ensure_ascii=False, separators=(",", ":"))
 def esc(s): return html.escape(s or "", quote=False)
 def text_of(s): return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", s or ""))).strip()
+def wget(url, timeout=20):
+    """웹페이지 받기. GitHub 서버 접속을 막는 사이트(가부탄 PC판 405 등)면 즉시 응답 관문으로 다시 → bytes"""
+    try:
+        return http(url, timeout=timeout, headers=UA)
+    except Exception as e:
+        if getattr(e, "code", None) not in (403, 405, 429, 451) and not re.search(r"timed out|reset|refused", str(e), re.I): raise
+        import earn_ir
+        return earn_ir._get(url, timeout=timeout)
+
 def mget(url, timeout=25):
     for wait in (0, 3, 8):
         time.sleep(wait)
@@ -186,7 +196,7 @@ def kb_fc_hist(code):
     except Exception as e:
         log("fc hist(mobile) error", code, e)
     try:
-        s = mget(f"https://kabutan.jp/stock/finance?code={code}")
+        s = wget(f"https://kabutan.jp/stock/finance?code={code}").decode("utf-8", "ignore")
         i = s.find("修正日"); j = s.find("「初」", i)
         if i < 0: return out
         fy = None
@@ -356,7 +366,7 @@ QRULE = """- 기간 기준: 이번 3개월 분기(예: 2Q(7~9월))가 기본이�
   자료에 누적(반기·1~3Q 누적)만 있으면, 같은 자료에 직전 분기 누적도 있을 때만 '이번 누적 − 직전 분기 누적'으로 분기 숫자를 계산해 쓰고,
   그럴 수 없으면 누적 숫자를 쓰되 반드시 '(누적 n~m월)'이라고 붙인다. 누적 숫자를 분기 숫자처럼 쓰지 말 것.
 """
-REP_VER = 2   # 리포트 내용·구성을 바꾸면 올림 → 예전에 만든 리포트를 다시 보내지 않고 새로 만듦
+REP_VER = 3   # 리포트 내용·구성을 바꾸면 올림 → 예전에 만든 리포트를 다시 보내지 않고 새로 만듦
 QBASIS_VER = 1   # 올리면 예전 기준으로 만든 리포트·IR 요약 저장분을 버리고 새로 만듦
 
 def read_tanshin(row):
@@ -1264,7 +1274,38 @@ def _rep_build(cp):
     ok_ai = cp.pop("_ai_ok", True)
     if not ok_ai: FAIL[cp["code"]] = ai_fail_reason()
     log("리포트 AI", cp["code"], key_label(), "성공" if ok_ai else f"실패({ai_fail_reason()})")
-    return fn, blob, ok_ai
+    return fn, blob, ok_ai, cp.get("_stats") or {}
+
+def _matchk(cp):
+    """리포트를 만들 때 이번 분기 설명 자료가 없던 카드: 그사이 회사 IR 홈페이지·TDnet에 올라왔는지 → True/False"""
+    import earn_ir
+    kd = earn_ir.kabutan_docs(cp)
+    if kd.get("mat"): return True
+    per = earn_ir.card_period(cp)
+    for t, u, d in earn_ir.ir_site_docs(cp["code"], cp["d"], limit=3, pat=earn_ir.MAT_LINK, period=per):
+        if earn_ir.QA_LINK.search(t): continue
+        if (d and d.replace("-", "")[:8] >= cp["d"]) or (per and earn_ir.period_score(t + " " + u, per) == 2):
+            try:
+                kind, _ = earn_ir.fetch_doc(u, pat=earn_ir.MAT_LINK, period=per)
+                if kind == "pdf": return True
+            except Exception: pass
+    return False
+
+def rep_refresh(st, limit=2):
+    """설명 자료 없이 만든 리포트: 결산 후 7일 동안 6시간마다 자료가 올라왔는지 확인 → 올라왔으면 다시 만들어 받았던 사람에게 보냄"""
+    n = 0
+    for cid, c in (st.get("cards") or {}).items():
+        if n >= limit: break
+        if not c.get("rep_to") or c.get("rep_mat") or c.get("deleted") or _running(None, cid): continue
+        try: age = (now().date() - dt.date(int(c["d"][:4]), int(c["d"][4:6]), int(c["d"][6:]))).days
+        except Exception: continue
+        if age > 7 or time.time() - c.get("mat_chk", 0) < 6 * 3600: continue
+        c["mat_chk"] = time.time(); n += 1
+        _submit("matchk", _matchk, _copy.deepcopy(c), cid=cid, waiters=[])
+
+def _rep_stats(st, stt):
+    for k, v in (stt or {}).items():
+        if v: bump(st, "rep_" + k, int(v))
 
 def _ir_build(cp):
     import earn_ir
@@ -1408,7 +1449,7 @@ def _find_job(key, st):
         reqs = json.loads(http(JPS_URL + "/findq", timeout=20, headers={"x-watch-key": key}))
     except Exception as e:
         log("jps findq error", str(e)[:80]); return
-    H = {"get": lambda u: http(u, timeout=20, headers=UA), "daily": naver_daily, "label": label_of, "esc": esc,
+    H = {"get": lambda u: wget(u, timeout=20), "daily": naver_daily, "label": label_of, "esc": esc,
          "gemini": gemini_json, "models": MON_MODELS, "jp_state": jp_state, "now": now}
     for r in reqs[:3]:
         try:
@@ -1465,6 +1506,9 @@ def do_reports(st):
         for lab, why in list(BAD_KEYS.items()):   # 거부된 Gemini 키(잘못 붙여넣음·만료·삭제) → 하루 한 번 알림
             alert_owner(st, f"Gemini {lab}가 구글에서 거부됐습니다({why[:80]}). GitHub 비밀값의 키를 확인해 주세요.", "badkey:" + lab, every=86400)
         _start_jobs(st)
+        try:
+            if len([x for x in JOBS if x["kind"] in ("rep", "ir", "deck", "matchk")]) < MAX_HEAVY: rep_refresh(st)
+        except Exception: traceback.print_exc()
     finally:
         st["ai_out"] = {k: v for k, v in AI_OUT.items() if v > time.time()}
 
@@ -1601,11 +1645,12 @@ class _DONE:
             rp = {"reply_to_message_id": reply, "allow_sending_without_reply": True} if reply else {}
             if ok != "ok":
                 tg("sendMessage", {"chat_id": dest, "text": f"리포트 생성 실패({card['code']}). 처리 중 오류가 났습니다(기록해 두었습니다). 잠시 뒤 다시 눌러 주세요.", **rp}); continue
-            fn, blob, ok_ai = res
+            fn, blob, ok_ai = res[:3]
             if not ok_ai:
                 with _key2(): out = ai_out_until(heavy=True)
                 if out: defer_ai(st, "rep", j["cid"], dest, reply, out); continue   # 만드는 도중 한도가 끝남 → 풀린 뒤 다시
             cap = f"📄 {card.get('name_ko') or card['name']}({card['code']}) 리포트 — 파일을 열어 보세요"
+            if card.get("mat_refresh"): cap = f"🔁 {card.get('name_ko') or card['name']}({card['code']}) 결산 설명 자료가 새로 올라와 반영한 리포트입니다"
             if not ok_ai: cap += "\n⚠️ AI 분석(결론·사업부·IR 핵심 데이터·Q&A)이 빠졌습니다. " + FAIL_TXT.get(FAIL.get(card["code"]), FAIL_TXT[None]) + " 📄 리포트를 다시 누르면 새로 만듭니다."
             if card.get("rep_file") and card.get("rep_ver") == REP_VER:
                 r = tg("sendDocument", {"chat_id": dest, "caption": cap, "document": card["rep_file"], **rp})
@@ -1614,12 +1659,28 @@ class _DONE:
             log("리포트 보냄", card["code"], dest, "AI 포함" if ok_ai else "AI 빠짐", "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:80]}")
             if r.get("ok") and ok_ai:
                 card["rep_file"] = ((r.get("result") or {}).get("document") or {}).get("file_id"); card["rep_ver"] = REP_VER
+            if r.get("ok") and str(dest) not in [str(x) for x in card.setdefault("rep_to", [])]: card["rep_to"] = (card["rep_to"] + [dest])[-10:]
+        if ok == "ok":
+            stt = res[3] if len(res) > 3 else {}
+            _rep_stats(st, {"built": 1, **stt})
+            card["rep_mat"] = bool(stt.get("mat")) or card.get("mat_refresh", False)
+            card.pop("mat_refresh", None)
+
+    @staticmethod
+    def matchk(st, j, ok, res):
+        card = st.get("cards", {}).get(j["cid"])
+        if not card or ok != "ok" or not res: return
+        log("설명 자료 새로 올라옴 → 리포트 다시 만듦", card["code"])
+        card.pop("rep_file", None); card["mat_refresh"] = True; card["rep_mat"] = True
+        for d in card.get("rep_to") or []:
+            st.setdefault("rep_q", []).append({"cid": j["cid"], "chat": d, "reply": None})
 
 def finish_jobs(st, timeout=300):
     """실행을 마치기 전: 돌던 작업을 최대 timeout초 기다려 반영, 그래도 안 끝난 건 대기열에 되돌려 다음 실행이 이어서 처리"""
     _collect(st, wait=timeout)
     for j in list(JOBS):
         if j["kind"] in ("analyze", "card"): st.setdefault("ask_q", []).insert(0, j["job"])
+        elif j["kind"] == "matchk": (st.get("cards", {}).get(j["cid"]) or {}).pop("mat_chk", None)
         else:
             for dest, reply in j["waiters"]:
                 st.setdefault("rep_q" if j["kind"] == "rep" else "ir_q", []).insert(0, {"cid": j["cid"], "chat": dest, "reply": reply})

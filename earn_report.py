@@ -421,8 +421,53 @@ def guide_section(plt, card, kb):
     head = "<tr><th>항목</th><th>전년 실적</th>" + "".join(f"<th>{esc(nm)}</th><th>YoY</th>" for nm, _, _ in sets) + "</tr>"
     hist_txt = " → ".join(f"{x['d'][2:].replace('-', '/')} {'기초' if x['k'] == '초' else '수정'}" for x in hist if x["k"] in ("초", "수")) if len(hist) > 1 else ""
     note = (f" · 수정 경과: {hist_txt}" if hist_txt else "")
+    # 회사 예상 vs 시장 컨센서스(Yahoo 애널리스트 평균, 이번 회계연도)
+    cons_html = ""
+    try:
+        cy = cons_fy(card["code"])
+        parts = []
+        if cy.get("rev") and new.get("rev"):
+            d_ = (new["rev"] * 1e6 / cy["rev"] - 1) * 100
+            parts.append(f"매출: 회사 {E.oku(new['rev'])} vs 컨센서스 {E.oku(cy['rev'] / 1e6)} → <b>{d_:+.1f}%</b>" + (f"({cy['rev_n']}명)" if cy.get("rev_n") else ""))
+        feps = (r.get("fc") or {}).get("eps")
+        if cy.get("eps") and feps:
+            d2 = (feps / cy["eps"] - 1) * 100
+            parts.append(f"EPS: 회사 {feps:,.1f}엔 vs 컨센서스 {cy['eps']:,.1f}엔 → <b>{d2:+.1f}%</b>" + (f"({cy['eps_n']}명)" if cy.get("eps_n") else ""))
+        if parts:
+            dd = [float(re.search(r"([+-][\d.]+)%", p_).group(1)) for p_ in parts]
+            tone = "회사 예상이 시장 기대보다 보수적" if max(dd) < -3 else "회사 예상이 시장 기대보다 높음" if min(dd) > 3 else "회사 예상이 시장 기대와 비슷"
+            cons_html = (f"<div class=card><b>회사 예상 vs 시장 컨센서스</b> — {tone}<br>" + "<br>".join(parts)
+                         + "<br><small class=muted>컨센서스: Yahoo Finance 애널리스트 평균(이번 회계연도). 발표 전에 받아 둔 값이 있으면 그것(=발표 전 시장 기대), 없으면 리포트 작성 시점 값</small></div>")
+    except Exception as e:
+        E.log("consensus fy error", e)
     return (f"<h2>연간 가이던스 ({esc(lab_fy)})</h2><p class=muted>금액 억 엔 · 전년 실적 대비 · 출처: 결산단신(회사 예상), 가부탄(수정 이력·전년 실적){note}</p>"
-            f"<div class=scroll><table>{head}{''.join(rows)}</table></div>{img}")
+            f"<div class=scroll><table>{head}{''.join(rows)}</table></div>{img}{cons_html}")
+
+def cons_fy(code):
+    """Yahoo 애널리스트 평균 — 이번 회계연도(0y) 매출(엔)·EPS(엔)와 애널리스트 수"""
+    out = {}
+    c = (E.jp_state().get("cons") or {}).get(code) or {}   # 공시봇이 발표 전에 받아 둔 값(발표 전 기대치)
+    if c.get("rev_y0"): out.update(rev=c["rev_y0"], rev_n=c.get("rev_y0_n"))
+    if c.get("eps_y0"): out.update(eps=c["eps_y0"], eps_n=c.get("eps_y0_n"))
+    if out: return out
+    import yfinance as yf
+    tk = yf.Ticker(code + ".T")
+    re_, ee = tk.revenue_estimate, tk.earnings_estimate
+    if re_ is not None and "0y" in re_.index and re_.loc["0y", "avg"] == re_.loc["0y", "avg"] and re_.loc["0y", "avg"]:
+        out["rev"] = float(re_.loc["0y", "avg"]); out["rev_n"] = int(re_.loc["0y", "numberOfAnalysts"] or 0)
+    if ee is not None and "0y" in ee.index and ee.loc["0y", "avg"] == ee.loc["0y", "avg"] and ee.loc["0y", "avg"]:
+        out["eps"] = float(ee.loc["0y", "avg"]); out["eps_n"] = int(ee.loc["0y", "numberOfAnalysts"] or 0)
+    return out
+
+# ───────────────────────── 캐파(생산능력)·증설 자료 따로 찾기 ─────────────────────────
+CAPA_RE = re.compile(r"캐파|생산능력|생산 능력|증설|설비 능력|가동률|라인 증설|공장 신설|생산 체제")
+CAPA_PROMPT = """첨부 PDF는 일본 상장사 {name}({code})의 IR 자료다(첨부 목록: {docs}). 생산능력(캐파)·증설과 관련된 숫자만 찾아 한국어 JSON으로.
+- 찾을 것: 연도·시점별 생산능력(톤/년, 개/월, 배수, 지수 등)과 그 추이, 증설·신규 공장의 완공·가동 시기와 투자액, 가동률.
+- 자료에 적힌 숫자만. 추측 금지. 일본어를 그대로 쓰지 말 것. 관련 내용이 없으면 {{"found": false}}.
+출력: {{"found": true, "title": "한국어 제목(예: 초고순도 콜로이달 실리카 생산능력 추이)", "doc": 첨부 번호, "page": 그 PDF 쪽 번호,
+ "why": "왜 중요한지 한 줄", "takeaway": "숫자로 된 결론 한 줄(예: 2025년 대비 2029년 생산능력 1.8배)",
+ "chart": {{"type": "bar", "unit": "단위", "labels": ["시점"], "series": [{{"name": "생산능력", "values": [숫자]}}]}}}}
+"""
 
 # ───────────────────────── 분기 단독(3개월) 계산 ─────────────────────────
 PREV_PROMPT = """첨부 PDF는 일본 상장사 {name}({code})의 직전 분기 결산단신이다. PDF 표에 적힌 숫자만 읽어 JSON으로 출력하라. 추측 금지, 없으면 null.
@@ -596,6 +641,22 @@ def build(card):
     ai = (gemini_pdf(prompt, pdfs, max_tokens=16000) if pdfs else gemini_json(prompt, timeout=180)) or {}
     card["_ai_ok"] = bool(ai)
     if isinstance(ai, list): ai = ai[0] if ai and isinstance(ai[0], dict) else {}
+    # 4-2) 캐파·증설 자료를 AI 선택에만 맡기지 않음: 핵심 데이터에 없으면 설명 자료·참고 자료에서 따로 한 번 더 찾아 맨 앞에 넣음
+    capa_hit = False
+    try:
+        ins = [x for x in (ai.get("insights") or []) if isinstance(x, dict)]
+        capa_hit = any(CAPA_RE.search(f"{x.get('title', '')} {x.get('takeaway', '')}") for x in ins)
+        cdocs = [i for i, (nm, _) in enumerate(pnames) if "결산단신" not in nm and "질의응답" not in nm and "수정 공시" not in nm]
+        if ai and not capa_hit and cdocs:
+            cp_ = gemini_pdf(CAPA_PROMPT.format(name=name, code=code, docs="; ".join(f"{k}. {pnames[i][0]}" for k, i in enumerate(cdocs, 1))),
+                             [pdfs[i] for i in cdocs], max_tokens=4000) or {}
+            if isinstance(cp_, dict) and cp_.get("found") and cp_.get("title"):
+                try: cp_["doc"] = cdocs[int(cp_.get("doc") or 1) - 1] + 1   # 이 호출의 첨부 번호 → 전체 첨부 번호
+                except Exception: cp_["doc"] = cdocs[0] + 1
+                ai["insights"] = [cp_] + ins[:5]; capa_hit = True
+                E.log("캐파 자료 따로 찾음", code, cp_.get("title", "")[:30])
+    except Exception as e:
+        E.log("capa extract error", e)
     trm = {w: KO_COMMON[w] for w in words if w in KO_COMMON}
     trm.update({k: v for k, v in (ai.get("tr") or {}).items() if v})
     miss = [w for w in words if w not in trm or re.search(r"[぀-ヿ一-鿿]", trm.get(w) or "")]
@@ -733,6 +794,11 @@ def build(card):
         qrows.append(f"<tr{cls}><td>{lab}<br><small>{months}</small></td><td>{qq.get('ann') or ''}</td><td>{E.oku(qq.get('rev'))}</td><td>{E.yoy_txt(ry, rs)}</td>"
                      f"<td>{E.oku(qq.get('op'))}</td><td>{E.yoy_txt(oy, os_)}</td><td>{fmt(opm)}%</td><td>{E.oku(qq.get('ni'))}</td><td>{E.yoy_txt(ny, ns)}</td></tr>")
     pl_html = ""
+    pl_src = qsrc
+    if not qpl and q.get("rev") is not None:   # 누적 − 직전 누적이 안 맞으면 가부탄 3개월 실적(결산단신 기준)으로 주요 항목만
+        mm = lambda k: [q[k] * 1e6 if q.get(k) is not None else None, py[k] * 1e6 if py.get(k) is not None else None]
+        qpl = {"매출": mm("rev"), "영업이익": mm("op"), "경상이익": mm("ord"), "지배주주 순이익": mm("ni")}
+        pl_src = "가부탄 3개월 실적(주요 항목만)"
     if qpl:
         rows = []
         rev = qpl.get("매출") or [None, None]
@@ -742,7 +808,7 @@ def build(card):
             if not v or (v[0] is None and v[1] is None): continue
             rows.append(f"<tr><td>{lab}</td><td>{E.oku(v[1] / 1e6 if v[1] is not None else None)}</td><td>{ratio(v[1], rev[1])}</td>"
                         f"<td>{E.oku(v[0] / 1e6 if v[0] is not None else None)}</td><td>{ratio(v[0], rev[0])}</td><td>{fmt(pct(v[0], v[1]))}%</td></tr>")
-        pl_html = (f"<details open><summary>분기 손익 상세 ({esc(lab_q)} {esc(months_q)} 3개월" + (f", 누적 − 직전 분기 누적 · {esc(qsrc)}" if (r.get('q') or 1) > 1 else "") + ")</summary><div class=scroll><table>"
+        pl_html = (f"<details open><summary>분기 손익 상세 ({esc(lab_q)} {esc(months_q)} 3개월" + (f" · {esc(pl_src)}" if (r.get('q') or 1) > 1 else "") + ")</summary><div class=scroll><table>"
                    "<tr><th>항목</th><th>전년 분기</th><th>매출 대비</th><th>이번 분기</th><th>매출 대비</th><th>YoY</th></tr>" + "".join(rows) + "</table></div></details>")
     if att["pl"] and (r.get("q") or 1) > 1:
         rows = []
@@ -826,4 +892,6 @@ figure{{margin:10px 0;background:#fff;border-radius:10px;padding:8px}} figure im
 <p class=muted>출처: TDnet(결산단신 XBRL·PDF, 설명 자료), 회사 IR 홈페이지, 로그미 파이낸스, 가부탄(실적·시가총액·대주주), 네이버 증권(주가). 금액 억 엔(원자료 백만 엔 환산).
 결론·요약·번역과 설명 자료에서 뽑은 숫자는 Gemini가 원문만 읽고 작성 — 숫자는 원문 쪽 이미지·링크로 확인하세요. 작성 {E.now():%Y-%m-%d %H:%M} JST</p>
 </main></body></html>"""
+    card["_stats"] = {"mat": int(bool(mat_pdf)), "refs": len(refs), "capa": int(capa_hit), "ai_fail": int(not ai),
+                      "qfail": int(bool(att["seg"]) and (r.get("q") or 1) > 1 and not seg_q)}
     return f"{code}_{card['d']}_report.html", doc.encode("utf-8")

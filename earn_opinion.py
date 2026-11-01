@@ -15,7 +15,11 @@ UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/60
       "Accept-Language": "ja,en;q=0.8"}
 
 def _get(url, timeout=25):
-    return http(url, timeout=timeout, headers=UA).decode("utf-8", "ignore")
+    try:
+        return http(url, timeout=timeout, headers=UA).decode("utf-8", "ignore")
+    except Exception as e:   # 가부탄 PC판처럼 GitHub 서버를 막는 사이트(405·403) → 즉시 응답 관문으로
+        if getattr(e, "code", None) not in (403, 405, 429, 451): raise
+        return E.wget(url, timeout=timeout).decode("utf-8", "ignore")
 
 def _since(card):
     d = card["d"]

@@ -127,7 +127,7 @@ def _get0(url, timeout=25):
                                                          "Accept-Language": "ja,en;q=0.8"})
         except Exception as e:
             code = getattr(e, "code", None)
-            blocked = code in (403, 451) or (code is None and re.search(r"timed out|reset|refused|closed|unreachable", str(e), re.I))
+            blocked = code in (403, 405, 429, 451) or (code is None and re.search(r"timed out|reset|refused|closed|unreachable", str(e), re.I))
             if not blocked or h in NO_GW or not (E.GATEWAY_URL and E.GATEWAY_KEY): raise
             E.log("site blocked → gateway", h, str(e)[:60])
     try:
