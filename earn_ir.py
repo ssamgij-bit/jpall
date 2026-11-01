@@ -19,6 +19,7 @@ IR_PROMPT = """첨부 PDF는 일본 상장사 {name}({code})의 이번 결산 �
 - 자료에 있는 내용만 쓴다. 추측·외부 지식 금지. 자료에 없으면 빈 문자열 또는 빈 배열.
 - 일본어를 그대로 쓰지 말고 전부 한국어로 번역(인명·제품명은 한글 발음 또는 통용 영문).
 - 금액은 자료 단위 그대로 쓰되 억 엔으로 바꿀 수 있으면 억 엔(1억 엔=100백만 엔). 전년 대비는 YoY.
+{qrule}- key 첫 줄은 아래 '이번 3개월 분기 수치'를 그대로 쓰고, 부문 숫자도 3개월 분기 기준(없으면 '(누적 n~m월)' 표시).
 - quality: 실적 퀄리티 1~10점(매출·이익 성장의 질, 일회성 여부, 가이던스 변화를 종합)과 한 줄 근거.
 - qa: 질의응답 자료가 있을 때만, 주식 운용역이 투자 판단에 쓸 질문만 골라 중요한 순서로 3~8개. 전부 옮기지 말 것.
   우선순위: ① 가이던스·실적 전망의 전제(수요·환율·가격 가정)와 상향·하향 여지 ② 수주·주문·수요 흐름과 지속성 ③ 가격 인상·원가·마진 방향 ④ 일회성 요인과 구조적 변화 구분 ⑤ 신사업·설비투자·M&A ⑥ 배당·자사주 등 자본 정책 ⑦ 경영진이 인정한 리스크.
@@ -31,7 +32,20 @@ IR_PROMPT = """첨부 PDF는 일본 상장사 {name}({code})의 이번 결산 �
  "surprise": [{{"title": "짧은 제목", "body": "1~2문장"}}], "kpi": ["특이사항·핵심 KPI(수주잔고, 점포 수, 단가, 환율 영향 등) 3~6줄"],
  "guidance": "가이던스와 수정 이유, 배당·주주환원 2~4문장", "qa": [{{"asker": "", "answerer": "", "q": "질문", "a": "답변 2~3문장", "why": "투자 판단에 중요한 이유 한 문장"}}],
  "qa_source": "질의응답 출처 자료 이름(없으면 빈 문자열)"}}
+
+이번 3개월 분기 수치(결산단신·가부탄 3개월 실적, 억 엔): {qnums}
 """
+
+def qnums(card):
+    """카드의 이번 3개월 분기 매출·영업이익·순이익과 전년 동기"""
+    try:
+        s = card.get("series") or []
+        q = s[-1]; py = {x["end"]: x for x in s}.get(E.ym_add(q["end"], -12)) or {}
+        lab, months = E.qlabel(q, card.get("fem") or E.fy_end_month_of(card["r"]))
+        f = lambda k: f"{E.oku(q.get(k))}(전년 {E.oku(py.get(k))}, {E.yoy_txt(*E.yoy(q.get(k), py.get(k)))})"
+        return f"{lab}({months}) 매출 {f('rev')}, 영업이익 {f('op')}, 순이익 {f('ni')}"
+    except Exception:
+        return "없음"
 
 SLOW = {}  # 모델 → 다시 시도할 시각(응답 지연·과부하일 때)
 def gemini_pdfs(prompt, pdfs):
@@ -449,24 +463,47 @@ def other_qa(card):
             E.log("qa fetch error", url, e)
     return out
 
-def kabutan_docs(card):
-    """TDnet 보관 기간(약 1개월)이 지난 결산: 가부탄 공시 목록의 TDnet 사본 PDF 주소 → {"pdf": 결산단신, "mat": 설명 자료}"""
-    out, items = {}, []
+def kabutan_list(code, min_day, pages=6):
+    """가부탄 공시 목록 → [(YYYYMMDD, 문서 번호, 제목)] (min_day보다 앞선 것까지 나오도록 모바일판 쪽 넘김)"""
+    items = []
     try:
-        s = _get(f"https://kabutan.jp/stock/news?code={card['code']}&nmode=3").decode("utf-8", "ignore")
+        s = _get(f"https://kabutan.jp/stock/news?code={code}&nmode=3").decode("utf-8", "ignore")
         items = re.findall(r'/disclosures/pdf/(\d{8})/(\d+)/"[^>]*>([^<]+)<', s)
     except Exception as e:
         E.log("kabutan disc error", e)
-    if not items or min(x[0] for x in items) > card["d"]:   # PC판이 막히거나 목록이 짧으면 모바일판(쪽 넘김)
-        for pg in range(1, 7):
+    if not items or min(x[0] for x in items) > min_day:   # PC판이 막히거나 목록이 짧으면 모바일판(쪽 넘김)
+        for pg in range(1, pages + 1):
             try:
-                s = E.mget(f"https://s.kabutan.jp/stocks/{card['code']}/news/?category=disclosure&page={pg}")
+                s = E.mget(f"https://s.kabutan.jp/stocks/{code}/news/?category=disclosure&page={pg}")
             except Exception as e:
                 E.log("kabutan mobile disc error", e); break
             got = re.findall(r'tdnet-pdf\.kabutan\.jp/(\d{8})/(\d+)\.pdf">\s*<div[^>]*>\s*([^<]+?)\s*</div>', s)
             if not got: break
             items += got
-            if min(x[0] for x in got) < card["d"]: break
+            if min(x[0] for x in got) < min_day: break
+    return items
+
+def prev_tanshin_pdf(card):
+    """직전 분기 결산단신 PDF(가부탄의 TDnet 사본) → (bytes, url) 또는 (None, None)"""
+    qn = (card.get("r") or {}).get("q") or 1
+    pat = {2: r"第1四半期", 3: r"第2四半期|中間", 4: r"第3四半期"}.get(qn)
+    if not pat: return None, None
+    d0 = dt.datetime.strptime(card["d"], "%Y%m%d")
+    lo = (d0 - dt.timedelta(days=140)).strftime("%Y%m%d"); hi = (d0 - dt.timedelta(days=40)).strftime("%Y%m%d")
+    for day, did, title in sorted(kabutan_list(card["code"], lo, pages=12), reverse=True):
+        t = nfkc(html.unescape(title))
+        if lo <= day <= hi and "決算短信" in t and "訂正" not in t and re.search(pat, t):
+            u = f"https://tdnet-pdf.kabutan.jp/{day}/{did}.pdf"
+            try:
+                b = http(u, timeout=60)
+                if b"%PDF" in b[:1024]: return b, u
+            except Exception as e: E.log("prev tanshin error", e)
+    return None, None
+
+def kabutan_docs(card):
+    """TDnet 보관 기간(약 1개월)이 지난 결산: 가부탄 공시 목록의 TDnet 사본 PDF 주소 → {"pdf": 결산단신, "mat": 설명 자료}"""
+    out = {}
+    items = kabutan_list(card["code"], card["d"])
     d0 = dt.datetime.strptime(card["d"], "%Y%m%d")
     for day, did, title in items:
         try: gap = abs((dt.datetime.strptime(day, "%Y%m%d") - d0).days)
@@ -519,7 +556,7 @@ def build(card, qa_rows=None):
     for d in docs:
         if total + len(d) <= 12_000_000: keep.append(d); total += len(d)
     docs = keep
-    prompt = IR_PROMPT.format(name=name, code=card["code"])
+    prompt = IR_PROMPT.format(name=name, code=card["code"], qrule=E.QRULE, qnums=qnums(card))
     for day, u, t in (kd.get("revs") or [])[:1]:   # 발표 이후 나온 업적 예상 수정 → 최신 가이던스로 반영
         try:
             b = http(u, timeout=60)

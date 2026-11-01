@@ -99,9 +99,9 @@ KO_COMMON = {"日本": "일본", "国内": "국내", "海外": "해외", "アジ
              "南米": "남미", "ヨーロッパ": "유럽", "欧州": "유럽", "その他": "기타", "東南アジア": "동남아시아", "インド": "인도", "韓国": "한국", "台湾": "대만"}
 STD_MEMBER = {"OtherReportableSegmentsMember": "その他", "OtherSegmentsMember": "その他", "OtherMember": "その他"}
 
-def attachments(xbrl_url):
+def attachments(xbrl_url=None, blob=None):
     """→ {'pl': {항목: (당기누적, 전기누적)}, 'seg': [{name, rev, rev_py, op, op_py}], 'per': '누적 기간 이름'}"""
-    blob = http(xbrl_url, timeout=60)
+    blob = blob or http(xbrl_url, timeout=60)
     zf = zipfile.ZipFile(io.BytesIO(blob))
     labels = _labels(zf)
     out = {"pl": {}, "seg": [], "kind": ""}
@@ -146,6 +146,14 @@ def pl_pick(pl, *pats):
             if re.fullmatch(p, k): return v
     return [None, None]
 
+def pl_compact(pl):
+    """XBRL 손익 항목 → {표 항목 이름: [당기 누적, 전기 누적]}(엔)"""
+    out = {}
+    for lab, pats in PL_ROWS:
+        v = pl_pick(pl, *pats)
+        if v[0] is not None or v[1] is not None: out[lab] = list(v)
+    return out
+
 PL_ROWS = [("매출", [r"NetSales", r"Revenue(IFRS)?", r"OperatingRevenue\w*", r"NetSalesIFRS", r"RevenueFromContractsWithCustomers\w*"]),
            ("매출원가", [r"CostOfSales(IFRS)?", r"CostOfRevenue\w*"]),
            ("매출총이익", [r"GrossProfit(IFRS)?"]),
@@ -164,7 +172,8 @@ IR_PROMPT = """너는 일본 중소형주를 깊게 보는 한국 바이사이�
 
 규칙
 - 자료에 있는 숫자·사실만. 추측 금지. 없으면 빈 값. 일본어를 그대로 쓰지 말 것(제품·지역·인명은 한국어 또는 통용 영문).
-- 금액 단위는 억 엔으로 통일(백만 엔 ÷ 100). 기간 표기는 자료 그대로(예: "2Q 누적(4~9월)", "2Q(7~9월)").
+- 금액 단위는 억 엔으로 통일(백만 엔 ÷ 100). 기간 표기를 period에 꼭 적는다(예: "2Q(7~9월)", 누적이면 "2Q 누적(4~9월)").
+{qrule}- business·region·insights·headline·narrative 모두 위 기간 기준을 따른다. headline·narrative의 매출·이익은 '수치'의 이번 분기 숫자.
 - business: 사업부·제품군별 매출·영업이익(전년 같은 기간과 이번). 자료에 사업부 구분이 여러 개면 매출 비중이 가장 큰 구분 하나.
 - region: 지역별 매출(·이익). 자료에 없으면 빈 배열.
   · 두 표 모두 business/region 항목 값은 숫자(억 엔), 모르면 null. period는 두 숫자의 기간.
@@ -186,7 +195,7 @@ IR_PROMPT = """너는 일본 중소형주를 깊게 보는 한국 바이사이�
 회사: {name}({code}) · 업종 {sector}
 회사 개요(일본어): {profile}
 수치(억 엔): {nums}
-결산단신 XBRL 세그먼트(누적, 억 엔): {segs}
+결산단신 XBRL 세그먼트({seg_basis}, 억 엔): {segs}
 번역할 말: {words}
 결산단신 본문:
 {qual}
@@ -349,6 +358,64 @@ def seg_section(plt, title, rows, period, source, check_total=None):
     if c2: charts.append(("막대 = (그 구분의 이번 − 전년 영업이익) ÷ 전년 영업이익 합계(본사 비용·조정 전).", c2))
     return html_ + "".join(f'<figure><img src="{c}">' + (f'<figcaption>{esc(cap)}</figcaption>' if cap else '') + '</figure>' for cap, c in charts), charts
 
+# ───────────────────────── 분기 단독(3개월) 계산 ─────────────────────────
+PREV_PROMPT = """첨부 PDF는 일본 상장사 {name}({code})의 직전 분기 결산단신이다. PDF 표에 적힌 숫자만 읽어 JSON으로 출력하라. 추측 금지, 없으면 null.
+단위는 모두 백만 엔으로 바꿔라(표가 천 엔이면 ÷1000, 엔이면 ÷1,000,000). 손실·마이너스는 음수.
+1) pl: 연결 손익계산서(연결이 없으면 개별)의 당기 누적(cur)과 전기 누적(prev).
+   항목: 매출(売上高·売上収益·営業収益), 매출원가, 매출총이익, 판관비(販売費及び一般管理費), 영업이익, 영업외수익, 영업외비용, 경상이익, 특별이익, 특별손실, 세전이익, 지배주주 순이익
+2) seg: 세그먼트 정보(セグメント情報)의 보고 세그먼트별 외부 고객 매출(外部顧客への売上高)과 세그먼트 이익(セグメント利益), 당기 누적·전기 누적.
+   아래 이름 목록 순서대로, name은 목록의 이름 그대로: {names}
+출력: {{"pl": {{"매출": [cur, prev], "영업이익": [cur, prev]}}, "seg": [{{"name": "", "rev": 0, "rev_py": 0, "op": 0, "op_py": 0}}]}}
+"""
+
+def prev_cum(card, att):
+    """직전 분기 누적(엔) → ({"pl": {항목: [cur, py]}, "seg": {key 또는 이름: [rev, rev_py, op, op_py]}}, 출처) 또는 (None, "")"""
+    import earn_ir
+    r = card["r"]; prev_end = E.ym_add(r["end"][:7], -3)
+    c = E.cum_load(card["code"]).get(prev_end)
+    if c:
+        seg = {}
+        for k, n, *v in c.get("seg") or []: seg[k] = v; seg.setdefault(n, v)
+        return {"pl": c.get("pl") or {}, "seg": seg}, "직전 분기 결산단신 XBRL"
+    pdf, url = earn_ir.prev_tanshin_pdf(card)
+    if not pdf: return None, ""
+    names = [x["name"] for x in att["seg"]]
+    out = gemini_pdf(PREV_PROMPT.format(name=card["name"], code=card["code"], names=json.dumps(names, ensure_ascii=False)), [pdf], max_tokens=4000) or {}
+    m = lambda v: num(v) * 1e6 if num(v) is not None else None
+    pl = {k: [m((v or [None, None])[0]), m((v or [None, None])[1])] for k, v in (out.get("pl") or {}).items() if isinstance(v, list) and len(v) >= 2}
+    seg = {}
+    for x in out.get("seg") or []:
+        if isinstance(x, dict) and x.get("name"): seg[nfkc(str(x["name"]))] = [m(x.get("rev")), m(x.get("rev_py")), m(x.get("op")), m(x.get("op_py"))]
+    return {"pl": pl, "seg": seg}, "직전 분기 결산단신 PDF에서 AI 추출 · 3개월 매출로 검산"
+
+def quarterize(card, att, q, py):
+    """이번 누적 − 직전 분기 누적 → 3개월 단독 손익·세그먼트. → (pl{항목:[이번, 전년]}, segs[], 출처) / 계산 못 하면 (None, None, 이유)"""
+    r = card["r"]; qn = r.get("q") or 1
+    cur_pl = pl_compact(att["pl"])
+    if qn == 1: return cur_pl, att["seg"], "1분기라 누적 = 3개월"
+    prev, src = prev_cum(card, att)
+    if not prev: return None, None, "직전 분기 결산단신을 못 찾음"
+    sub = lambda a, b: a - b if a is not None and b is not None else None
+    qpl = {k: [sub(v[0], (prev["pl"].get(k) or [None, None])[0]), sub(v[1], (prev["pl"].get(k) or [None, None])[1])] for k, v in cur_pl.items()}
+    # 검산: 계산한 3개월 매출이 가부탄 3개월 매출과 맞아야 씀(단위·기간 오독 방지)
+    def close(a, b, tol): return a is not None and b not in (None, 0) and abs(a / b - 1) <= tol
+    rv = (qpl.get("매출") or [None, None])
+    ok_pl = close((rv[0] or 0) / 1e6 if rv[0] is not None else None, q.get("rev"), 0.015) and \
+        (py.get("rev") is None or close((rv[1] or 0) / 1e6 if rv[1] is not None else None, py.get("rev"), 0.015))
+    if not ok_pl: qpl = None
+    qsegs = []
+    for x in att["seg"]:
+        pv = prev["seg"].get(x["key"]) or prev["seg"].get(x["name"])
+        if not pv: qsegs = None; break
+        qsegs.append(dict(x, rev=sub(x["rev"], pv[0]), rev_py=sub(x["rev_py"], pv[1]), op=sub(x["op"], pv[2]), op_py=sub(x["op_py"], pv[3])))
+    if qsegs:
+        tot = sum(x["rev"] or 0 for x in qsegs) / 1e6
+        # 세그먼트 합계가 내부 거래 포함 등으로 전사 매출과 원래 다를 수 있음 → 누적에서의 비율과 3개월 비율이 같아야 함
+        cum_tot = sum(x["rev"] or 0 for x in att["seg"]); base = (cum_tot / r["rev"]) if r.get("rev") else 1.0
+        if any((x["rev"] or 0) < 0 for x in qsegs) or not q.get("rev") or abs(tot / q["rev"] - base) > (0.06 if ok_pl else 0.03): qsegs = None
+    if qpl is None and qsegs is None: return None, None, "직전 분기 숫자가 3개월 매출과 맞지 않음"
+    return qpl, qsegs, src
+
 # ───────────────────────── 본체 ─────────────────────────
 def build(card):
     import earn_ir
@@ -378,6 +445,15 @@ def build(card):
         try: att = attachments(card["xbrl"])
         except Exception as e: E.log("attachment error", e)
     segs = att["seg"]
+    # 1-2) 분기 기준: 결산단신 손익·세그먼트(회계연도 누적)를 이번 3개월로(이번 누적 − 직전 분기 누적)
+    q = s[-1]; py = full.get(E.ym_add(q["end"], -12)) or {}
+    qpl, qsegs, qsrc = None, None, ""
+    if att["pl"] or segs:
+        try: qpl, qsegs, qsrc = quarterize(card, att, q, py)
+        except Exception as e: E.log("quarterize error", e); qsrc = "계산 오류"
+        E.log("분기 단독 계산", code, "손익" if qpl else "-", "세그먼트" if qsegs else "-", qsrc)
+    seg_q = qsegs is not None
+    if seg_q: segs = qsegs
     # 2) 대주주
     holders = []
     try:
@@ -433,13 +509,14 @@ def build(card):
         if p_ and p_ not in pdfs and total + len(p_) <= 12_000_000:  # Gemini 요청 한도(약 20MB, base64 포함) 안으로
             pdfs.append(p_); total += len(p_)
     # 4) Gemini 분석(설명 자료 + 결산단신 + 기록)
-    q = s[-1]; py = full.get(E.ym_add(q["end"], -12)) or {}
-    nums = (f"이번 분기 매출 {E.oku(q.get('rev'))}(전년 {E.oku(py.get('rev'))}), 영업이익 {E.oku(q.get('op'))}(전년 {E.oku(py.get('op'))}), "
-            f"순이익 {E.oku(q.get('ni'))}; 누적 매출 {E.oku(r['rev'] / 1e6) if r.get('rev') else '—'}; 연간 예상 영업이익 {E.oku(fc['op'] / 1e6) if fc.get('op') else '없음'}")
+    lab_q, months_q = E.qlabel(q, fem)
+    nums = (f"이번 3개월 분기({lab_q} {months_q}) 매출 {E.oku(q.get('rev'))}(전년 {E.oku(py.get('rev'))}), 영업이익 {E.oku(q.get('op'))}(전년 {E.oku(py.get('op'))}), "
+            f"순이익 {E.oku(q.get('ni'))}(전년 {E.oku(py.get('ni'))}); 참고 누적 매출 {E.oku(r['rev'] / 1e6) if r.get('rev') else '—'}; 연간 예상 영업이익 {E.oku(fc['op'] / 1e6) if fc.get('op') else '없음'}")
     seg_txt = "; ".join(f"{x['name']} 매출 {fmt((x['rev'] or 0) / 1e8)}(전년 {fmt((x['rev_py'] or 0) / 1e8)}) 영익 {fmt((x['op'] or 0) / 1e8)}(전년 {fmt((x['op_py'] or 0) / 1e8)})" for x in segs)
     words = [x["name"] for x in segs] + [h[0] for h in holders]
     prompt = IR_PROMPT.format(name=name, code=code, sector=E.SECTOR_KO.get(card["sector"], card["sector"]), profile=card.get("profile", "")[:500],
-                              nums=nums, segs=seg_txt or "없음", words=json.dumps(words, ensure_ascii=False), qual=card.get("qual", "")[:5000],
+                              nums=nums, segs=seg_txt or "없음", qrule=E.QRULE,
+                              seg_basis=f"이번 3개월 분기 {lab_q}({months_q}), 누적 − 직전 분기 누적" if seg_q else "회계연도 누적 — 분기 숫자 아님", words=json.dumps(words, ensure_ascii=False), qual=card.get("qual", "")[:5000],
                               extra=("설명회 기록(웹):\n" + "\n\n".join(rec_texts)) if rec_texts else "")
     prompt += rev_note
     ai = (gemini_pdf(prompt, pdfs, max_tokens=16000) if pdfs else gemini_json(prompt, timeout=180)) or {}
@@ -454,10 +531,16 @@ def build(card):
     xrows = [{"ko": trm.get(x["name"], x["name"]), "rev": x["rev"] / 1e8 if x.get("rev") is not None else None,
               "rev_py": x["rev_py"] / 1e8 if x.get("rev_py") is not None else None, "op": x["op"] / 1e8 if x.get("op") is not None else None,
               "op_py": x["op_py"] / 1e8 if x.get("op_py") is not None else None} for x in segs]
-    per_lab = f"{'누적' if r.get('q', 4) > 1 else ''} {r.get('start', '')[:7]}~{r.get('end', '')[:7]}".strip()
+    per_lab = (f"{lab_q}({months_q}) 3개월" + (f" · 이번 누적 − 직전 분기 누적({qsrc})" if (r.get('q') or 1) > 1 else "")) if seg_q else \
+        f"{'누적' if r.get('q', 4) > 1 else ''} {r.get('start', '')[:7]}~{r.get('end', '')[:7]}".strip() + (f" · 분기 분리 불가({qsrc})" if qsrc else "")
+    QPER = lambda p: bool(p) and "누적" not in p and bool(re.search(r"3개월|[1-4]Q\s*\(|분기|\d+~\d+월", p))
     total_cum = r["rev"] / 1e8 if r.get("rev") else None
     biz_rows, biz_src, biz_per = [], "", ""
     reg_rows, reg_src, reg_per = [], "", ""
+    if len(xrows) >= 2:
+        ai_q = lambda blk: QPER((ai.get(blk) or {}).get("period")) and len(seg_rows_from_ai(ai.get(blk), trm)) >= 2
+        if not seg_q and (ai_q("business") or ai_q("region")):   # XBRL이 누적뿐이면 설명 자료의 3개월 숫자를 우선
+            xrows = []
     if len(xrows) >= 2:
         if is_region([x["name"] for x in segs] + [x["ko"] for x in xrows]):
             reg_rows, reg_src, reg_per = xrows, "결산단신 XBRL 세그먼트 정보(외부 고객 매출)", per_lab
@@ -469,8 +552,9 @@ def build(card):
     if not reg_rows:
         reg_rows = seg_rows_from_ai(ai.get("region"), trm); reg_src = f"{src_name}(Gemini 추출)"; reg_per = (ai.get("region") or {}).get("period", "")
     def total_for(per):
+        if seg_q and per == per_lab and q.get("rev"): return q["rev"] / 100
         if "누적" in (per or "") and total_cum: return total_cum
-        if per and re.search(r"[1-4]Q\s*\(|3개월|분기", per) and q.get("rev"): return q["rev"] / 100
+        if QPER(per) and q.get("rev"): return q["rev"] / 100
         return total_cum
     biz_html, _ = seg_section(plt, "사업부별 실적", biz_rows, biz_per, biz_src, total_for(biz_per))
     reg_html, _ = seg_section(plt, "지역별 실적", reg_rows, reg_per, reg_src, total_for(reg_per))
@@ -563,7 +647,18 @@ def build(card):
         qrows.append(f"<tr{cls}><td>{lab}<br><small>{months}</small></td><td>{qq.get('ann') or ''}</td><td>{E.oku(qq.get('rev'))}</td><td>{E.yoy_txt(ry, rs)}</td>"
                      f"<td>{E.oku(qq.get('op'))}</td><td>{E.yoy_txt(oy, os_)}</td><td>{fmt(opm)}%</td><td>{E.oku(qq.get('ni'))}</td><td>{E.yoy_txt(ny, ns)}</td></tr>")
     pl_html = ""
-    if att["pl"]:
+    if qpl:
+        rows = []
+        rev = qpl.get("매출") or [None, None]
+        ratio = lambda a, b: f"{a / b * 100:.1f}%" if a is not None and b else "—"
+        for lab, _ in PL_ROWS:
+            v = qpl.get(lab)
+            if not v or (v[0] is None and v[1] is None): continue
+            rows.append(f"<tr><td>{lab}</td><td>{E.oku(v[1] / 1e6 if v[1] is not None else None)}</td><td>{ratio(v[1], rev[1])}</td>"
+                        f"<td>{E.oku(v[0] / 1e6 if v[0] is not None else None)}</td><td>{ratio(v[0], rev[0])}</td><td>{fmt(pct(v[0], v[1]))}%</td></tr>")
+        pl_html = (f"<details open><summary>분기 손익 상세 ({esc(lab_q)} {esc(months_q)} 3개월" + (f", 누적 − 직전 분기 누적 · {esc(qsrc)}" if (r.get('q') or 1) > 1 else "") + ")</summary><div class=scroll><table>"
+                   "<tr><th>항목</th><th>전년 분기</th><th>매출 대비</th><th>이번 분기</th><th>매출 대비</th><th>YoY</th></tr>" + "".join(rows) + "</table></div></details>")
+    if att["pl"] and (r.get("q") or 1) > 1:
         rows = []
         rev = pl_pick(att["pl"], *PL_ROWS[0][1])
         for lab, pats in PL_ROWS:
@@ -572,7 +667,7 @@ def build(card):
             ratio = lambda a, b: f"{a / b * 100:.1f}%" if a is not None and b else "—"
             rows.append(f"<tr><td>{lab}</td><td>{E.oku(v[1] / 1e6 if v[1] is not None else None)}</td><td>{ratio(v[1], rev[1])}</td>"
                         f"<td>{E.oku(v[0] / 1e6 if v[0] is not None else None)}</td><td>{ratio(v[0], rev[0])}</td><td>{fmt(pct(v[0], v[1]))}%</td></tr>")
-        pl_html = (f"<details><summary>누적 손익 상세 ({esc(r.get('start', '')[:7])}~{esc(r.get('end', '')[:7])}, 결산단신 손익계산서)</summary><div class=scroll><table>"
+        pl_html += (f"<details><summary>참고: 누적 손익 상세 ({esc(r.get('start', '')[:7])}~{esc(r.get('end', '')[:7])}, 결산단신 손익계산서)</summary><div class=scroll><table>"
                    "<tr><th>항목</th><th>작년 누적</th><th>매출 대비</th><th>올해 누적</th><th>매출 대비</th><th>YoY</th></tr>" + "".join(rows) + "</table></div></details>")
     yrows = []
     for y in kb["y"][-6:]:

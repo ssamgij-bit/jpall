@@ -280,6 +280,33 @@ def judge(series, i):
     return bool(hit), hit, ""
 
 # ───────────────────────── 결산단신 XBRL ─────────────────────────
+# ───────────────────────── 누적 손익·세그먼트 보관(분기 단독 계산용) ─────────────────────────
+# 결산단신의 손익·세그먼트는 회계연도 누적(반기·1~3Q 누적)이라, 이번 3개월 분기 = 이번 누적 − 직전 분기 누적.
+# 모든 결산단신의 누적 값을 종목별로 보관(estate/cum/종목코드.json, 최근 3개 분기) → 다음 분기 리포트에서 바로 뺌.
+CUM_DIR = os.path.join(STATE_DIR, "cum")
+def cum_load(code):
+    try: return json.load(open(os.path.join(CUM_DIR, f"{code}.json")))
+    except Exception: return {}
+def cum_save(code, r, blob):
+    try:
+        import earn_report as R
+        att = R.attachments(blob=blob)
+        d = cum_load(code)
+        d[r["end"][:7]] = {"q": r.get("q"), "pl": R.pl_compact(att["pl"]),
+                           "seg": [[x["key"], x["name"], x["rev"], x["rev_py"], x["op"], x["op_py"]] for x in att["seg"]]}
+        d = {k: d[k] for k in sorted(d)[-3:]}
+        os.makedirs(CUM_DIR, exist_ok=True)
+        json.dump(d, open(os.path.join(CUM_DIR, f"{code}.json"), "w"), ensure_ascii=False, separators=(",", ":"))
+    except Exception as e:
+        log("cum save error", code, e)
+
+# AI 글의 기간 기준(카드·리포트·IR 요약 공통): 반기·누적이 아니라 이번 3개월 분기
+QRULE = """- 기간 기준: 이번 3개월 분기(예: 2Q(7~9월))가 기본이다. 매출·이익·사업부·지역·KPI 숫자는 3개월 분기 숫자를 먼저 쓴다(설명 자료의 분기별 추이 표, '3개월'·'7~9월' 같은 분기 숫자).
+  자료에 누적(반기·1~3Q 누적)만 있으면, 같은 자료에 직전 분기 누적도 있을 때만 '이번 누적 − 직전 분기 누적'으로 분기 숫자를 계산해 쓰고,
+  그럴 수 없으면 누적 숫자를 쓰되 반드시 '(누적 n~m월)'이라고 붙인다. 누적 숫자를 분기 숫자처럼 쓰지 말 것.
+"""
+QBASIS_VER = 1   # 올리면 예전 기준으로 만든 리포트·IR 요약 저장분을 버리고 새로 만듦
+
 def read_tanshin(row):
     blob = http(row["xbrl"], timeout=60)
     kind, facts, ctx = X.open_zip(blob)
@@ -290,6 +317,7 @@ def read_tanshin(row):
     sh = [v for n, cid, v in facts if n.startswith("NumberOfIssuedAndOutstandingShares") and cid.startswith("Current")]
     tr = [v for n, cid, v in facts if n.startswith("NumberOfTreasuryStock") and cid.startswith("Current")]
     r["shares"] = (max(sh) - (max(tr) if tr else 0)) if sh else None
+    if row.get("code"): cum_save(row["code"], r, blob)
     # 본문(경영성적 개황 등) — 첨부의 qualitative.htm
     qual = ""
     try:
@@ -495,7 +523,7 @@ CARD_PROMPT = """너는 일본 중소형주를 보는 한국 애널리스트다.
   발표 자료에 없을 때 결산단신 본문으로 보완. 숫자가 있으면 꼭 숫자로(예: "AI 서버용 매출 +80%, 판가 인상 효과 +8억 엔").
 - 일본어를 그대로 쓰지 말고 전부 한국어로. 회사명·제품명은 한글 발음이나 통용 영문명으로.
 - 짧게: bm 45자, summary 60자, P/Q/C/etc 각 70자 이내. 숫자는 본문 그대로(억 엔 환산은 1억 엔=100백만 엔).
-- P=가격·환율·제품 믹스, Q=물량·수주·고객 수·점포 수, C=원가·판관비·감가상각, etc=일회성·영업외·특별손익 등 그 밖의 요인.
+{qrule}- P=가격·환율·제품 믹스, Q=물량·수주·고객 수·점포 수, C=원가·판관비·감가상각, etc=일회성·영업외·특별손익 등 그 밖의 요인.
 - oneoff: 영업이익(IFRS면 영업이익 또는 사업이익)을 이번 분기에 일시적으로 끌어올린 요인만 적는다.
   해당: 관세 환급금(예: 미국 IEEPA 관세 환급), 회계 방침·회계 추정 변경 효과(내용연수·감가상각 방법·수익 인식 변경 등),
   영업이익에 들어간 사업·자산 양도익, 충당금 환입, 보험금·보상금·화해금·일시 보조금 수령, 과거 비용의 환입·정산,
@@ -507,7 +535,7 @@ CARD_PROMPT = """너는 일본 중소형주를 보는 한국 애널리스트다.
   해당: 사업부·자회사 매각·양도, 연결 범위에서 제외, 수익 인식 기준 변경(총액→순액 등), 결산기 변경으로 비교 기간 불일치, 전년 동기의 대형 일회성 매출(기저 효과).
   제외: 수요 감소, 가격 인하, 환율, 경쟁 심화처럼 본업의 흐름인 것.
   adj_yoy = 그 요인을 뺀 매출 증가율(%, 자료에 숫자나 계산 근거가 있을 때만, 없으면 null).
-출력: {{"name_ko": "회사명(한국어 표기)", "bm": "무엇을 만들어/팔아 누구에게 파는 회사인지", "summary": "이번 분기 실적이 좋았던 핵심 이유 한 줄",
+출력: {{"name_ko": "회사명(한국어 표기)", "bm": "무엇을 만들어/팔아 누구에게 파는 회사인지", "summary": "이번 3개월 분기 실적이 좋았던 핵심 이유 한 줄",
  "P": "...", "Q": "...", "C": "...", "etc": "...",
  "oneoff": {{"what": "요인(없으면 빈 문자열)", "amt": 0, "main": false}},
  "rev_oneoff": {{"what": "요인(없으면 빈 문자열)", "adj_yoy": null}}}}
@@ -537,7 +565,7 @@ def find_mat_pdf(a, row):
 
 def ai_card(info, pdf=None):
     p = CARD_PROMPT.format(name=info["name"], code=info["code"], sector=info["sector"], profile=info["profile"][:400],
-                           nums=info["nums"], qual=info["qual"][:6000])
+                           nums=info["nums"], qual=info["qual"][:6000], qrule=QRULE)
     out = None
     if pdf:
         try:
@@ -2375,6 +2403,10 @@ def cleanup(st):
 def main():
     t0 = time.time()
     st = load()
+    if st.get("qbasis_ver") != QBASIS_VER:   # 분기 기준으로 바뀜 → 예전(누적 기준) 리포트·IR 요약은 다시 만들도록
+        for c in (st.get("cards") or {}).values():
+            c.pop("rep_file", None); c.pop("ir_texts", None)
+        st["qbasis_ver"] = QBASIS_VER
     if not DRY and not TOKEN:
         log("EARN_TOKEN이 없습니다. 저장소 Settings → Secrets에 봇 토큰을 등록해 주세요."); return
     if not DRY and not find_channel(st):
