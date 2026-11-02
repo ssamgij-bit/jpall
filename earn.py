@@ -224,6 +224,18 @@ def hist_revision(code, day, fc_end):
                 return {m: (p.get(m), x.get(m)) for m in ("rev", "op", "ni")} | {"init": h[0] if h[0]["k"] == "초" else None, "src": "kabutan"}
     return None
 
+_KBN = {}
+def kb_name(code):
+    """가부탄 종목 페이지 제목에서 회사명(일본어) — JPX(도쿄) 목록에 없는 나고야·삿포로·후쿠오카 단독 상장 종목용. 없으면 ''"""
+    if code not in _KBN:
+        try:
+            s = mget(f"https://s.kabutan.jp/stocks/{code}/")
+            m = re.search(r"<title>\s*(.+?)【" + re.escape(code) + r"】", s)
+            _KBN[code] = nfkc(m.group(1)).strip() if m else ""
+        except Exception as e:
+            log("kabutan name error", code, e); _KBN[code] = ""
+    return _KBN[code]
+
 def kb_profile(code):
     """시가총액(억엔), 회사 개요(일본어 원문)"""
     s = mget(f"https://s.kabutan.jp/stocks/{code}/")
@@ -1947,6 +1959,8 @@ def resolve(q):
     idx = name_index()
     codes = {c for c, *_ in idx}
     if m and m.group(1).upper() in codes: return m.group(1).upper(), []
+    if m and re.fullmatch(r"\d{3}[0-9A-Z]", m.group(1).upper()) and kb_name(m.group(1).upper()):
+        return m.group(1).upper(), []   # 나고야·삿포로·후쿠오카 단독 상장(JPX 목록에 없음) — 가부탄에 종목 페이지가 있으면 인정
     nq = _norm(re.sub(r"^/?(분석|실적|a)\s+", "", q))
     if len(nq) < 2: return None, []
     exact = [c for c, jp, en, ko in idx if nq in (_norm(jp), _norm(en), _norm(ko))]
@@ -2018,7 +2032,7 @@ def analyze_code(code):
         try: cap = r["shares"] * naver_daily(f"{code}.T", days=10)[-1]["c"] / 1e8
         except Exception: pass
     if ok and cap is not None and cap < RULES["X5_min_cap_oku"]: ok, why = False, f"X5 시총 {cap:,.0f}억 엔"
-    jp = next((x[1] for x in name_index() if x[0] == code), code)
+    jp = next((x[1] for x in name_index() if x[0] == code), None) or kb_name(code) or code
     a = {"code": code, "name": jp, "sector": sector, "pass": ok, "hit": hit, "why": why if not ok else "", "series": series, "r": r,
          "cap": cap, "profile": profile, "qual": qual, "ondemand": True, "prev_ok": judge(series, i - 1)[0] if i >= 2 else False}
     if rows:
