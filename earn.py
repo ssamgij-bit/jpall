@@ -1669,6 +1669,7 @@ def do_reports(st):
         _collect(st)
         for lab, why in list(BAD_KEYS.items()):   # 거부된 Gemini 키(잘못 붙여넣음·만료·삭제) → 하루 한 번 알림
             alert_owner(st, f"Gemini {lab}가 구글에서 거부됐습니다({why[:80]}). GitHub 비밀값의 키를 확인해 주세요.", "badkey:" + lab, every=86400)
+        if DRAIN["on"]: return   # 새 코드로 넘기는 중: 대기열은 다음 실행(새 코드)이 처리
         _start_jobs(st)
         try:
             if len([x for x in JOBS if x["kind"] in ("rep", "ir", "deck", "matchk")]) < MAX_HEAVY: rep_refresh(st)
@@ -2766,6 +2767,8 @@ def cleanup(st):
         if time.time() - c.get("ts", 0) > 86400 * 7: c.pop("qual", None)
     st["log"] = st.get("log", [])[-3000:]
 
+DRAIN = {"on": False, "t": 0}   # 새 코드 배포 감지 → 새 작업 시작을 멈추고 돌던 작업만 마무리
+
 def new_code():
     """main 브랜치의 최신 커밋이 이번 실행의 커밋과 다르면 True(코드 수정이 몇 분 안에 반영되도록)"""
     sha, repo, tok = os.environ.get("GITHUB_SHA"), os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GH_TOKEN")
@@ -2894,10 +2897,13 @@ def main():
     last_scan = 0
     last_code_chk = time.time()
     while time.time() - t0 < RUN_SECONDS:
-        if time.time() - last_code_chk > 60 and not (TEST_DAY or TEST_REPORT):
+        if not DRAIN["on"] and time.time() - last_code_chk > 60 and not (TEST_DAY or TEST_REPORT):
             last_code_chk = time.time()
             if new_code():
-                log("새 코드가 배포됨 → 하던 작업을 마치고 이번 실행 종료(다음 실행이 새 코드로 이어받음)"); break
+                DRAIN.update(on=True, t=time.time())
+                log("새 코드가 배포됨 → 새 작업은 받아만 두고, 돌던 리포트·카드가 끝나면 종료(다음 실행이 새 코드로 이어받음)")
+        if DRAIN["on"] and (not JOBS or time.time() - DRAIN["t"] > 900):   # 돌던 작업을 버리지 않도록 끝날 때까지(최대 15분) 기다림
+            log("새 코드로 넘김", "남은 작업 없음" if not JOBS else f"남은 작업 {len(JOBS)}개 되돌림"); break
         try:
             poll_buttons(st, wait=0)
             do_reports(st)
