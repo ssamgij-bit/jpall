@@ -1029,7 +1029,7 @@ def build(card):
     try: ret_html = ret_section(card, kb, att, plt, deep.get("policy"), div_html)
     except Exception as e: E.log("ret section error", e); ret_html = ""
     # 맨 앞 '기업 개요'(연혁·사업 변천·지금의 사업 구성) + '주주 구성'(소유자별 분포·대주주 상위 10) — EDINET 유가증권보고서
-    prof_html = ""
+    prof_html, pf = "", {}
     try:
         import earn_profile as EP
         pf = EP.get(card, name)
@@ -1198,6 +1198,28 @@ def build(card):
         if pts: glance.append("<b>핵심 포인트</b><ul>" + "".join(f"<li>{esc(x.get('takeaway') or x.get('title'))}</li>" for x in pts) + "</ul>")
     except Exception as e:
         E.log("glance error", e)
+    # 분기 컨센서스 대비(매출: 발표 전 Yahoo 평균, EPS: Yahoo 분기 실적 기록)
+    cq_html = ""
+    try:
+        import earn_diff as ED_
+        cq_html, cq_short = ED_.cons_quarter(card, q, esc)
+        if cq_short: glance.insert(1, f"<b>컨센서스</b> {esc(cq_short)}")
+        card["_cq"] = cq_short or "없음"
+    except Exception as e: E.log("cons quarter error", e)
+    # 지난 리포트 대비 달라진 점(같은 종목의 이전 분기 리포트와 비교, 이번 값 저장)
+    diff_html = ""
+    try:
+        import earn_diff as ED_
+        cp_ = deep.get("capa") if isinstance(deep.get("capa"), dict) and deep["capa"].get("found") else None
+        def _f(x):
+            try: return float(str(x).replace("%", "").replace(",", ""))
+            except Exception: return None
+        hs_ = [(n, None, p_) for n, _, p_ in (pf.get("holders") or [])] if pf.get("holders") else [(h[0], None, _f(h[1])) for h in holders]
+        snap = ED_.snapshot(card, fc, card.get("ret"), cp_, deep.get("policy"), hs_, ai.get("headline") or (card.get("ai") or {}).get("summary") or "",
+                            f"{lab_q}({months_q})", "edinet" if pf.get("holders") else "kabutan")
+        diff_html, n_ = ED_.diff_html(code, snap, esc)
+        card["_diff"] = (f"{n_}건" if diff_html else "첫 리포트")
+    except Exception as e: E.log("report diff error", e)
     glance_html = ("<div class=glance><div class=gt>한눈에 보기</div>" + "".join(f"<div>{g}</div>" for g in glance) + "</div>") if glance else ""
 
     tables_html = (f"<h2>분기·연간 실적 표와 차트</h2><h3>분기 실적 (3개월 단독, {esc(r.get('scope') or '')})</h3><div class=scroll><table>"
@@ -1213,10 +1235,11 @@ def build(card):
         m = re.match(r"\s*<h2>(.*?)</h2>", h, re.S)
         secs.append((title or (m.group(1) if m else ""), h[m.end():] if m else h, open_))
     ov_txt = ai.get("overview") or cardai.get("bm")
+    add(diff_html, True)   # 같은 종목을 다시 볼 때: 달라진 점을 맨 먼저
     add(prof_html or (("<h2>기업 개요</h2>" + (f"<div class=card>{esc(ov_txt)}</div>" if ov_txt else "") + holder_html) if (ov_txt or holder_html) else ""), True, "기업 개요 · 주주 구성")
     add("<h2>이번 분기 요약</h2>" + f"<div class=kpi>{''.join(f'<div><span>{k}</span><b>{v}</b></div>' for k, v in kpi)}</div>" + glance_html
         + (f"<div class=head><b>{esc(headline)}</b><p>{esc(ai.get('narrative'))}</p></div>" if headline else "")
-        + (f"<div class=card><ul>{why}</ul>{rx_html}</div>" if (why or rx_html) else ""), True)
+        + cq_html + (f"<div class=card><ul>{why}</ul>{rx_html}</div>" if (why or rx_html) else ""), True)
     add(biz_html, True); add(reg_html); add(guide_html, True); add(ins_html, True); add(qa_html)
     add(bizdeep_html); add(ret_html); add(op_html)
     add(tail, True, "리스크 · 다음에 확인할 점")
@@ -1226,7 +1249,7 @@ def build(card):
         num = "" if ti.startswith("부록") else f"{(k := k + 1)}. "
         plain = re.sub(r"<[^>]+>", "", ti)
         toc.append(f"<li><a href='#s{i}'>{num}{esc(plain)}</a></li>")
-        body.append(f"<details class=sec id=s{i}{' open' if op_ else ''}><summary><span class=h2>{num}{ti}</span></summary>{bd}</details>")
+        body.append(f"<details class=sec id=s{i} open><summary><span class=h2>{num}{ti}</span></summary>{bd}</details>")
     toc_html = "<nav class=toc><b>차례</b><ol>" + "".join(toc) + "</ol></nav>" if len(secs) > 2 else ""
     body_html = "\n".join(body)
     TOC_CSS = (".toc{background:#fff;border-radius:12px;padding:10px 16px;margin:12px 0;box-shadow:0 1px 2px rgba(0,0,0,.06)} .toc ol{list-style:none;margin:6px 0 0;padding:0;columns:2;column-gap:20px;font-size:13.5px}"
@@ -1282,6 +1305,6 @@ details.sec{{padding:0 12px 8px}} details.sec>summary{{list-style:none;padding:1
             "설명자료": "O" if mat_pdf else "X", "이전IR": len(refs), "분기3개월": "X" if card["_stats"]["qfail"] else "O",
             "캐파": "O" if capa_hit else "X", "사업분석": ("저장분" if deep.get("_biz_cached") else "O") if bz else "X",
             "밸류체인지도": f"{len(vm.get('players') or [])}개사", "환원목표": len(deep.get("policy") or []),
-            "EDINET": f"{card.pop('_edinet_n', 0)}개년", "기업개요": card.pop("_prof", "X"), "배당자료": len(div_ins), "컨센서스": "O" if card.pop("_cons", 0) else "X"}
+            "EDINET": f"{card.pop('_edinet_n', 0)}개년", "기업개요": card.pop("_prof", "X"), "분기컨센서스": card.pop("_cq", "X"), "지난대비": card.pop("_diff", "X"), "배당자료": len(div_ins), "컨센서스": "O" if card.pop("_cons", 0) else "X"}
     except Exception as e: E.log("rep sec stats error", e)
     return f"{code}_{card['d']}_report.html", doc.encode("utf-8")
