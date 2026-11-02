@@ -83,6 +83,12 @@ def _labels(zf):
 
 KO_COMMON = {"日本": "일본", "国内": "국내", "海外": "해외", "アジア": "아시아", "中国": "중국", "アメリカ": "미국", "米国": "미국", "北米": "북미", "米州": "미주",
              "南米": "남미", "ヨーロッパ": "유럽", "欧州": "유럽", "その他": "기타", "東南アジア": "동남아시아", "インド": "인도", "韓国": "한국", "台湾": "대만"}
+# 사업부 표에서 뺄 합계·조정 줄: '보고 세그먼트 계', '보고 세그먼트 및 기타'(소계), 합계, 조정액, 전사·소거 — '기타' 단독 세그먼트는 남김(2026-11 요청)
+AGG_KEY = re.compile(r"^(ReportableSegments?(AndOthers?)?Member|TotalMember|.*TotalOf.*|.*Reconciling.*|.*Elimination.*|.*Corporate.*|.*Adjustment.*|.*Unallocated.*|ConsolidatedMember)$")   # 회사 접두어를 뗀 멤버 이름 전체로 판단
+AGG_LAB = re.compile(r"報告セグメント(計|合計|及びその他|およびその他|とその他)?$|報告セグメント計|及びその他計|合計|小計|調整|消去|全社|連結|보고\s?세그먼트|및\s?기타|합계|소계|조정|소거|전사|연결")
+def agg_seg(name):
+    return bool(AGG_LAB.search(str(name or "")))
+
 STD_MEMBER = {"OtherReportableSegmentsMember": "その他", "OtherSegmentsMember": "その他", "OtherMember": "その他"}
 
 def attachments(xbrl_url=None, blob=None):
@@ -119,8 +125,8 @@ def attachments(xbrl_url=None, blob=None):
                 if not per.endswith("Duration"): continue
                 slot = 1 if per.startswith("Prior1") else 0
                 key = mem.split("_")[0] if mem.count("_") else mem
-                if key in ("ReportableSegmentsMember", "ReconcilingItemsMember", "TotalMember") or "Reconciling" in key or "Elimination" in key or "Corporate" in key: continue
                 mname = re.sub(r"^.*?\d{5}", "", key)  # 회사 접두어 제거
+                if key in ("ReportableSegmentsMember", "ReconcilingItemsMember", "TotalMember") or AGG_KEY.match(mname): continue
                 d = seg.setdefault(mname, {})
                 d.setdefault(name, [None, None])
                 if d[name][slot] is None: d[name][slot] = v
@@ -129,6 +135,7 @@ def attachments(xbrl_url=None, blob=None):
                 op = next((d[k] for k in d if re.match(r"(OperatingIncome|OperatingProfit|SegmentProfit|SegmentIncome|ProfitLossOfReportableSegment|OrdinaryIncome)", k)), None)
                 if not rev and not op: continue
                 lab = labels.get(mname) or STD_MEMBER.get(mname) or re.sub(r"(ReportableSegments?Member|SegmentMember|Member)$", "", mname)
+                if agg_seg(lab): continue   # '보고 세그먼트 및 기타' 등 합계 줄
                 out["seg"].append({"key": mname, "name": nfkc(lab), "rev": (rev or [None, None])[0], "rev_py": (rev or [None, None])[1],
                                    "op": (op or [None, None])[0], "op_py": (op or [None, None])[1]})
     return out
@@ -322,7 +329,7 @@ def page_image(pdf, page):
 def seg_rows_from_ai(block, trm):
     rows = []
     for it in (block or {}).get("items") or []:
-        if not isinstance(it, dict) or not it.get("name"): continue
+        if not isinstance(it, dict) or not it.get("name") or agg_seg(it["name"]): continue   # 합계·소계·조정 줄 제외
         rows.append({"ko": str(it["name"]), "rev": num(it.get("rev_cur")), "rev_py": num(it.get("rev_prev")),
                      "op": num(it.get("op_cur")), "op_py": num(it.get("op_prev"))})
     return rows
