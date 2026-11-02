@@ -18,7 +18,12 @@ def _f(x):
     except Exception: return None
 
 
-def check(text, facts, mode="q", fy=None):
+SEG_WORD = re.compile(r"부문|사업부|세그먼트|사업\s?(?:의\s?)?$")
+
+
+def check(text, facts, mode="q", fy=None, others=(), names=()):
+    """others: 다른 정당한 값들(세그먼트·전년 동기, 억 엔) — 이것과 맞으면 전사 합계가 아닌 숫자로 보고 건너뜀
+    names: 세그먼트 이름 — 숫자 앞 25자 안에 있으면 세그먼트 숫자로 보고 건너뜀"""
     """text 안 금액을 facts({항목: 억 엔})와 대조 → (표시를 붙인 문장, 일치 수, 불일치 목록)"""
     if not text or not facts: return text, 0, []
     ok, bad = 0, []
@@ -29,6 +34,9 @@ def check(text, facts, mode="q", fy=None):
             if v is None: continue
             pre = text[max(0, m.start() - 18):m.start()] + text[m.start():m.start(1)]
             if mode == "q" and SKIP_Q.search(pre): continue
+            near = re.split(r"[.。,，;]", text[max(0, m.start() - 25):m.start()])[-1]   # 같은 구절 안만
+            if SEG_WORD.search(near) or any(n_ and n_ in near for n_ in names): continue   # 세그먼트(부문) 숫자
+            if any(o_ is not None and abs(v - o_) <= max(0.5, abs(o_) * 0.01) for o_ in others): continue
             if mode == "y":
                 if SKIP_Y.search(pre): continue
                 fys = re.findall(r"FY\d{1,2}/\d{2}", text[max(0, m.start() - 60):m.start()])

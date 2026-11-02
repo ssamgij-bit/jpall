@@ -1039,7 +1039,7 @@ def build(card):
             if pf.get("overview") and fy_:
                 ov_, ok_, bad_ = [], 0, []
                 for x in pf["overview"]:
-                    x2, o2, b2 = CK.check(x, fy_, "y", fyl_); ov_.append(x2); ok_ += o2; bad_ += b2
+                    x2, o2, b2 = CK.check(x, fy_, "y", fyl_, names=[str(r_.get("ko") or "")[:6] for r_ in (biz_rows or [])]); ov_.append(x2); ok_ += o2; bad_ += b2
                 pf = dict(pf, overview=ov_)
                 card["_chk_ov"] = (ok_, bad_)
                 if bad_: E.log("기업 개요 숫자 불일치", code, " | ".join(bad_))
@@ -1188,9 +1188,11 @@ def build(card):
     try:   # 결론·설명 속 이번 분기 금액을 원자료와 대조
         import earn_check as CK
         fq_ = CK.facts_quarter(card); ok_q, bad_q = 0, []
+        oth_ = [x.get(k2) for x in (biz_rows or []) + (reg_rows or []) for k2 in ("rev", "rev_py", "op", "op_py")] + [py.get(k2) / 100 for k2 in ("rev", "op", "ni") if py.get(k2) is not None]
+        nm_ = [str(x.get("ko") or x.get("name") or "")[:6] for x in (biz_rows or []) + (reg_rows or [])]
         for k_ in ("headline", "narrative"):
             if ai.get(k_):
-                ai[k_], o2, b2 = CK.check(str(ai[k_]), fq_, "q"); ok_q += o2; bad_q += b2
+                ai[k_], o2, b2 = CK.check(str(ai[k_]), fq_, "q", others=oth_, names=nm_); ok_q += o2; bad_q += b2
         card["_chk_q"] = (ok_q, bad_q)
         if bad_q: E.log("결론 숫자 불일치", code, " | ".join(bad_q))
     except Exception as e: E.log("headline number check error", e)
