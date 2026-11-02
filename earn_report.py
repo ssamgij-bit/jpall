@@ -1200,18 +1200,39 @@ def build(card):
         E.log("glance error", e)
     glance_html = ("<div class=glance><div class=gt>한눈에 보기</div>" + "".join(f"<div>{g}</div>" for g in glance) + "</div>") if glance else ""
 
-    def fold(h, open_=False):
-        """<h2>로 시작하는 섹션을 접을 수 있게(제목을 누르면 펼침)"""
-        if not h: return ""
-        m = re.match(r"\s*<h2>(.*?)</h2>", h, re.S)
-        if not m: return h
-        return f"<details class=sec{' open' if open_ else ''}><summary><span class=h2>{m.group(1)}</span></summary>{h[m.end():]}</details>"
     tables_html = (f"<h2>분기·연간 실적 표와 차트</h2><h3>분기 실적 (3개월 단독, {esc(r.get('scope') or '')})</h3><div class=scroll><table>"
                    "<tr><th>분기</th><th>발표일</th><th>매출</th><th>YoY</th><th>영업이익</th><th>YoY</th><th>영업이익률</th><th>순이익</th><th>YoY</th></tr>" + "".join(qrows) + "</table></div>"
                    + pl_html + "<h3>연간 실적</h3><div class=scroll><table><tr><th>회계연도</th><th>매출</th><th>영업이익</th><th>영업이익률</th><th>순이익</th><th>EPS</th><th>배당</th></tr>"
                    + "".join(yrows) + "</table></div>" + "".join(f'<figure><img src="{c}"></figure>' for c in charts))
     try: EP_CSS = __import__("earn_profile").CSS
     except Exception: EP_CSS = ""
+    # 차례: 회사 이해(개요·주주) → 이번 분기(요약·사업부·지역·가이던스·IR 자료·Q&A) → 구조(비즈니스 심층·주주환원) → 시장 반응 → 리스크·체크포인트 → 부록(표)
+    secs = []
+    def add(h, open_=False, title=None):
+        if not h: return
+        m = re.match(r"\s*<h2>(.*?)</h2>", h, re.S)
+        secs.append((title or (m.group(1) if m else ""), h[m.end():] if m else h, open_))
+    ov_txt = ai.get("overview") or cardai.get("bm")
+    add(prof_html or (("<h2>기업 개요</h2>" + (f"<div class=card>{esc(ov_txt)}</div>" if ov_txt else "") + holder_html) if (ov_txt or holder_html) else ""), True, "기업 개요 · 주주 구성")
+    add("<h2>이번 분기 요약</h2>" + f"<div class=kpi>{''.join(f'<div><span>{k}</span><b>{v}</b></div>' for k, v in kpi)}</div>" + glance_html
+        + (f"<div class=head><b>{esc(headline)}</b><p>{esc(ai.get('narrative'))}</p></div>" if headline else "")
+        + (f"<div class=card><ul>{why}</ul>{rx_html}</div>" if (why or rx_html) else ""), True)
+    add(biz_html, True); add(reg_html); add(guide_html, True); add(ins_html, True); add(qa_html)
+    add(bizdeep_html); add(ret_html); add(op_html)
+    add(tail, True, "리스크 · 다음에 확인할 점")
+    add(tables_html, False, "부록 — 분기·연간 실적 표와 차트")
+    toc, body, k = [], [], 0
+    for i, (ti, bd, op_) in enumerate(secs):
+        num = "" if ti.startswith("부록") else f"{(k := k + 1)}. "
+        plain = re.sub(r"<[^>]+>", "", ti)
+        toc.append(f"<li><a href='#s{i}'>{num}{esc(plain)}</a></li>")
+        body.append(f"<details class=sec id=s{i}{' open' if op_ else ''}><summary><span class=h2>{num}{ti}</span></summary>{bd}</details>")
+    toc_html = "<nav class=toc><b>차례</b><ol>" + "".join(toc) + "</ol></nav>" if len(secs) > 2 else ""
+    body_html = "\n".join(body)
+    TOC_CSS = (".toc{background:#fff;border-radius:12px;padding:10px 16px;margin:12px 0;box-shadow:0 1px 2px rgba(0,0,0,.06)} .toc ol{list-style:none;margin:6px 0 0;padding:0;columns:2;column-gap:20px;font-size:13.5px}"
+               " .toc li{margin:3px 0;break-inside:avoid} .toc a{text-decoration:none} @media (max-width:600px){.toc ol{columns:1}}")
+    TOC_JS = ("<script>document.querySelectorAll('.toc a').forEach(function(a){a.addEventListener('click',function(){var d=document.querySelector(a.getAttribute('href'));if(d)d.open=true;});});"
+              "if(location.hash){var d0=document.querySelector(location.hash);if(d0)d0.open=true;}</script>")
     doc = f"""<!doctype html><html lang=ko><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>{esc(name)}({code}) 실적 리포트</title><style>
 body{{font-family:-apple-system,'Apple SD Gothic Neo','Noto Sans KR','Malgun Gothic',sans-serif;margin:0;background:#f6f7f9;color:#1f2328;line-height:1.55}}
@@ -1242,29 +1263,16 @@ details.sec{{padding:0 12px 8px}} details.sec>summary{{list-style:none;padding:1
 .vbar.me{{box-shadow:0 0 0 2px #fde68a}} .vsep{{grid-column:1/-1;border-top:1px dashed #c3c9d2;height:0}} .vrowend{{display:none}}
 @media (max-width:600px){{.vchain{{flex-direction:column}} .vc{{flex:1 1 auto}} .varr{{transform:rotate(90deg);align-self:center}}}} .tag{{font-size:11px;background:#fde68a;color:#78350f;border-radius:4px;padding:0 4px;margin-left:4px}}
 {EP_CSS}
+{TOC_CSS}
 </style></head><body><main>
 <h1>{esc(name)} <small>({code} JP · {esc(E.SECTOR_KO.get(card['sector'], card['sector']))})</small></h1>
 <p class=muted>{lab}({months}) 실적 · 발표 {card['d'][:4]}-{card['d'][4:6]}-{card['d'][6:]} {card['t']} JST · {' · '.join(card.get('hit') or []) or '요청 분석'}</p>
-{prof_html or (f"<div class=card>{esc(ai.get('overview') or cardai.get('bm'))}</div>" if (ai.get('overview') or cardai.get('bm')) else '')}
-<div class=kpi>{''.join(f'<div><span>{k}</span><b>{v}</b></div>' for k, v in kpi)}</div>
-{glance_html}
-{f"<div class=head><b>{esc(headline)}</b><p>{esc(ai.get('narrative'))}</p></div>" if headline else ''}
-{f"<div class=card><ul>{why}</ul>{rx_html}</div>" if (why or rx_html) else ''}
-{fold(guide_html, True)}
-{fold(ins_html, True)}
-{fold(biz_html, True)}
-{fold(ret_html)}
-{fold(reg_html)}
-{fold(bizdeep_html)}
-{fold(qa_html)}
-{fold(op_html)}
-{fold(tables_html)}
-{fold(tail, True)}
-{'' if prof_html else holder_html}
+{toc_html}
+{body_html}
 <h2>원문</h2><p>{' · '.join(links)}</p>
 <p class=muted>출처: TDnet(결산단신 XBRL·PDF, 설명 자료), 회사 IR 홈페이지, 로그미 파이낸스, 가부탄(실적·시가총액·대주주), 네이버 증권(주가). 금액 억 엔(원자료 백만 엔 환산).
 결론·요약·번역과 설명 자료에서 뽑은 숫자는 Gemini가 원문만 읽고 작성 — 숫자는 원문 쪽 이미지·링크로 확인하세요. 작성 {E.now():%Y-%m-%d %H:%M} JST</p>
-</main></body></html>"""
+</main>{TOC_JS}</body></html>"""
     card["_stats"] = {"mat": int(bool(mat_pdf)), "refs": len(refs), "capa": int(capa_hit), "ai_fail": int(not ai),
                       "qfail": int(bool(att["seg"]) and (r.get("q") or 1) > 1 and not seg_q)}
     try:   # 실행 기록용 섹션별 결과(텔레그램을 안 열어도 빠진 항목을 알 수 있게)
