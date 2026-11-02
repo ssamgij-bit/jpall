@@ -18,7 +18,7 @@
  7. 분기·누적 손익 상세·연간 실적 표, 주가·매출·영업이익 차트
  8. 가이던스·리스크·다음에 확인할 점, 대주주, 원문 링크
 """
-import io, os, re, json, time, base64, html, zipfile, subprocess, tempfile, datetime as dt
+import io, os, re, json, time, base64, html, zipfile, subprocess, tempfile, urllib.parse, datetime as dt
 
 import earn as E
 import xbrl as X
@@ -381,13 +381,28 @@ def guide_section(plt, card, kb):
     except Exception: pass
     same = lambda a, b: all(a.get(m) is None or b.get(m) is None or abs(a[m] - b[m]) < 0.5 for m in ("rev", "op", "ni"))
     sets = []
-    init = hist[0] if hist and hist[0]["k"] == "초" else (rv.get("init") or None)
-    if init and not same(init, new): sets.append((f"기초 예상({init['d'][5:].replace('-', '/')})", init, "#d6d3cc"))
-    old = {m: (rv.get(m) or (None, None))[0] for m in ("rev", "op", "ni")}
-    if any(v is not None for v in old.values()) and not same(old, new) and not (init and same(init, old)):
-        sets.append(("직전 예상", old, "#9aa0a6"))
-    revised = bool(sets)
-    sets.append(("현재 예상" if revised else "회사 예상", new, E.BLUE))
+    steps = [x for x in hist if x["k"] in ("초", "수")]
+    if len(steps) >= 2 or (steps and not same(steps[-1], new)):
+        # 가부탄 수정 이력이 있으면 기초 → 1차 수정 → 2차 수정 … 을 모두 열로(수정할 때마다 전년 대비 성장률이 어떻게 바뀌었는지)
+        n_rev = 0; seq = []
+        for x in steps:
+            if seq and same(seq[-1][1], x): continue   # 숫자가 같은 중복 줄은 건너뜀
+            if x["k"] == "수": n_rev += 1
+            seq.append((f"{'기초 예상' if x['k'] == '초' else f'{n_rev}차 수정'}({x['d'][2:].replace('-', '/')})", x))
+        if not same(seq[-1][1], new): seq.append(("현재 예상(결산단신)", new))   # 가부탄에 아직 안 올라온 이번 수정
+        if len(seq) > 5: seq = seq[:1] + seq[-4:]   # 너무 많으면 기초 + 최근 4개
+        greys = ["#e3e0d9", "#cfcbc2", "#b5b1a8", "#9aa0a6"]
+        for k, (nm, d) in enumerate(seq):
+            last = k == len(seq) - 1
+            sets.append((nm + (" ← 현재" if last and nm[:2] != "현재" else ""), d if not last else new, E.BLUE if last else greys[min(k, 3) if len(seq) <= 4 else min(k, 3)]))
+    else:
+        init = hist[0] if hist and hist[0]["k"] == "초" else (rv.get("init") or None)
+        if init and not same(init, new): sets.append((f"기초 예상({init['d'][5:].replace('-', '/')})", init, "#d6d3cc"))
+        old = {m: (rv.get(m) or (None, None))[0] for m in ("rev", "op", "ni")}
+        if any(v is not None for v in old.values()) and not same(old, new) and not (init and same(init, old)):
+            sets.append(("직전 예상", old, "#9aa0a6"))
+        sets.append(("현재 예상" if sets else "회사 예상", new, E.BLUE))
+    revised = len(sets) > 1
     lab_fy = E.fy_label_end(r.get("fc_end"))
     names = {"rev": "매출", "op": "영업이익", "ni": "순이익"}
     g = lambda a, b: (a / b - 1) * 100 if a is not None and b not in (None, 0) and b > 0 else None
@@ -409,12 +424,12 @@ def guide_section(plt, card, kb):
             for b_, v in zip(bars, vals):
                 if v is not None:
                     ax.text(b_.get_x() + b_.get_width() / 2, v, f"{v:+.1f}%", ha="center", va="bottom" if v >= 0 else "top",
-                            fontsize=9 if len(sets) > 2 else 10, fontweight="bold", color=col if col != "#d6d3cc" else "#8a877f")
+                            fontsize=8 if len(sets) > 3 else 9 if len(sets) > 2 else 10, fontweight="bold", color=col if col not in ("#d6d3cc", "#e3e0d9", "#cfcbc2") else "#8a877f")
         ax.axhline(0, color="#999", lw=0.8)
         ax.set_xticks(x); ax.set_xticklabels([names[m] for m in ms], fontsize=11)
         ax.set_ylabel("전년 실적 대비 %", fontsize=9)
         ax.set_title(f"{lab_fy} 회사 예상의 전년 대비 성장률" + (" — 수정 경과" if revised else ""), loc="left", fontsize=12, fontweight="bold")
-        if revised: ax.legend(fontsize=9, frameon=False, loc="upper left", ncol=len(sets))
+        if revised: ax.legend(fontsize=8 if len(sets) > 3 else 9, frameon=False, loc="upper left", ncol=min(len(sets), 3))
         for sp in ("top", "right"): ax.spines[sp].set_visible(False)
         lo, hi = ax.get_ylim(); ax.set_ylim(min(lo, 0) * 1.15, max(hi, 0) * 1.25)
         fig.tight_layout(); img = f'<figure><img src="{b64png(fig)}"></figure>'
@@ -937,9 +952,15 @@ def build(card):
                 rev_note = f"\n참고: 첨부 중 하나는 이번 결산 발표 뒤 {day[:4]}-{day[4:6]}-{day[6:]}에 나온 업적 예상 수정 공시다. 가이던스(guidance) 서술에는 이 최신 수정치와 날짜를 반드시 반영하라."
         except Exception as e: E.log("revision pdf error", e)
     pdfs, total, pnames = [], 0, []
-    for p_, nm in [(mat_pdf, "이번 결산 설명 자료"), (rec_pdfs[0] if rec_pdfs else None, "설명회 질의응답 기록"), (tan_pdf, "이번 결산단신"), (rev_pdf, "이후 업적 예상 수정 공시")]:
+    psrc = []   # 첨부마다 (자료 이름, 발표일 YYYY-MM-DD, 어디서, 링크) — 'IR 자료에서 고른 핵심 데이터' 카드에 언제·어디서 나온 자료인지 표시
+    ann = f"{card['d'][:4]}-{card['d'][4:6]}-{card['d'][6:]}"
+    rv_day = next((f"{d_[:4]}-{d_[4:6]}-{d_[6:]}" for d_, _, _ in (kd.get("revs") or [])[:1]), "")
+    for p_, nm, src_ in [(mat_pdf, "이번 결산 설명 자료", ("결산 설명 자료", ann, mat_src, mat_url)),
+                         (rec_pdfs[0] if rec_pdfs else None, "설명회 질의응답 기록", (rec_links[0][0] if rec_links else "질의응답 기록", "", "질의응답 기록", rec_links[0][1] if rec_links else "")),
+                         (tan_pdf, "이번 결산단신", ("결산단신", ann, "TDnet 적시공시", card.get("pdf") or "")),
+                         (rev_pdf, "이후 업적 예상 수정 공시", ("업적 예상 수정 공시", rv_day, "TDnet 적시공시", ""))]:
         if p_ and p_ not in pdfs and total + len(p_) <= 12_000_000:  # Gemini 요청 한도(약 20MB, base64 포함) 안으로
-            pdfs.append(p_); total += len(p_); pnames.append((nm, None))
+            pdfs.append(p_); total += len(p_); pnames.append((nm, None)); psrc.append(src_)
     # 3-2) 최근 IR 참고 자료: 이번 분기 설명 자료가 없으면 최근 1년 안의 발표 자료·중기 경영계획·설비투자 공시로 구조 자료(캐파·증설·수주잔고 등)를 보완
     refs = []
     try:
@@ -947,6 +968,7 @@ def build(card):
     except Exception as e: E.log("latest refs error", e)
     for b_, u_, t_, d_ in refs:
         pdfs.append(b_); total += len(b_); pnames.append((f"이전 IR 참고 자료: {t_} ({d_} 발표)", (u_, t_, d_)))
+        psrc.append((t_, d_, "TDnet 적시공시" if re.search(r"tdnet|kabutan|jpx", u_ or "") else "회사 IR 홈페이지" + (f"({urllib.parse.urlparse(u_).netloc})" if u_ else ""), u_))
     ref_note = "\n첨부 목록: " + "; ".join(f"{i}. {nm}" for i, (nm, _) in enumerate(pnames, 1)) if pdfs else ""
     # 4) Gemini 분석(설명 자료 + 결산단신 + 기록)
     lab_q, months_q = E.qlabel(q, fem)
@@ -1027,11 +1049,16 @@ def build(card):
         except Exception: di = -1
         src_pdf, ref = (pdfs[di], pnames[di][1]) if 0 <= di < len(pdfs) else (base_pdf, None)
         pg = page_image(src_pdf, it.get("page")) if src_pdf and it.get("page") else None
+        if ref and ref not in used_refs: used_refs.append(ref)
+        # 언제·어디서 나온 자료인지(모든 카드): 발표일 · 출처(TDnet·회사 IR 홈페이지) · 자료 이름 · 쪽
+        s_ = psrc[di] if 0 <= di < len(psrc) else (psrc[0] if psrc else None)
         tag = ""
-        if ref:
-            tag = f' <small class=muted>({esc(ref[2])} 발표 「<a href="{esc(ref[0])}">{esc(ref[1][:30])}</a>」 기준)</small>'
-            if ref not in used_refs: used_refs.append(ref)
-        return (f"<div class=card><h3>{esc(it['title'])}{tag}</h3>" + (f"<p><b>{esc(it.get('takeaway'))}</b></p>" if it.get("takeaway") else "")
+        if s_:
+            nm_, d_, where_, u_ = s_
+            nm_html = f'<a href="{esc(u_)}">{esc(str(nm_)[:40])}</a>' if u_ else esc(str(nm_)[:40])
+            tag = (f'<p class=src>📅 <b>{esc(d_) if d_ else "발표일 미상"}</b> 발표 · {esc(where_)} · 「{nm_html}」'
+                   + (f" {esc(it.get('page'))}쪽" if it.get("page") else "") + "</p>")
+        return (f"<div class=card><h3>{esc(it['title'])}</h3>{tag}" + (f"<p><b>{esc(it.get('takeaway'))}</b></p>" if it.get("takeaway") else "")
                 + (f"<p class=muted>왜 중요한가: {esc(it.get('why'))}</p>" if it.get("why") else "")
                 + (f'<img src="{img}">' if img else "")
                 + (f"<details><summary>원문 {esc(it.get('page'))}쪽 보기</summary><img src=\"{pg}\"></details>" if pg else "") + "</div>")
@@ -1322,6 +1349,7 @@ details.sec{{padding:0 12px 8px}} details.sec>summary{{list-style:none;padding:1
 @media (max-width:600px){{.vchain{{flex-direction:column}} .vc{{flex:1 1 auto}} .varr{{transform:rotate(90deg);align-self:center}}}} .tag{{font-size:11px;background:#fde68a;color:#78350f;border-radius:4px;padding:0 4px;margin-left:4px}}
 {EP_CSS}
 {TOC_CSS}
+.src{{margin:-2px 0 6px;font-size:12.5px;color:#4b5563;background:#f3f4f6;border-radius:6px;padding:3px 8px;display:inline-block}}
 </style></head><body><main>
 <h1>{esc(name)} <small>({code} JP · {esc(E.SECTOR_KO.get(card['sector'], card['sector']))})</small></h1>
 <p class=muted>{lab}({months}) 실적 · 발표 {card['d'][:4]}-{card['d'][4:6]}-{card['d'][6:]} {card['t']} JST · {' · '.join(card.get('hit') or []) or '요청 분석'}</p>
