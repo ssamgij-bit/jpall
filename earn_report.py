@@ -511,36 +511,36 @@ def ret_policy(card, pdfs, pnames):
     return [x for x in (out.get("items") or []) if isinstance(x, dict) and x.get("target")]
 
 def ret_hist_chart(plt, rows, fc=None, progressive=False):
-    """주당배당(막대, 분할 조정) + 배당성향(선) 10년 + 이번 회계연도 회사 예상(빗금 막대)"""
+    """배당금 총액(막대, 억 엔 — 주식분할과 무관) + 배당성향(선) 10년 + 이번 회계연도 회사 예상(빗금 막대)"""
     import numpy as np
-    rows = [r for r in rows if r.get("dps") is not None or r.get("payout") is not None]
+    rows = [r for r in rows if r.get("dtot") is not None or r.get("payout") is not None]
     if len(rows) < 3: return ""
     lab = [f"FY{int(r['fy'][5:7])}/{r['fy'][2:4]}" for r in rows]
-    dps = [r.get("dps") for r in rows]; pay = [r.get("payout") for r in rows]
-    fc_on = bool(fc and fc.get("dps") is not None and fc.get("lab") and fc["lab"] not in lab)
-    if fc_on: lab.append(fc["lab"] + "\n(예상)"); dps.append(fc["dps"]); pay.append(fc.get("payout"))
+    tot = [(r.get("dtot") / 100 if r.get("dtot") is not None else None) for r in rows]; pay = [r.get("payout") for r in rows]
+    fc_on = bool(fc and fc.get("dtot") is not None and fc.get("lab") and fc["lab"] not in lab)
+    if fc_on: lab.append(fc["lab"] + "\n(예상)"); tot.append(fc["dtot"] / 100); pay.append(fc.get("payout"))
     fig, ax = plt.subplots(figsize=(8, 3.8))
     x = np.arange(len(lab))
     cols = ["#9dbbea"] * len(lab)
     if fc_on: cols[-1] = "#ffffff"
-    bars = ax.bar(x, [d or 0 for d in dps], 0.6, color=cols, edgecolor=[E.BLUE if (fc_on and i == len(lab) - 1) else "#9dbbea" for i in range(len(lab))],
-                  hatch=None, label="주당배당(엔, 분할 조정)")
+    bars = ax.bar(x, [d or 0 for d in tot], 0.6, color=cols, edgecolor=[E.BLUE if (fc_on and i == len(lab) - 1) else "#9dbbea" for i in range(len(lab))],
+                  label="배당금 총액(억 엔)")
     if fc_on: bars[-1].set_hatch("///")
-    for i, d in enumerate(dps):
+    for i, d in enumerate(tot):
         if d is not None: ax.annotate(f"{d:,.0f}" if d >= 10 else f"{d:,.1f}", (i, d), textcoords="offset points", xytext=(0, 3), ha="center", fontsize=7.5, color="#374151")
-    ax.set_ylabel("엔", fontsize=9); ax.set_xticks(x); ax.set_xticklabels(lab, fontsize=8)
+    ax.set_ylabel("억 엔", fontsize=9); ax.set_xticks(x); ax.set_xticklabels(lab, fontsize=8)
     ax2 = ax.twinx()
     xp = [i for i, v in enumerate(pay) if v is not None]
     if xp:
         ax2.plot(xp, [min(pay[i], 200) for i in xp], color=E.ORANGE, marker="o", ms=4, label="배당성향(%)")
         i = xp[-1]; ax2.annotate(f"{pay[i]:.0f}%", (i, min(pay[i], 200)), textcoords="offset points", xytext=(0, 7), ha="center", fontsize=8, color=E.ORANGE)
         top = max(min(max(pay[i] for i in xp), 200), 20)
-        ax2.set_ylim(-top * 1.15, top * 1.25)   # 배당성향 선은 위쪽, 주당배당 막대는 아래쪽에 → 겹치지 않게
+        ax2.set_ylim(-top * 1.15, top * 1.25)   # 배당성향 선은 위쪽, 배당금 막대는 아래쪽에 → 겹치지 않게
         ax2.set_yticks([v for v in ax2.get_yticks() if 0 <= v <= top * 1.2])
     ax2.set_ylabel("%", fontsize=9)
     h1, l1 = ax.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
     ax.legend(h1 + h2, l1 + l2, fontsize=8, frameon=False, loc="upper left", ncol=3, bbox_to_anchor=(0, 1.02))
-    ax.set_title("주당 배당금과 배당성향 추이" + (" — 누진배당 방침" if progressive else ""), loc="left", fontsize=12, fontweight="bold")
+    ax.set_title("배당금 총액과 배당성향 추이" + (" — 누진배당 방침" if progressive else ""), loc="left", fontsize=12, fontweight="bold")
     for sp in ("top",): ax.spines[sp].set_visible(False); ax2.spines[sp].set_visible(False)
     lo, hi = ax.get_ylim(); ax.set_ylim(0, hi * 1.9)
     fig.tight_layout()
@@ -589,24 +589,30 @@ def ret_section(card, kb, att, plt=None, policy=None, div_html=""):
         E.log("주주환원 10년", card["code"], f"{len(hist)}개년", note or "")
         card["_edinet_n"] = len(hist)
         if hist:
-            fc = {"lab": fy_lab(ret.get("fy_end")), "dps": ret.get("dps_fc"), "payout": ret.get("payout_fc")} if ret.get("dps_fc") is not None else None
-            ds = [h.get("dps") for h in hist if h.get("dps") is not None]
-            cut = [hist[i]["fy"] for i in range(1, len(hist)) if hist[i].get("dps") is not None and hist[i - 1].get("dps") is not None and hist[i]["dps"] < hist[i - 1]["dps"] * 0.995]
+            # 배당금 총액(그 회계연도 몫, 백만 엔) = 배당성향 × 순이익 — 주식분할과 무관. 둘 중 하나가 없으면 그해 현금흐름표의 배당금 지급액
+            for h in hist:
+                if h.get("payout") is not None and h.get("ni"): h["dtot"], h["dsrc"] = h["payout"] * h["ni"] / 100, ""
+                elif h.get("div") is not None: h["dtot"], h["dsrc"] = h["div"], "현금"
+                else: h["dtot"], h["dsrc"] = None, ""
+            fc = {"lab": fy_lab(ret.get("fy_end")), "dtot": ret.get("div_total_fc"), "payout": ret.get("payout_fc")} if ret.get("div_total_fc") is not None else None
+            ds = [(h["fy"], h["dtot"]) for h in hist if h.get("dtot") is not None]
+            down = [ds[i][0] for i in range(1, len(ds)) if ds[i][1] < ds[i - 1][1] * 0.995]
             summ = ""
             if len(ds) >= 3:
-                n = len(ds) - 1
-                cagr = ((ds[-1] / ds[0]) ** (1 / n) - 1) * 100 if ds[0] and ds[0] > 0 else None
-                summ = (f"<p><b>{len(ds)}개년 주당배당 {fmt(ds[0])}엔 → {fmt(ds[-1])}엔</b>" + (f"(연평균 {cagr:+.1f}%)" if cagr is not None else "")
-                        + (" · 이 기간 감배 없음" if not cut else " · 감배 " + ", ".join(f"FY{int(c[5:7])}/{c[2:4]}" for c in cut))
-                        + (f" · 이번 회계연도 회사 예상 {fmt(fc['dps'])}엔" if fc else "") + "</p>")
-            trs = "".join(f"<tr><td>FY{int(h['fy'][5:7])}/{h['fy'][2:4]}</td><td><b>{fmt(h.get('dps'))}엔</b>{f"<br><small>(당시 {fmt(h.get('dps_raw'))}엔, 1:{h['split']:g} 분할 조정)</small>" if (h.get('split') or 1) > 1 else ""}</td>"
+                n = len(ds) - 1; a0, a1 = ds[0][1], ds[-1][1]
+                cagr = ((a1 / a0) ** (1 / n) - 1) * 100 if a0 and a0 > 0 and a1 > 0 else None
+                summ = (f"<p><b>{len(ds)}개년 배당금 총액 {E.oku(a0)} 엔 → {E.oku(a1)} 엔</b>" + (f"(연평균 {cagr:+.1f}%)" if cagr is not None else "")
+                        + (" · 이 기간 줄어든 해 없음" if not down else " · 줄어든 해 " + ", ".join(f"FY{int(c[5:7])}/{c[2:4]}" for c in down))
+                        + (f" · 이번 회계연도 회사 예상 {E.oku(fc['dtot'])} 엔" if fc else "") + "</p>")
+            trs = "".join(f"<tr><td>FY{int(h['fy'][5:7])}/{h['fy'][2:4]}</td><td><b>{E.oku(h.get('dtot'))}</b>{'<small> (현금 지급액)</small>' if h.get('dsrc') else ''}</td>"
                           f"<td>{fmt(h.get('payout'))}%</td><td>{E.oku(h.get('div'))}</td><td>{E.oku(h.get('buy'))}</td><td>{E.oku(h.get('ni'))}</td></tr>" for h in hist)
             if fc:
-                trs += f"<tr class=cur><td>{fc['lab']} 회사 예상</td><td><b>{fmt(fc['dps'])}엔</b></td><td>{fmt(fc.get('payout'))}%</td><td></td><td></td><td></td></tr>"
+                trs += f"<tr class=cur><td>{fc['lab']} 회사 예상</td><td><b>{E.oku(fc['dtot'])}</b></td><td>{fmt(fc.get('payout'))}%</td><td></td><td></td><td></td></tr>"
             hist_html = (summ + (ret_hist_chart(plt, hist, fc, progressive) if plt else "") +
-                         "<div class=scroll><table><tr><th>회계연도</th><th>주당배당</th><th>배당성향</th><th>배당금 지급</th><th>자사주 매입</th><th>순이익</th></tr>"
-                         + trs + "</table></div><p class=muted>출처: EDINET 유가증권보고서(주요 경영지표 추이·현금흐름표), 이번 회계연도 예상은 결산단신. 배당금·자사주는 그해 실제 지급액(현금 기준). "
-                         "주당배당은 발행주식수 변화로 주식분할을 찾아 지금 기준으로 조정(조정한 해는 당시 숫자 병기)."
+                         "<div class=scroll><table><tr><th>회계연도</th><th>배당금 총액</th><th>배당성향</th><th>배당금 지급(현금)</th><th>자사주 매입</th><th>순이익</th></tr>"
+                         + trs + "</table></div><p class=muted>출처: EDINET 유가증권보고서(주요 경영지표 추이·현금흐름표), 이번 회계연도 예상은 결산단신. 금액 억 엔. "
+                         "배당금 총액 = 그 회계연도 배당성향 × 지배주주 순이익(그 해 몫의 배당, 주식분할과 무관). 배당금 지급(현금)은 그해 실제로 나간 돈이라 전기 기말배당이 섞여 한 해씩 늦게 반영됨. "
+                         "이번 회계연도 예상 = 예상 주당배당 × (발행주식수 − 자기주식)."
                          + (f" {esc(note)}" if note else "") + "</p>")
         elif note:
             hist_html = f"<p class=muted>10년 추이: {esc(note)}</p>"
@@ -615,7 +621,7 @@ def ret_section(card, kb, att, plt=None, policy=None, div_html=""):
     if div_html:
         div_html = "<h3>회사 IR 자료의 배당 자료</h3>" + div_html
     if not rows and not hist_html and not pol_html and not div_html: return ""
-    return ("<h2>주주환원</h2>" + pol_html + "<h3>주당 배당금·배당성향 추이</h3>" + (hist_html or "<p class=muted>10년 추이 자료 없음</p>") + div_html
+    return ("<h2>주주환원</h2>" + pol_html + "<h3>배당금 총액·배당성향 추이</h3>" + (hist_html or "<p class=muted>10년 추이 자료 없음</p>") + div_html
             + "<h3>이번 회계연도</h3><p class=muted>배당성향 = 주당배당 ÷ 주당순이익(가부탄 연간 실적·예상, 분할 반영) · "
             "올해 누적은 결산단신 현금흐름표의 실제 지급액 · 자사주 매입 금액은 결정 공시의 취득 총액 상한(실제 매입액과 다를 수 있음)</p>"
             + ("<div class=scroll><table><tr><th>항목</th><th>값</th><th>계산</th></tr>" + "".join(rows) + "</table></div>" if rows else ""))
