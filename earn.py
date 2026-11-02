@@ -372,7 +372,7 @@ QRULE = """- 기간 기준: 이번 3개월 분기(예: 2Q(7~9월))가 기본이�
   자료에 누적(반기·1~3Q 누적)만 있으면, 같은 자료에 직전 분기 누적도 있을 때만 '이번 누적 − 직전 분기 누적'으로 분기 숫자를 계산해 쓰고,
   그럴 수 없으면 누적 숫자를 쓰되 반드시 '(누적 n~m월)'이라고 붙인다. 누적 숫자를 분기 숫자처럼 쓰지 말 것.
 """
-REP_VER = 11   # 리포트 내용·구성을 바꾸면 올림 → 예전에 만든 리포트를 다시 보내지 않고 새로 만듦
+REP_VER = 10   # 리포트 내용·구성을 바꾸면 올림 → 예전에 만든 리포트를 다시 보내지 않고 새로 만듦
 QBASIS_VER = 1   # 올리면 예전 기준으로 만든 리포트·IR 요약 저장분을 버리고 새로 만듦
 
 def read_tanshin(row):
@@ -1980,7 +1980,7 @@ HELP_TXT = ("일본 실적 스크리닝 봇 사용법\n"
             "스크리닝 기준을 통과한 종목은 지금처럼 채널에 올라갑니다.")
 
 
-GUIDE_VER = 10  # 공지 문구를 바꾸면 올림 → 고정 공지를 새 내용으로 수정
+GUIDE_VER = 11  # 공지 문구를 바꾸면 올림 → 고정 공지를 새 내용으로 수정
 def guide_text(me):
     R = RULES
     sec = ", ".join(sorted(dict.fromkeys(SECTOR_KO.get(x, x) for x in EXCL_SECTORS)))
@@ -1992,7 +1992,8 @@ def guide_text(me):
             f"✅ 매출 고성장: 매출 +{R['R5_rev_only_yoy']:.0f}% 이상이고 영업이익이 전년보다 개선(적자 폭 축소도 인정)\n"
             f"✅ 성장 가속: 매출·영업이익 모두 플러스이고, 둘 중 하나의 증가율이 직전 분기보다 {R['R3_accel_pp']:.0f}%p 이상 높아짐\n"
             f"✅ 턴어라운드: 영업적자에서 흑자 전환, 또는 2개 분기 연속 감익 뒤 영업이익 +{R['R4_turn_yoy']:.0f}% 이상\n\n"
-            f"⚡ 실적 속보: 결산 발표 전 회사가 상반기·연간 예상 영업이익을 +{FLASH_MIN:.0f}% 이상 올리면 따로 알림(차트 없음)\n\n"
+            f"⚡ 실적 속보: 결산 발표 전 회사가 상반기·연간 예상 영업이익을 +{FLASH_MIN:.0f}% 이상 올리면 따로 알림(차트 없음). 앞서 카드가 나간 종목은 -{FLASH_MIN:.0f}% 이상 하향·적자 전환도 🔻로 알림\n"
+            "🏆 토요일 탑 5 게시 뒤 지난 탑 5(최근 8주)의 TOPIX 대비 성과를 답글로\n\n"
             "다만 아래 경우는 제외합니다.\n"
             "❌ 매출·영업이익 증가율이 둘 다 직전 분기보다 낮아짐\n"
             "❌ 매출이 2개 분기 연속 전년보다 감소\n"
@@ -2272,29 +2273,44 @@ FLASH_PROMPT = """아래는 일본 상장사 {name}({code})의 업적 예상 수
 {body}
 """
 
+def down_targets(st, code):
+    """하향 속보를 받을 곳: 최근 200일 안에 채널 카드가 나간 종목이면 채널, 관심 종목으로 등록한 사용자는 개인 대화"""
+    carded = any(p.get("code") == code for p in st.get("perf_log", []))
+    users = [uid for uid, codes in (st.get("subs") or {}).items() if code in codes]
+    return carded, users
+
 def flash_card(st, row, rows):
-    """결산 전 업적 예상 상향(영업이익 +20% 이상) → 채널에 텍스트 속보 카드. 올리면 True"""
+    """결산 전 업적 예상 수정 → 텍스트 속보 카드. 상향(영업이익 +20% 이상)은 채널,
+    하향(-20% 이상·적자 전환)은 앞서 채널 카드가 나간 종목이면 채널 + 관심 종목 등록자 개인 대화. 보내면 True"""
     code = row["code"]
     if any(x["code"] == code and is_tanshin(x) for x in rows): return False   # 같은 날 결산단신이 있으면 결산 카드가 다룸
+    carded, users = down_targets(st, code)
     kind, facts, ctx = X.open_zip(http(row["xbrl"], timeout=40))
     rv = revision_periods(facts, ctx)
-    hits = []
+    hits, downs = [], []
     for per, x in rv.items():
         a, b = x["op"]
         if a is not None and b is not None and b > 0 and (a <= 0 or (b / a - 1) * 100 >= FLASH_MIN): hits.append(per)
-    if not hits: return False
+        elif a is not None and b is not None and a > 0 and (b <= 0 or (b / a - 1) * 100 <= -FLASH_MIN): downs.append(per)
+    up = bool(hits)
+    if not up:
+        if not downs or not (carded or users): return False
+        hits = downs
     kb = kb_finance(code)
-    if kb["sector"] in EXCL_SECTORS: log("속보 제외 업종", code); return False
+    if up and kb["sector"] in EXCL_SECTORS: log("속보 제외 업종", code); return False
     cap, profile = kb_profile(code)
-    if cap is None or cap < RULES["X5_min_cap_oku"]: log("속보 시총 미달·확인 불가", code, cap); return False
+    if up and (cap is None or cap < RULES["X5_min_cap_oku"]): log("속보 시총 미달·확인 불가", code, cap); return False
     name = name_of(code, row["name"], None)
-    L = [f"⚡ <b>실적 속보 · 예상 상향</b> — <b>{esc(name)} ({code})</b> · {int(row['d'][4:6])}/{int(row['d'][6:])} {row.get('t') or ''}".rstrip(),
+    head = "⚡ <b>실적 속보 · 예상 상향</b>" if up else "🔻 <b>실적 속보 · 예상 하향</b>"
+    L = [f"{head} — <b>{esc(name)} ({code})</b> · {int(row['d'][4:6])}/{int(row['d'][6:])} {row.get('t') or ''}".rstrip(),
          (f"시총 {cap:,.0f}억 엔" if cap else "시총 —") + f" · {esc(SECTOR_KO.get(kb['sector'], kb['sector']))}", ""]
-    def pct(a, b): return f"{(b / a - 1) * 100:+.0f}%" if a and a > 0 and b is not None else ("흑자전환" if a is not None and a <= 0 < (b or 0) else "—")
+    def pct(a, b):
+        if a and a > 0 and b is not None: return f"{(b / a - 1) * 100:+.0f}%" if b > 0 else "적자 전환"
+        return "흑자전환" if a is not None and a <= 0 < (b or 0) else "—"
     for per in [p for p in PER_KO if p in rv]:
         x = rv[per]; yend = (rv.get("CurrentYearDuration") or {}).get("end")   # 회계연도 표기는 연간 기간 끝 기준(상반기 끝으로 하면 FY9/26처럼 틀림)
         lab = (f"{fy_label_end(yend)} " if yend else "") + PER_KO[per]
-        L.append(f"▶️ <b>{lab} 예상</b>" + (" ✅" if per in hits else ""))
+        L.append(f"▶️ <b>{lab} 예상</b>" + ((" ✅" if up else " ⚠️") if per in hits else ""))
         for m, ml in (("rev", "매출"), ("op", "영업이익"), ("ni", "순이익")):
             a, b = x[m]
             if b is None: continue
@@ -2318,12 +2334,23 @@ def flash_card(st, row, rows):
         if why: L += [f"📝 <b>수정 이유</b> {esc(why)}", ""]
     except Exception as e:
         log("flash reason error", code, e)
+    if not up:
+        why_here = ["앞서 이 채널에 실적 카드가 나간 종목"] if carded else []
+        why_here += ["관심 종목"] if users else []
+        L.append(f"<i>{' · '.join(why_here)}이라 하향 수정도 알려 드립니다.</i>")
     L.append(f"<a href=\"{row['pdf']}\">공시 원문</a> · <i>결산 발표 전 회사 예상 수정입니다. 확정 실적은 결산단신에서 확인하세요.</i>")
     if DRY:
         print("-" * 60 + "\n" + re.sub(r"<[^>]+>", "", "\n".join(L))); return True
-    r = tg("sendMessage", {"chat_id": CHANNEL, "text": "\n".join(L), "parse_mode": "HTML", "disable_web_page_preview": True})
-    log("실적 속보", code, name, [PER_KO[p] for p in hits], "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:80]}")
-    return bool(r.get("ok"))
+    dests = [CHANNEL] if up or carded else []
+    dests += [] if up else [int(u) if str(u).lstrip("-").isdigit() else u for u in users]
+    ok = False
+    for d_ in dests:
+        r = tg("sendMessage", {"chat_id": d_, "text": "\n".join(L), "parse_mode": "HTML", "disable_web_page_preview": True})
+        ok = ok or bool(r.get("ok"))
+        log("실적 속보" + ("" if up else "(하향)"), code, name, [PER_KO[p] for p in hits], "채널" if d_ == CHANNEL else "개인",
+            "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:80]}")
+        time.sleep(0.3)
+    return ok
 
 def process_flash(st, day, rows):
     seen = st.setdefault("seen", {})
@@ -2657,6 +2684,8 @@ def weekly_top5(st):
         log("top5: AI 결과 부족", ai_fail_reason()); return
     st["top5_done"] = wk
     sel = [byc[str(t["code"])] for t in top]
+    try: track = top5_track(st)   # 지난 탑 5가 그 뒤 어떻게 됐나(이번 주 게시 바로 뒤에 따로)
+    except Exception as e: log("top5 track error", e); track = None
     try: buzz = top5_buzz(sel)
     except Exception as e: log("top5 buzz error", e); buzz = {}
     try:
@@ -2679,6 +2708,44 @@ def weekly_top5(st):
     if len(txt) > 4000: txt = txt[:3990] + "…"
     r = tg("sendMessage", {"chat_id": CHANNEL, "text": txt, "parse_mode": "HTML", "disable_web_page_preview": True})
     log("top5 posted", [t["code"] for t in top], "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:80]}")
+    if r.get("ok"):
+        st.setdefault("top5_log", []).append({"wk": wk, "d": n.strftime("%Y-%m-%d"),
+                                             "picks": [{"code": c["code"], "name": c.get("name_ko") or c["name"]} for c in sel]})
+        st["top5_log"] = st["top5_log"][-26:]
+        if track:
+            tg("sendMessage", {"chat_id": CHANNEL, "text": track, "parse_mode": "HTML", "disable_web_page_preview": True,
+                               "reply_to_message_id": r["result"]["message_id"]})
+
+def top5_track(st):
+    """지난 탑 5(최근 8주) 성과: 게시 시점(게시일 이전 마지막 종가) → 최근 종가 수익률과 TOPIX 대비 초과수익"""
+    logs = (st.get("top5_log") or [])[-8:]
+    if not logs: return None
+    tp = {b["d"]: b["c"] for b in naver_daily(".TOPX", days=90, index=True)}
+    tds = sorted(tp)
+    if not tds: return None
+    def base_of(bars, d): return next((b for b in reversed(bars) if b["d"] < d or b["d"] == d), None)
+    L, allx = ["📊 <b>지난 탑 5 성과</b> (게시 전 마지막 종가 → " + f"{tds[-1][5:].replace('-', '/')} 종가, TOPIX 대비)", ""], []
+    for g in reversed(logs):
+        xs = []
+        for p in g["picks"]:
+            try: bars = naver_daily(f"{p['code']}.T", days=90)
+            except Exception: continue
+            b0 = base_of(bars, g["d"]); t0 = base_of([{"d": d} for d in tds], g["d"])
+            if not b0 or not bars or not t0 or bars[-1]["d"] <= b0["d"]: continue
+            ret = (bars[-1]["c"] / b0["c"] - 1) * 100
+            mk = (tp[tds[-1]] / tp[t0["d"]] - 1) * 100
+            xs.append((ret - mk, ret, p)); time.sleep(0.2)
+        if not xs: continue
+        allx += [x[0] for x in xs]
+        avg = sum(x[0] for x in xs) / len(xs)
+        xs.sort(key=lambda x: -x[0])
+        f = lambda x: f"{esc(x[2]['name'])} {x[0]:+.1f}%p"
+        L.append(f"<b>{g['d'][5:].replace('-', '/')} 픽</b> 평균 {avg:+.1f}%p · 이긴 종목 {sum(1 for x in xs if x[0] > 0)}/{len(xs)}")
+        L.append("  " + ", ".join(f(x) for x in xs))
+    if not allx: return None
+    L += ["", f"전체 {len(allx)}건 평균 {sum(allx) / len(allx):+.1f}%p · 이긴 비율 {sum(1 for x in allx if x > 0) / len(allx) * 100:.0f}%",
+          "<i>배당·수수료 미반영 단순 주가 기준. 표본이 적어 참고용입니다.</i>"]
+    return "\n".join(L)
 
 TOP5_DOW, TOP5_HOUR = 5, 10   # 토요일 10시(일본·한국 시각)
 
