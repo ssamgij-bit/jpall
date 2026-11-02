@@ -9,7 +9,7 @@ import re
 
 KEYS = [("매출", r"매출(?:액|수익)?"), ("영업이익", r"영업\s?이익"), ("경상이익", r"경상\s?이익"), ("순이익", r"(?:지배주주\s?)?(?:당기\s?)?순이익")]
 NUM = r"(-?[\d,]+(?:\.\d+)?)\s*억\s*엔"
-SKIP_Q = re.compile(r"예상|계획|가이던스|목표|전년|전기|작년|누적|연간|통기|상반기|반기|컨센서스|중기|FY\d")
+SKIP_Q = re.compile(r"예상|계획|가이던스|목표|전년|전기|작년|누적|연간|통기|상반기|반기|컨센서스|중기|FY\d{1,2}/\d{2}(?!\d)(?!\s*\d\s*Q)")   # 'FY3/27 2Q'처럼 분기가 붙은 표기는 이번 분기라 건너뛰지 않음
 SKIP_Y = re.compile(r"예상|계획|가이던스|목표|전년|전기|작년|분기|상반기|반기|컨센서스|중기")
 
 
@@ -18,7 +18,10 @@ def _f(x):
     except Exception: return None
 
 
-SEG_WORD = re.compile(r"부문|사업부|세그먼트|사업\s?(?:의\s?)?$")
+SEG_WORD = re.compile(r"부문|사업부|세그먼트|사업\s?(?:의|에서|은|는|이|도|역시)?\s?$")
+SEG_SENT = re.compile(r"[가-힣A-Za-z·]+\s?(?:사업|부문|세그먼트)\s?(?:에서|은|는|이|도|역시|의)")   # 문장 안에서 특정 사업을 주어로 말하는지
+TOTAL_WORD = re.compile(r"연결|전사|회사 전체|전체")
+SENT_END = re.compile(r"[.。](?!\d)|\n")   # 숫자 사이 소수점(41.4)은 문장 끝이 아님
 
 
 def check(text, facts, mode="q", fy=None, others=(), names=()):
@@ -32,10 +35,13 @@ def check(text, facts, mode="q", fy=None, others=(), names=()):
         for m in re.finditer(kx + r"[^0-9。\n]{0,14}?" + NUM, text):
             v = _f(m.group(1))
             if v is None: continue
-            pre = text[max(0, m.start() - 18):m.start()] + text[m.start():m.start(1)]
+            pre = re.split(r"[,，;)）]|[.。](?!\d)", text[max(0, m.start() - 18):m.start()])[-1] + text[m.start():m.start(1)]   # 같은 구절 안만(앞 괄호 속 '전년 동기' 등은 제외)
             if mode == "q" and SKIP_Q.search(pre): continue
-            near = re.split(r"[.。,，;]", text[max(0, m.start() - 25):m.start()])[-1]   # 같은 구절 안만
+            near = re.split(r"[,，;]|[.。](?!\d)", text[max(0, m.start() - 25):m.start()])[-1]   # 같은 구절 안만
             if SEG_WORD.search(near) or any(n_ and n_ in near for n_ in names): continue   # 세그먼트(부문) 숫자
+            s0 = max([x.end() for x in SENT_END.finditer(text, 0, m.start())] or [0])
+            sent = text[s0:m.start()]   # 같은 문장에서 숫자 앞부분
+            if (SEG_SENT.search(sent) or any(n_ and n_ in sent for n_ in names)) and not TOTAL_WORD.search(sent): continue   # 사업부 이야기 중인 숫자
             if any(o_ is not None and abs(v - o_) <= max(0.5, abs(o_) * 0.01) for o_ in others): continue
             if mode == "y":
                 if SKIP_Y.search(pre): continue
@@ -48,7 +54,7 @@ def check(text, facts, mode="q", fy=None, others=(), names=()):
     # 문장 끝(마침표·줄 끝)에 표시
     marks = {}
     for end, msg in bad:
-        j = min([x for x in (text.find(".", end), text.find("。", end), text.find("\n", end)) if x >= 0] or [len(text)])
+        m2 = SENT_END.search(text, end); j = m2.start() if m2 else len(text)
         marks.setdefault(j, []).append(msg)
     for j in sorted(marks, reverse=True):
         text = text[:j + 1 if j < len(text) else j] + f" ⚠️ 원자료와 다름({'; '.join(marks[j])})" + text[j + 1 if j < len(text) else j:]
