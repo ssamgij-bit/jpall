@@ -1028,6 +1028,14 @@ def build(card):
         except Exception as e: E.log("div insight error", e)
     try: ret_html = ret_section(card, kb, att, plt, deep.get("policy"), div_html)
     except Exception as e: E.log("ret section error", e); ret_html = ""
+    # 맨 앞 '기업 개요'(연혁·사업 변천·지금의 사업 구성) + '주주 구성'(소유자별 분포·대주주 상위 10) — EDINET 유가증권보고서
+    prof_html = ""
+    try:
+        import earn_profile as EP
+        pf = EP.get(card, name)
+        prof_html = EP.html(pf, esc, fallback_overview=ai.get("overview") or (card.get("ai") or {}).get("bm") or "", fallback_holders=holders, trm=trm)
+        card["_prof"] = f"{len(pf.get('overview') or [])}문단·주주구성 {len(pf.get('owners') or [])}·대주주 {len(pf.get('holders') or [])}" if pf else "EDINET 없음(대체)"
+    except Exception as e: E.log("profile error", e)
     try: bizdeep_html = biz_section(plt, card, name, code, deep.get("biz"), deep.get("_biz_cached"))
     except Exception as e: E.log("biz section error", e); bizdeep_html = ""
     # 6) IR 자료에서 고른 핵심 데이터
@@ -1202,6 +1210,8 @@ def build(card):
                    "<tr><th>분기</th><th>발표일</th><th>매출</th><th>YoY</th><th>영업이익</th><th>YoY</th><th>영업이익률</th><th>순이익</th><th>YoY</th></tr>" + "".join(qrows) + "</table></div>"
                    + pl_html + "<h3>연간 실적</h3><div class=scroll><table><tr><th>회계연도</th><th>매출</th><th>영업이익</th><th>영업이익률</th><th>순이익</th><th>EPS</th><th>배당</th></tr>"
                    + "".join(yrows) + "</table></div>" + "".join(f'<figure><img src="{c}"></figure>' for c in charts))
+    try: EP_CSS = __import__("earn_profile").CSS
+    except Exception: EP_CSS = ""
     doc = f"""<!doctype html><html lang=ko><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>{esc(name)}({code}) 실적 리포트</title><style>
 body{{font-family:-apple-system,'Apple SD Gothic Neo','Noto Sans KR','Malgun Gothic',sans-serif;margin:0;background:#f6f7f9;color:#1f2328;line-height:1.55}}
@@ -1231,10 +1241,11 @@ details.sec{{padding:0 12px 8px}} details.sec>summary{{list-style:none;padding:1
 .vbar{{border-radius:8px;padding:7px 6px;text-align:center;font-size:12.5px;font-weight:600;line-height:1.25}} .vbar.mn{{background:#fbe4de;border:2px solid #b33a2e}} .vbar.sub{{background:#e8eef5;border:1px solid #9aa4b2;font-weight:500}}
 .vbar.me{{box-shadow:0 0 0 2px #fde68a}} .vsep{{grid-column:1/-1;border-top:1px dashed #c3c9d2;height:0}} .vrowend{{display:none}}
 @media (max-width:600px){{.vchain{{flex-direction:column}} .vc{{flex:1 1 auto}} .varr{{transform:rotate(90deg);align-self:center}}}} .tag{{font-size:11px;background:#fde68a;color:#78350f;border-radius:4px;padding:0 4px;margin-left:4px}}
+{EP_CSS}
 </style></head><body><main>
 <h1>{esc(name)} <small>({code} JP · {esc(E.SECTOR_KO.get(card['sector'], card['sector']))})</small></h1>
 <p class=muted>{lab}({months}) 실적 · 발표 {card['d'][:4]}-{card['d'][4:6]}-{card['d'][6:]} {card['t']} JST · {' · '.join(card.get('hit') or []) or '요청 분석'}</p>
-{f"<div class=card>{esc(ai.get('overview') or cardai.get('bm'))}</div>" if (ai.get('overview') or cardai.get('bm')) else ''}
+{prof_html or (f"<div class=card>{esc(ai.get('overview') or cardai.get('bm'))}</div>" if (ai.get('overview') or cardai.get('bm')) else '')}
 <div class=kpi>{''.join(f'<div><span>{k}</span><b>{v}</b></div>' for k, v in kpi)}</div>
 {glance_html}
 {f"<div class=head><b>{esc(headline)}</b><p>{esc(ai.get('narrative'))}</p></div>" if headline else ''}
@@ -1249,7 +1260,7 @@ details.sec{{padding:0 12px 8px}} details.sec>summary{{list-style:none;padding:1
 {fold(op_html)}
 {fold(tables_html)}
 {fold(tail, True)}
-{holder_html}
+{'' if prof_html else holder_html}
 <h2>원문</h2><p>{' · '.join(links)}</p>
 <p class=muted>출처: TDnet(결산단신 XBRL·PDF, 설명 자료), 회사 IR 홈페이지, 로그미 파이낸스, 가부탄(실적·시가총액·대주주), 네이버 증권(주가). 금액 억 엔(원자료 백만 엔 환산).
 결론·요약·번역과 설명 자료에서 뽑은 숫자는 Gemini가 원문만 읽고 작성 — 숫자는 원문 쪽 이미지·링크로 확인하세요. 작성 {E.now():%Y-%m-%d %H:%M} JST</p>
@@ -1263,6 +1274,6 @@ details.sec{{padding:0 12px 8px}} details.sec>summary{{list-style:none;padding:1
             "설명자료": "O" if mat_pdf else "X", "이전IR": len(refs), "분기3개월": "X" if card["_stats"]["qfail"] else "O",
             "캐파": "O" if capa_hit else "X", "사업분석": ("저장분" if deep.get("_biz_cached") else "O") if bz else "X",
             "밸류체인지도": f"{len(vm.get('players') or [])}개사", "환원목표": len(deep.get("policy") or []),
-            "EDINET": f"{card.pop('_edinet_n', 0)}개년", "배당자료": len(div_ins), "컨센서스": "O" if card.pop("_cons", 0) else "X"}
+            "EDINET": f"{card.pop('_edinet_n', 0)}개년", "기업개요": card.pop("_prof", "X"), "배당자료": len(div_ins), "컨센서스": "O" if card.pop("_cons", 0) else "X"}
     except Exception as e: E.log("rep sec stats error", e)
     return f"{code}_{card['d']}_report.html", doc.encode("utf-8")
