@@ -53,10 +53,10 @@ def cons_quarter(card, q, esc):
     tone = ""
     try:
         ds = [float(x.split()[-1].rstrip("%")) for x in short]
-        tone = " — 시장 기대 상회" if min(ds) > 3 else " — 시장 기대 하회" if max(ds) < -3 else " — 시장 기대 부합" if all(abs(x) <= 3 for x in ds) else " — 항목별로 엇갈림"
+        tone = " — 시장 기대 상회" if min(ds) > 5 else " — 시장 기대 하회" if max(ds) < -5 else " — 시장 기대 부합" if all(abs(x) <= 5 for x in ds) else " — 항목별로 엇갈림"
     except Exception: pass
     html_ = (f"<div class=card><b>분기 컨센서스 대비{tone}</b><div class=scroll><table><tr><th>항목</th><th>실제</th><th>컨센서스</th><th>차이</th><th>기준</th></tr>"
-             + "".join(rows) + "</table></div><p class=muted>컨센서스: Yahoo Finance 애널리스트 평균. 매출은 발표 전에 받아 둔 이번 분기 예상, EPS는 Yahoo 분기 실적 기록의 예상·실제. ±3% 안이면 부합으로 봄. 영업이익 컨센서스는 무료 출처가 없어 빠짐</p></div>")
+             + "".join(rows) + "</table></div><p class=muted>컨센서스: Yahoo Finance 애널리스트 평균. 매출은 발표 전에 받아 둔 이번 분기 예상, EPS는 Yahoo 분기 실적 기록의 예상·실제. ±5% 안이면 부합으로 봄. 영업이익 컨센서스는 무료 출처가 없어 빠짐</p></div>")
     return html_, " · ".join(short)
 
 

@@ -428,7 +428,7 @@ def guide_section(plt, card, kb):
             parts.append(f"EPS: 회사 {feps:,.1f}엔 vs 컨센서스 {cy['eps']:,.1f}엔 → <b>{d2:+.1f}%</b>" + (f"({cy['eps_n']}명)" if cy.get("eps_n") else ""))
         if parts:
             dd = [float(re.search(r"([+-][\d.]+)%", p_).group(1)) for p_ in parts]
-            tone = "회사 예상이 시장 기대보다 보수적" if max(dd) < -3 else "회사 예상이 시장 기대보다 높음" if min(dd) > 3 else "회사 예상이 시장 기대와 비슷"
+            tone = "회사 예상이 시장 기대보다 보수적" if max(dd) < -5 else "회사 예상이 시장 기대보다 높음" if min(dd) > 5 else "회사 예상이 시장 기대와 비슷"
             card["_cons"] = 1
             cons_html = (f"<div class=card><b>회사 예상 vs 시장 컨센서스</b> — {tone}<br>" + "<br>".join(parts)
                          + "<br><small class=muted>컨센서스: Yahoo Finance 애널리스트 평균(이번 회계연도). 발표 전에 받아 둔 값이 있으면 그것(=발표 전 시장 기대), 없으면 리포트 작성 시점 값</small></div>")
