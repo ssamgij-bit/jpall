@@ -30,13 +30,13 @@ MUA = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) App
 
 # ───────────────────────── 스크리닝 규칙(사용자와 합의, 2026-10-27) ─────────────────────────
 RULES = {
-    "R1_rev_yoy": 10.0,       # R1 매출 성장: 분기 매출 YoY ≥ 10%
-    "R2_op_yoy": 10.0,        # R2 이익 성장: 분기 영업이익 YoY ≥ 10% 그리고 흑자
+    "R1_rev_yoy": 15.0,       # R1 매출 성장: 분기 매출 YoY ≥ 15%(2026-11-02 10→15)
+    "R2_op_yoy": 15.0,        # R2 이익 성장: 분기 영업이익 YoY ≥ 15% 그리고 흑자(2026-11-02 10→15)
     "R3_accel_pp": 5.0,       # R3 성장 가속: 매출 또는 영업이익 YoY가 직전 분기보다 +5%p 이상(둘 다 플러스)
     "R4_turn_yoy": 20.0,      # R4 턴어라운드: 전년 동기 영업적자→흑자, 또는 2개 분기 연속 감익 뒤 영업이익 YoY ≥ 20%
     "R5_rev_only_yoy": 20.0,  # R5 매출 고성장: 분기 매출 YoY ≥ 20% 그리고 영업이익이 전년 동기보다 개선(적자여도 적자 폭이 줄면 인정)
     "X5_min_cap_oku": 300.0,  # X5 시가총액 300억 엔 미만 제외
-    "X7_min_rev_yoy": 5.0,    # X7 분기 매출 YoY 5% 미만 제외(사업부 매각·연결 제외 등 일회성 요인 때문이면 예외, 2026-11-01)
+    "X7_min_rev_yoy": 10.0,   # X7 분기 매출 YoY 10% 미만 제외(사업부 매각·연결 제외 등 일회성 요인 때문이면 예외, 2026-11-01 도입·2026-11-02 5→10)
 }
 # X4 제외 업종(도쿄증권거래소 33업종)
 EXCL_SECTORS = {"建設業", "不動産業", "電気・ガス業", "海運業", "石油・石炭製品", "鉱業", "銀行業", "証券、商品先物取引業", "証券・商品先物取引業", "保険業", "その他金融業", "医薬品", "鉄鋼", "パルプ・紙"}
@@ -2057,7 +2057,7 @@ HELP_TXT = ("일본 실적 스크리닝 봇 사용법\n"
             "스크리닝 기준을 통과한 종목은 지금처럼 채널에 올라갑니다.")
 
 
-GUIDE_VER = 11  # 공지 문구를 바꾸면 올림 → 고정 공지를 새 내용으로 수정
+GUIDE_VER = 12  # 공지 문구를 바꾸면 올림 → 고정 공지를 새 내용으로 수정
 def guide_text(me):
     R = RULES
     sec = ", ".join(sorted(dict.fromkeys(SECTOR_KO.get(x, x) for x in EXCL_SECTORS)))
@@ -2924,6 +2924,26 @@ def main():
                 log("제외 업종 카드 삭제", c["code"], "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:80]}")
         st["perf_log"] = [p for p in st.get("perf_log", []) if (p.get("code"), p.get("d")) not in bad]
         st["fix_excl_1031"] = True; save(st)
+    if not st.get("fix_rule_1102") and not DRY:  # 한 번(2026-11-02 요청): 바뀐 기준(매출·영업이익 +15%, 매출 증가율 10% 미만 제외)으로 채널 카드를 다시 판별 → 못 미치는 카드 삭제 + 성과 집계 제외
+        gone = []
+        for cid, c in list(st.get("cards", {}).items()):
+            if c.get("deleted") or not c.get("msg") or cid.startswith("q") or str(c.get("chat") or CHANNEL) != str(CHANNEL): continue   # 요청 분석 카드(q…)·개인 대화 카드는 그대로
+            s = c.get("series") or []
+            if len(s) < 2: continue
+            ok_, hit_, why_ = judge(s, len(s) - 1)
+            x7_, why7_ = low_rev_check({"series": s, "qual": c.get("qual") or ""}, c.get("ai") if isinstance(c.get("ai"), dict) else None)
+            if ok_ and not x7_: continue
+            why_ = why_ or (why7_ if x7_ else "새 기준 R1~R5 미충족")
+            r = tg("deleteMessage", {"chat_id": CHANNEL, "message_id": c["msg"]})
+            if not r.get("ok"):   # 삭제가 안 되는 글(권한·기간 문제)은 캡션 맨 앞에 제외 표시
+                cap = f"🚫 <b>스크리닝 기준 변경으로 제외</b>({esc(why_)})\n\n" + (c.get("caption") or "")
+                tg("editMessageCaption", {"chat_id": CHANNEL, "message_id": c["msg"], "caption": shrink(cap) if len(cap) > 1024 else cap, "parse_mode": "HTML"})
+            c["deleted"] = True; c["rx"] = c.get("rx") or "deleted"; gone.append(cid)
+            log("기준 변경 카드 삭제", c.get("code"), why_, "성공" if r.get("ok") else f"삭제 실패 → 제외 표시 {LAST_ERR['d'][:60]}")
+            time.sleep(0.6)
+        st["perf_log"] = [p for p in st.get("perf_log", []) if p.get("cid") not in gone]
+        st["fix_rule_1102"] = True; save(st)
+        log("기준 변경 정리 끝", f"{len(gone)}건")
     if not st.get("fix_rule_1031") and not DRY:  # 한 번: 바뀐 규칙(매출 고성장 +20%·영업이익 개선, 일회성 제외, 같은 분기 중복)에 안 맞는 채널 카드 6건 삭제 + 성과 집계 제외
         bad = {"261009548847", "261030560625", "261030560502",   # 소지츠·메이와산업·Genki: 매출 고성장인데 영업이익 감소·미확인
                "261020553608", "261028557610",                   # JVC켄우드(관세 환급)·르네사스(사업 양도익): 일회성
