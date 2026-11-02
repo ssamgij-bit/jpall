@@ -649,6 +649,17 @@ def render(card, o, has_qa, names, links=None):
     try:
         lab, months = E.qlabel(card["series"][-1], fem); lab = f" ({lab}, {months})"
     except Exception: pass
+    try:   # AI가 쓴 핵심 실적 금액을 이번 분기 원자료와 대조(다르면 줄 끝에 표시)
+        import earn_check as CK
+        fq = CK.facts_quarter(card); bad_all = []
+        o = dict(o)
+        o["key"] = [CK.check(str(x), fq, "q")[0] for x in (o.get("key") or [])]
+        for x in o["key"]:
+            if "⚠️ 원자료와 다름" in x: bad_all.append(x[-80:])
+        if o.get("message"):
+            o["message"], _, b_ = CK.check(str(o["message"]), fq, "q"); bad_all += b_
+        if bad_all: E.log("IR 요약 숫자 불일치", card["code"], " | ".join(bad_all)[:300])
+    except Exception as e: E.log("IR number check error", e)
     q = o.get("quality")
     dot = "🟢" if isinstance(q, (int, float)) and q >= 7 else "🟡" if isinstance(q, (int, float)) and q >= 5 else "🔴"
     L = [f"📊 <b>{_e(name)} ({card['code']}) 실적 발표{lab}</b>", f"발표: {card['d'][:4]}-{card['d'][4:6]}-{card['d'][6:]} {card['t']} JST", ""]

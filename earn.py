@@ -65,7 +65,7 @@ def sector_norm(s):
 def now(): return dt.datetime.now(JST)
 def log(*a): print(now().strftime("%H:%M:%S"), *a, flush=True)
 # 상태 파일은 공개 저장소에 올라가므로 사용자 정보(텔레그램 계정 번호·관심 종목·요청 기록)는 암호화해서 저장
-PRIVATE_KEYS = ("owner", "subs", "watch_sent", "ask_q", "ask_recent", "jps_codes", "jps_map", "users", "blocked", "rep_q", "ir_q", "pending_start", "prefs", "alerts", "ai_wait")
+PRIVATE_KEYS = ("waitmsg", "owner", "subs", "watch_sent", "ask_q", "ask_recent", "jps_codes", "jps_map", "users", "blocked", "rep_q", "ir_q", "pending_start", "prefs", "alerts", "ai_wait")
 def _skey():
     import hashlib
     return hashlib.sha256(("earn-state-v1:" + (os.environ.get("STATE_KEY") or TOKEN or "")).encode()).digest()
@@ -372,7 +372,7 @@ QRULE = """- 기간 기준: 이번 3개월 분기(예: 2Q(7~9월))가 기본이�
   자료에 누적(반기·1~3Q 누적)만 있으면, 같은 자료에 직전 분기 누적도 있을 때만 '이번 누적 − 직전 분기 누적'으로 분기 숫자를 계산해 쓰고,
   그럴 수 없으면 누적 숫자를 쓰되 반드시 '(누적 n~m월)'이라고 붙인다. 누적 숫자를 분기 숫자처럼 쓰지 말 것.
 """
-REP_VER = 12   # 리포트 내용·구성을 바꾸면 올림 → 예전에 만든 리포트를 다시 보내지 않고 새로 만듦
+REP_VER = 13   # 리포트 내용·구성을 바꾸면 올림 → 예전에 만든 리포트를 다시 보내지 않고 새로 만듦
 QBASIS_VER = 1   # 올리면 예전 기준으로 만든 리포트·IR 요약 저장분을 버리고 새로 만듦
 
 def read_tanshin(row):
@@ -1136,12 +1136,69 @@ def bot_name(st):
         st["me"] = (tg("getMe").get("result") or {}).get("username", "")
     return st["me"]
 
-def enqueue_out(st, act, cid, dest, reply=None):
+def enqueue_out(st, act, cid, dest, reply=None, notify=True):
     key = "rep_q" if act == "rep" else "ir_q"
     q = st.setdefault(key, [])
     if not any(isinstance(x, dict) and x["cid"] == cid and str(x["chat"]) == str(dest) for x in q):
         q.append({"cid": cid, "chat": dest, "reply": reply})
     bump(st, "rep" if act == "rep" else "ir")
+    if notify:
+        try: wait_note(st, act, cid, dest)
+        except Exception: traceback.print_exc()
+
+# ── 처리 중 안내: 리포트·IR 요약을 누르면 바로 '만드는 중' 메시지 → 끝나면 지움, 10분·25분이 지나면 늦어지는 이유를 덧붙임
+def wait_note(st, act, cid, dest):
+    card = st.get("cards", {}).get(cid) or {}
+    if act == "rep" and card.get("rep_file") and card.get("rep_ver") == REP_VER: return   # 이미 만든 파일은 바로 감
+    if act == "ir" and card.get("ir_texts") and not card.get("qa_watch"): return
+    w = st.setdefault("waitmsg", {}); k = f"{act}:{cid}:{dest}"
+    if k in w: return
+    what = "리포트" if act == "rep" else "IR·Q&A 요약"
+    base = f"⏳ {card.get('name_ko') or card.get('name') or ''}({card.get('code', '')}) {what}를 만들고 있습니다(보통 3~5분). 끝나면 이 안내는 지워집니다."
+    r = tg("sendMessage", {"chat_id": dest, "text": base, "disable_notification": True})
+    mid = (r.get("result") or {}).get("message_id")
+    if mid: w[k] = {"mid": mid, "t": time.time(), "n": 0, "base": base}
+
+def wait_done(st, act, cid, dest):
+    v = (st.get("waitmsg") or {}).pop(f"{act}:{cid}:{dest}", None)
+    if v:
+        try: tg("deleteMessage", {"chat_id": dest, "message_id": v["mid"]})
+        except Exception: pass
+
+def wait_reason(act, cid, st):
+    from jpall import GEMINI_MODELS
+    if DRAIN["on"]: return "봇 코드를 새 버전으로 바꾸는 중이라 다음 실행에서 이어서 만듭니다(보통 1~3분 더)."
+    run = _running(act, cid)
+    if not run:
+        q = st.get("rep_q" if act == "rep" else "ir_q") or []
+        ahead = len([x for x in JOBS if x["kind"] in ("rep", "ir")])
+        return f"앞 순서 작업 {ahead}건이 끝나면 바로 시작합니다." if ahead else f"대기열에서 순서를 기다리고 있습니다(대기 {len(q)}건)."
+    try:
+        with _key2():
+            import jpall
+            ks = _heavy_keys() or [jpall.gem_key()]; old = jpall.AI_TL.key; out = 0
+            for k_ in ks:
+                jpall.AI_TL.key = k_
+                if ai_skip(GEMINI_MODELS[0]): out += 1
+            jpall.AI_TL.key = old
+        if out == len(ks): return "AI 상위 모델 한도가 차서 다른 키·모델로 다시 시도하고 있습니다."
+        import earn_report
+        if earn_report.SLOW.get(GEMINI_MODELS[0], 0) > time.time(): return "구글 AI 서버가 붐벼 응답을 기다리고 있습니다."
+    except Exception: pass
+    return "결산 설명 자료·유가증권보고서 등 자료를 읽는 데 시간이 걸리고 있습니다."
+
+def wait_check(st):
+    w = st.get("waitmsg") or {}
+    for k, v in list(w.items()):
+        age = time.time() - v["t"]
+        if age > 3 * 3600: w.pop(k, None); continue
+        stage = 2 if age > 1500 else 1 if age > 600 else 0
+        if stage <= v.get("n", 0): continue
+        act, cid, dest = k.split(":", 2)
+        why = wait_reason(act, cid, st)
+        txt = v["base"].replace("(보통 3~5분)", f"({int(age // 60)}분 지남)") + f"\n\n늦어지는 이유: {why}" + ("\n다시 누르지 않으셔도 끝나면 자동으로 보내드립니다." if stage == 2 else "")
+        tg("editMessageText", {"chat_id": dest, "message_id": v["mid"], "text": txt}); v["n"] = stage
+        log("처리 중 안내 갱신", act, cid, f"{int(age // 60)}분", why[:30])
 
 def _job(x, st):
     """대기열 항목(예전 형식은 카드 번호 문자열) → (카드 번호, 받는 곳, 답장할 메시지)"""
@@ -1321,6 +1378,7 @@ def ai_out_until(heavy=False):
     return 0
 
 def defer_ai(st, act, cid, dest, reply, until):
+    wait_done(st, act, cid, dest)   # 대신 '한도가 풀리면 보냄' 안내가 감
     w = st.setdefault("ai_wait", [])
     if any(x["act"] == act and x["cid"] == cid and str(x["chat"]) == str(dest) for x in w): return
     w.append({"act": act, "cid": cid, "chat": dest, "reply": reply, "ts": time.time()})
@@ -1669,6 +1727,8 @@ def do_reports(st):
         _collect(st)
         for lab, why in list(BAD_KEYS.items()):   # 거부된 Gemini 키(잘못 붙여넣음·만료·삭제) → 하루 한 번 알림
             alert_owner(st, f"Gemini {lab}가 구글에서 거부됐습니다({why[:80]}). GitHub 비밀값의 키를 확인해 주세요.", "badkey:" + lab, every=86400)
+        try: wait_check(st)
+        except Exception: traceback.print_exc()
         if DRAIN["on"]: return   # 새 코드로 넘기는 중: 대기열은 다음 실행(새 코드)이 처리
         _start_jobs(st)
         try:
@@ -1699,7 +1759,7 @@ def _start_jobs(st):
             _submit("ir", _ir_refresh, _copy.deepcopy(card), key2=True, cid=cid, waiters=[(dest, reply)]); log("IR Q&A 다시 확인", card["code"], dest)
             continue
         if card.get("ir_texts") and not _running("ir", cid):  # 이미 만든 요약은 바로
-            q.pop(0)
+            q.pop(0); wait_done(st, "ir", cid, dest)
             try:
                 send_texts(card, card["ir_texts"], dest, reply)
                 if card.get("qa_watch") and str(dest) not in [str(x) for x in card.setdefault("qa_to", [])]: card["qa_to"].append(dest)
@@ -1723,7 +1783,7 @@ def _start_jobs(st):
         if card.get("rep_file") and card.get("rep_ver") == REP_VER:  # 이미 만든 리포트(같은 리포트 버전)는 텔레그램 파일을 그대로 다시 보냄
             r = tg("sendDocument", {"chat_id": dest, "caption": cap, "document": card["rep_file"], **rp})
             log("리포트 재전송", card["code"], dest, "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:80]}")
-            if r.get("ok"): q.pop(0); continue
+            if r.get("ok"): q.pop(0); wait_done(st, "rep", cid, dest); continue
         same = _running("rep", cid)
         if same: q.pop(0); same[0]["waiters"].append((dest, reply)); continue
         with _key2(): out = ai_out_until(heavy=True)
@@ -1792,6 +1852,7 @@ class _DONE:
                 if not has_qa: card["qa_watch"] = time.time(); card.setdefault("qa_to", [])
                 else: card.pop("qa_watch", None); log("IR 요약에 Q&A 포함", card["code"])
         for dest, reply in j["waiters"]:
+            wait_done(st, "ir", j["cid"], dest)
             if not texts:
                 with _key2(): out = ai_out_until(heavy=True)
                 if out: defer_ai(st, "ir", j["cid"], dest, reply, out); continue
@@ -1807,6 +1868,7 @@ class _DONE:
         card = st.get("cards", {}).get(j["cid"])
         if not card: return
         for dest, reply in j["waiters"]:
+            wait_done(st, "rep", j["cid"], dest)
             rp = {"reply_to_message_id": reply, "allow_sending_without_reply": True} if reply else {}
             if ok != "ok":
                 tg("sendMessage", {"chat_id": dest, "text": f"리포트 생성 실패({card['code']}). 처리 중 오류가 났습니다(기록해 두었습니다). 잠시 뒤 다시 눌러 주세요.", **rp}); continue
@@ -2877,7 +2939,7 @@ def main():
         for cid, c in st.get("cards", {}).items():
             if c.get("code") == "7867":
                 for k in ("rep_file", "ir_texts", "pdf", "mat"): c.pop(k, None)
-                enqueue_out(st, "rep", cid, st["owner"]); enqueue_out(st, "ir", cid, st["owner"])
+                enqueue_out(st, "rep", cid, st["owner"], notify=False); enqueue_out(st, "ir", cid, st["owner"], notify=False)
                 log("타카라토미 리포트 다시 만들기", cid)
         save(st)
     if not st.get("fix_repost_2768") and not DRY:  # 한 번(사용자 요청): 기준 미통과(증가율 둔화)지만 소지츠 카드를 채널에 예외로 올림 — 요청 분석 카드라 성과 집계에서 빠짐

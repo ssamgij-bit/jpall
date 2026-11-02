@@ -49,7 +49,10 @@ def cons_quarter(card, q, esc):
     except Exception as e:
         E.log("cons q eps error", e)
     if not rows:
-        return ("<div class=card><b>분기 컨센서스 대비</b> <span class=muted>— 발표 전 이번 분기 애널리스트 예상(Yahoo)이 없습니다(커버리지가 없거나 적은 종목).</span></div>", "")
+        # 분기 예상이 없으면: 연간 매출 컨센서스 대비 누적 진척률을 작년 같은 시점 진척률과 비교(일본에서 흔히 보는 '진척률')
+        pg = progress(card)
+        if pg: return pg
+        return ("<div class=card><b>분기 컨센서스 대비</b> <span class=muted>— 이번 분기 애널리스트 예상(Yahoo)이 없고, 연간 컨센서스도 없어 진척률도 계산하지 못했습니다(커버리지가 없거나 적은 종목).</span></div>", "")
     tone = ""
     try:
         ds = [float(x.split()[-1].rstrip("%")) for x in short]
@@ -58,6 +61,40 @@ def cons_quarter(card, q, esc):
     html_ = (f"<div class=card><b>분기 컨센서스 대비{tone}</b><div class=scroll><table><tr><th>항목</th><th>실제</th><th>컨센서스</th><th>차이</th><th>기준</th></tr>"
              + "".join(rows) + "</table></div><p class=muted>컨센서스: Yahoo Finance 애널리스트 평균. 매출은 발표 전에 받아 둔 이번 분기 예상, EPS는 Yahoo 분기 실적 기록의 예상·실제. ±5% 안이면 부합으로 봄. 영업이익 컨센서스는 무료 출처가 없어 빠짐</p></div>")
     return html_, " · ".join(short)
+
+
+def progress(card):
+    """연간 매출 컨센서스(Yahoo 애널리스트 평균, 이번 회계연도) 대비 누적 매출 진척률 vs 작년 같은 시점 진척률(작년 누적 ÷ 작년 연간 실적) → (HTML, 한 줄) 또는 None"""
+    try:
+        r = card["r"]; s = card.get("series") or []
+        if (r.get("q") or 4) >= 4: return None   # 4분기는 연간 실적 자체가 나옴
+        fe = (r.get("fc_end") or "")[:7]
+        if not fe: return None
+        fs = E.ym_add(fe, -12)
+        by = {x["end"]: x for x in s}
+        cur = [x for x in s if fs < x["end"] <= fe]
+        if not cur or any(x.get("rev") is None for x in cur): return None
+        pyq = [by.get(E.ym_add(x["end"], -12)) for x in cur]
+        fy_py = E.fy_base(s, r, "rev")
+        import earn_report as R
+        cy = R.cons_fy(card["code"])
+        if not cy.get("rev"): return None
+        cum = sum(x["rev"] for x in cur); cons = cy["rev"] / 1e6
+        p_now = cum / cons * 100
+        p_py = (sum(x["rev"] for x in pyq) / fy_py * 100) if fy_py and all(x and x.get("rev") is not None for x in pyq) else None
+        diff = (p_now - p_py) if p_py is not None else None
+        tone = "" if diff is None else " — 작년보다 빠름" if diff > 5 else " — 작년보다 느림" if diff < -5 else " — 작년과 비슷"
+        n = len(cur)
+        html_ = (f"<div class=card><b>분기 컨센서스 대비</b> <span class=muted>— 이번 분기 애널리스트 예상(Yahoo)이 없어 연간 컨센서스 대비 진척률로 대신 봅니다</span>"
+                 f"<div class=scroll><table><tr><th>항목</th><th>누적 {n}개 분기</th><th>연간 컨센서스</th><th>진척률</th><th>작년 같은 시점</th></tr>"
+                 f"<tr><td>매출</td><td>{E.oku(cum)}</td><td>{E.oku(cons)}{f' ({cy.get('rev_n')}명)' if cy.get('rev_n') else ''}</td><td><b>{p_now:.1f}%</b></td>"
+                 f"<td>{f'{p_py:.1f}%' if p_py is not None else '—'}</td></tr></table></div>"
+                 f"<p class=muted>진척률 = 이번 회계연도 누적 매출 ÷ 연간 매출 컨센서스(Yahoo 애널리스트 평균). 작년 같은 시점 = 작년 같은 분기까지 누적 ÷ 작년 연간 실적. 차이가 ±5%p 안이면 '비슷'.{tone and ' 결과' + tone}</p></div>")
+        short = f"연간 매출 컨센서스 대비 진척률 {p_now:.0f}%" + (f"(작년 같은 시점 {p_py:.0f}%)" if p_py is not None else "")
+        return html_, short
+    except Exception as e:
+        E.log("progress error", e)
+        return None
 
 
 # ───────────────────────── 지난 리포트 대비 달라진 점 ─────────────────────────

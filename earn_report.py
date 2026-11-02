@@ -1033,6 +1033,17 @@ def build(card):
     try:
         import earn_profile as EP
         pf = EP.get(card, name)
+        try:   # 기업 개요 속 금액을 가부탄 연간 실적(같은 회계연도)과 대조 → 다르면 문장 뒤에 표시
+            import earn_check as CK
+            fy_, fyl_ = CK.facts_year(kb, pf.get("pe") or "")
+            if pf.get("overview") and fy_:
+                ov_, ok_, bad_ = [], 0, []
+                for x in pf["overview"]:
+                    x2, o2, b2 = CK.check(x, fy_, "y", fyl_); ov_.append(x2); ok_ += o2; bad_ += b2
+                pf = dict(pf, overview=ov_)
+                card["_chk_ov"] = (ok_, bad_)
+                if bad_: E.log("기업 개요 숫자 불일치", code, " | ".join(bad_))
+        except Exception as e: E.log("overview number check error", e)
         prof_html = EP.html(pf, esc, fallback_overview=ai.get("overview") or (card.get("ai") or {}).get("bm") or "", fallback_holders=holders, trm=trm)
         card["_prof"] = f"{len(pf.get('overview') or [])}문단·주주구성 {len(pf.get('owners') or [])}·대주주 {len(pf.get('holders') or [])}" if pf else "EDINET 없음(대체)"
     except Exception as e: E.log("profile error", e)
@@ -1174,6 +1185,15 @@ def build(card):
     if mat_url: links.append(f"<a href='{esc(mat_url)}'>결산 설명 자료({esc(mat_src)})</a>")
     links += [f"<a href='{esc(u_)}'>참고: {esc(t_[:30])}({esc(d_)})</a>" for _, u_, t_, d_ in refs]
     links += [f"<a href='{esc(u)}'>{esc(n)}</a>" for n, u in rec_links]
+    try:   # 결론·설명 속 이번 분기 금액을 원자료와 대조
+        import earn_check as CK
+        fq_ = CK.facts_quarter(card); ok_q, bad_q = 0, []
+        for k_ in ("headline", "narrative"):
+            if ai.get(k_):
+                ai[k_], o2, b2 = CK.check(str(ai[k_]), fq_, "q"); ok_q += o2; bad_q += b2
+        card["_chk_q"] = (ok_q, bad_q)
+        if bad_q: E.log("결론 숫자 불일치", code, " | ".join(bad_q))
+    except Exception as e: E.log("headline number check error", e)
     headline = ai.get("headline") or cardai.get("summary") or ""
     lab, months = E.qlabel(s[-1], fem)
     tail = ""
@@ -1305,6 +1325,7 @@ details.sec{{padding:0 12px 8px}} details.sec>summary{{list-style:none;padding:1
             "설명자료": "O" if mat_pdf else "X", "이전IR": len(refs), "분기3개월": "X" if card["_stats"]["qfail"] else "O",
             "캐파": "O" if capa_hit else "X", "사업분석": ("저장분" if deep.get("_biz_cached") else "O") if bz else "X",
             "밸류체인지도": f"{len(vm.get('players') or [])}개사", "환원목표": len(deep.get("policy") or []),
-            "EDINET": f"{card.pop('_edinet_n', 0)}개년", "기업개요": card.pop("_prof", "X"), "분기컨센서스": card.pop("_cq", "X"), "지난대비": card.pop("_diff", "X"), "배당자료": len(div_ins), "컨센서스": "O" if card.pop("_cons", 0) else "X"}
+            "EDINET": f"{card.pop('_edinet_n', 0)}개년", "기업개요": card.pop("_prof", "X"), "분기컨센서스": card.pop("_cq", "X"),
+            "숫자대조": "일치 {} · 불일치 {}".format(*[sum(x) for x in zip(*[(a, len(b)) for a, b in (card.pop("_chk_ov", (0, [])), card.pop("_chk_q", (0, [])))])]), "지난대비": card.pop("_diff", "X"), "배당자료": len(div_ins), "컨센서스": "O" if card.pop("_cons", 0) else "X"}
     except Exception as e: E.log("rep sec stats error", e)
     return f"{code}_{card['d']}_report.html", doc.encode("utf-8")
