@@ -596,6 +596,10 @@ def card_chart(name, series, fy_end_month, path):
     fig.savefig(path, facecolor="white"); plt.close(fig)
 
 # ───────────────────────── Gemini: 비즈니스 모델·왜 좋았나 ─────────────────────────
+# 투자 테마(2026-11-04 요청): 카드마다 하나 — '목록' 명령에서 테마별로 묶어 보여 줌
+THEMES = ["AI 반도체 장비", "AI 반도체 소재·부품", "전자부품·데이터센터", "반도체·FA 상사", "FA·설비투자·기계", "IT 서비스·SaaS·보안",
+          "중소기업 지원·M&A", "게임·IP·콘텐츠", "내수 소비·식품·유통", "자동차·운송", "종합상사·자원·소재", "건설·부동산·인프라", "금융", "헬스케어", "기타"]
+AI_THEMES = THEMES[:4]   # '목록 AI 빼고' 때 빠지는 테마
 CARD_PROMPT = """너는 일본 중소형주를 보는 한국 애널리스트다. 첨부 PDF(결산 설명 자료=IR 발표 자료, 있으면)와 아래 결산단신 본문(일본어)·수치를 읽고 한국어로 JSON을 써라.
 규칙
 - 자료에 적힌 내용만 쓴다. 추측 금지. 원인이 자료 어디에도 없으면 그 항목은 "원문 설명 없음".
@@ -611,6 +615,7 @@ CARD_PROMPT = """너는 일본 중소형주를 보는 한국 애널리스트다.
   제외: 특별이익·영업외 수익(영업이익에 안 들어감), 환율, 가격 인상, 해마다 받는 보조금(예: 미국 IRA 생산 세액공제)처럼 계속되는 것.
   amt = 그 금액(억 엔, 숫자, 1억 엔=100백만 엔). 이번 3개월 분기분을 우선, 분기 구분이 안 되면 누적 금액. 금액이 자료에 없으면 null, 없으면 0.
   main = 이 요인을 빼면 영업이익이 전년 동기보다 늘지 않았거나 증가분의 절반 이상이 이 요인인가(true/false).
+- theme: 이 회사의 이번 실적을 이끈 투자 테마를 다음 중 하나 그대로: {themes}
 - rev_oneoff: 매출 증가율을 이번 분기에 일시적으로 끌어내린 요인만 적는다(자료에 적힌 것만).
   해당: 사업부·자회사 매각·양도, 연결 범위에서 제외, 수익 인식 기준 변경(총액→순액 등), 결산기 변경으로 비교 기간 불일치, 전년 동기의 대형 일회성 매출(기저 효과).
   제외: 수요 감소, 가격 인하, 환율, 경쟁 심화처럼 본업의 흐름인 것.
@@ -619,6 +624,7 @@ CARD_PROMPT = """너는 일본 중소형주를 보는 한국 애널리스트다.
  "P": "...", "Q": "...", "C": "...", "etc": "...",
  "oneoff": {{"what": "요인(없으면 빈 문자열)", "amt": 0, "main": false}},
  "ret_policy": "회사가 자료에 밝힌 주주환원 목표 한 줄(예: 총주주환원율 50% 이상·DOE 4%, 기간 포함). 자료에 없으면 빈 문자열",
+ "theme": "위 목록 중 하나",
  "rev_oneoff": {{"what": "요인(없으면 빈 문자열)", "adj_yoy": null}}}}
 
 회사: {name} ({code}) · 업종: {sector}
@@ -646,7 +652,7 @@ def find_mat_pdf(a, row):
 
 def ai_card(info, pdf=None):
     p = CARD_PROMPT.format(name=info["name"], code=info["code"], sector=info["sector"], profile=info["profile"][:400],
-                           nums=info["nums"], qual=info["qual"][:6000], qrule=QRULE)
+                           nums=info["nums"], qual=info["qual"][:6000], qrule=QRULE, themes=" / ".join(THEMES))
     out = None
     if pdf:
         try:
@@ -660,7 +666,8 @@ def ai_card(info, pdf=None):
 
 # ───────────────────────── 일회성 요인(관세 환급·회계 변경 등) ─────────────────────────
 ONEOFF_RE = re.compile(r"関税[^。]{0,15}還付|還付[^。]{0,6}関税|IEEPA[^。]{0,30}還付|"
-                       r"(会計方針|会計上の見積り|耐用年数|減価償却方法)の変更[^。]{0,120}営業(利益|損失)[^。]{0,60}(増加|減少)")
+                       r"(会計方針|会計上の見積り|耐用年数|減価償却方法)の変更[^。]{0,120}営業(利益|損失)[^。]{0,60}(増加|減少)|"
+                       r"(?:譲渡益|売却益|戻入益|戻入額|受取補償金|受取保険金)[^。]{0,40}(?:により|もあり|等により|などにより)[^。]{0,30}営業利益[^。]{0,20}(?:増加|増益|改善)")   # 2026-11-04: 영업이익 증가 원인으로 적힌 양도익·환입·보상금
 _AMT_RE = re.compile(r"([\d,.]+)億(?:([\d,]+)百万)?円|([\d,.]+)百万円")
 _OTHER_RE = re.compile(r"売上高|営業利益|事業利益|経常利益|純利益|営業損失")
 
@@ -671,7 +678,8 @@ def oneoff_scan(qual):
         m = ONEOFF_RE.search(sen)
         if not m: continue
         if m.group(1) and m.group(3) == "減少" and "増加" not in sen: continue   # 회계 변경으로 이익이 줄어든 경우는 해당 없음
-        what = "관세 환급" if "還付" in sen else "회계 변경"
+        what = ("관세 환급" if "還付" in sen else "사업·자산 양도익" if re.search("譲渡益|売却益", sen) else "충당금 등 환입" if "戻入" in sen
+                else "보상금·보험금" if re.search("補償金|保険金", sen) else "회계 변경")
         rest = sen[m.end(2):] if m.group(1) else sen[m.end():]   # 회계 변경은 '営業利益が○百万円増加'처럼 금액이 지표 뒤에 옴
         am = _AMT_RE.search(rest)
         if am and not _OTHER_RE.search(rest[:am.start()]):   # 금액 앞에 다른 지표 이름이 오면 그 지표의 금액이라 쓰지 않음
@@ -695,6 +703,12 @@ def oneoff_check(a, ai):
     series = a["series"]; q = series[-1]; op = q.get("op")
     by_end = {x["end"]: x for x in series}; py = by_end.get(ym_add(q["end"], -12)) or {}
     excl, adj_txt = main, ""
+    if not amt and not main and op is not None:   # 금액 미공개(2026-11-04): 영업이익 증가율이 매출의 3배 넘게 튀면 증익 대부분이 일회성으로 보고 제외(타다노: 관세 환급, 매출 +26%·영업이익 +346%)
+        m_ = metrics(series, len(series) - 1)
+        oy, ry = m_.get("op_yoy"), m_.get("rev_yoy")
+        if oy is not None and oy >= 50 and oy >= 3 * max(ry or 0, 5):
+            excl = True
+            adj_txt = f" · 금액 미공개, 영업이익 {oy:+.0f}%가 매출({(ry or 0):+.0f}%)보다 크게 튀어 증익 상당 부분이 일회성으로 추정"
     if amt and op is not None:
         adj = op - amt * 100
         s2 = [dict(x) for x in series]; s2[-1]["op"] = adj
@@ -2053,6 +2067,8 @@ HELP_TXT = ("일본 실적 스크리닝 봇 사용법\n"
             "• /add 6857 7203 — 관심 종목 등록: 결산단신이 나오면 스크리닝 통과 여부와 상관없이 카드를 이 대화로 보내드립니다.\n"
             "• /del 6857 — 관심 종목 삭제 · /list — 내 관심 종목과 다음 실적 발표일\n"
             "• /alert on — 채널 통과 카드를 개인 대화로도 받기, /mincap 1000 · /exsector 은행 · /onlyrule 매출 고성장 으로 내 조건만 · /myrules 확인\n"
+            "• 목록 — 채널 통과 종목을 투자 테마별로(사업·실적 요인·매출/영업이익 YoY). '목록 AI 빼고' · '목록 일회성 빼고'\n"
+            "• 발표일 2780 4385 — 다음 실적 발표 예정일 · 관심 종목은 발표 전 영업일 아침에 알림\n"
             "• 카드의 📄 리포트·🗣 IR·Q&A 버튼으로 상세 자료도 받을 수 있습니다.\n"
             "스크리닝 기준을 통과한 종목은 지금처럼 채널에 올라갑니다.")
 
@@ -2237,6 +2253,171 @@ def stats_text(st):
          f"지금 대기: 카드 {len(st.get('ask_q') or [])} · 리포트 {len(st.get('rep_q') or [])} · IR {len(st.get('ir_q') or [])}"]
     return "\n".join(L)
 
+# ───────────────────────── '목록'(테마별 통과 종목)·'발표일' 명령 (2026-11-04 요청) ─────────────────────────
+def live_cards(st):
+    """채널에 살아 있는 스크리닝 카드(요청 분석·삭제·개인 대화 카드 제외), 종목당 가장 최근 것"""
+    best = {}
+    for cid, c in (st.get("cards") or {}).items():
+        if cid.startswith("q") or not c.get("msg") or c.get("deleted") or c.get("msg_gone") or not c.get("series"): continue
+        if str(c.get("chat") or CHANNEL) != str(CHANNEL): continue
+        if c["code"] not in best or c.get("ts", 0) > best[c["code"]][1].get("ts", 0): best[c["code"]] = (cid, c)
+    return list(best.values())
+
+def card_theme(c):
+    t = c.get("theme") or (c.get("ai") or {}).get("theme")
+    return t if t in THEMES else None
+
+THEME_PROMPT = """아래 일본 상장사 각각에 이번 실적을 이끈 투자 테마를 하나씩 붙여라. 테마는 다음 중 하나 그대로: {themes}
+판단 기준: AI 서버·데이터센터·반도체 수요가 실적의 주된 동인이면 앞의 4개 중 하나. 사업 설명과 실적 요인만 근거로.
+출력: {{"코드": "테마", ...}} JSON 하나
+{rows}"""
+
+def theme_fill(st, force=False):
+    """테마가 없는 채널 카드에 Gemini로 한 번에 테마를 붙임(6시간에 한 번 시도)"""
+    todo = [c for _, c in live_cards(st) if not card_theme(c)]
+    if not todo or (not force and time.time() - st.get("theme_try", 0) < 6 * 3600): return 0
+    st["theme_try"] = time.time()
+    rows = "\n".join(f"{c['code']} | {c.get('name_ko') or c['name']} | 업종 {SECTOR_KO.get(c.get('sector'), c.get('sector'))} | "
+                     f"{((c.get('ai') or {}).get('bm') or text_of(c.get('profile') or '')[:80])} | {((c.get('ai') or {}).get('summary') or '')}" for c in todo[:120])
+    out = gemini_json(THEME_PROMPT.format(themes=" / ".join(THEMES), rows=rows), timeout=150)
+    n = 0
+    if isinstance(out, dict):
+        for c in todo:
+            t = out.get(c["code"])
+            if t in THEMES: c["theme"] = t; n += 1
+    log("테마 붙이기", f"{n}/{len(todo)}")
+    return n
+
+def _short(x, n):
+    x = re.sub(r"\s+", " ", str(x or "")).strip().rstrip(".")
+    return x if len(x) <= n else x[:n - 1] + "…"
+
+def theme_cmd(st, chat, text):
+    """'목록' / '테마': 채널에 살아 있는 통과 종목을 테마별로(사업·실적 요인·분기 매출·영업이익 YoY).
+    '목록 AI 빼고' → AI 반도체·전자부품·데이터센터·반도체 상사 테마 제외, '목록 일회성 빼고' → 일회성 표시 카드 제외"""
+    m = re.match(r"^/?(목록|테마|theme|themes)(?:\s+(.*))?$", text.strip(), re.I)
+    if not m or text.strip().startswith("/목록"): return False   # '/목록'은 관심 종목 목록
+    arg = (m.group(2) or "").replace(" ", "")
+    no_ai = bool(re.search(r"AI|에이아이|반도체", arg, re.I)) and bool(re.search(r"빼|제외|없이|말고", arg))
+    no_one = "일회성" in arg
+    try:
+        if any(not card_theme(c) for _, c in live_cards(st)): theme_fill(st, force=True)
+    except Exception as e: log("theme fill error", e)
+    groups, drop = {}, 0
+    for cid, c in live_cards(st):
+        th = card_theme(c) or "기타"
+        if no_ai and th in AI_THEMES: drop += 1; continue
+        if no_one and "일회성 요인" in (c.get("caption") or ""): drop += 1; continue
+        groups.setdefault(th, []).append(c)
+    total = sum(len(v) for v in groups.values())
+    head = (f"📋 <b>스크리닝 통과 종목 {total}개</b> (채널 카드 기준, 분기 3개월 전년 동기 대비)"
+            + (f"\n제외 {drop}개: " + " · ".join(x for x, f in (("AI 반도체·전자부품·데이터센터·반도체 상사", no_ai), ("일회성 표시 카드", no_one)) if f) if drop else ""))
+    L = [head]
+    for th in THEMES:
+        cs = sorted(groups.get(th) or [], key=lambda c: -(metrics(c["series"], len(c["series"]) - 1).get("op_yoy") or -1e9))
+        if not cs: continue
+        L.append(f"\n<b>■ {esc(th)} ({len(cs)})</b>")
+        for c in cs:
+            s_ = c["series"]; mt = metrics(s_, len(s_) - 1); q = s_[-1]
+            ai = c.get("ai") or {}
+            if q.get("op") is None and q.get("ni") is not None:
+                ni_y, ni_s = yoy(q.get("ni"), (mt.get("py") or {}).get("ni"))
+                prof = f"순익 {yoy_txt(ni_y, ni_s)}"
+            else:
+                prof = f"영익 {yoy_txt(mt.get('op_yoy'), mt.get('op_st'))}"
+            warn = " ⚠️일회성" if "일회성 요인" in (c.get("caption") or "") else ""
+            bm = _short(ai.get("bm") or "(사업 설명 다시 만드는 중)", 34)   # 일본어 회사 개요는 보여 주지 않음
+            why = _short(ai.get("summary") if not re.search("원문 설명 없음|설명이 없", str(ai.get("summary") or "")) else "", 44)
+            L.append(f"• <b>{esc(c.get('name_ko') or c['name'])}</b>({c['code']}) 매출 {yoy_txt(mt.get('rev_yoy'), mt.get('rev_st'))} · {prof}{warn}\n"
+                     f"  {esc(bm)}" + (f" — {esc(why)}" if why else ""))
+    L.append("\n※ 투자포인트는 결산단신·IR 자료에 회사가 적은 실적 요인 요약. '목록 AI 빼고' · '목록 일회성 빼고'로 거를 수 있음")
+    # 텔레그램 한 메시지 4096자 제한 → 줄 단위로 나눠 보냄
+    buf = ""
+    for line in L:
+        if len(buf) + len(line) + 1 > 3800:
+            tg("sendMessage", {"chat_id": chat["id"], "text": buf, "parse_mode": "HTML", "disable_web_page_preview": True}); buf = ""
+        buf += line + "\n"
+    if buf.strip(): tg("sendMessage", {"chat_id": chat["id"], "text": buf, "parse_mode": "HTML", "disable_web_page_preview": True})
+    return True
+
+def next_ann(code):
+    """다음 실적 발표 예정일 → (YYYY-MM-DD, 출처) 또는 (None, None). JPX 결산 발표 예정일(공시봇이 매일 받음) → 가부탄"""
+    d = ((jp_state().get("sched") or {}).get(code) or [None])[0]
+    if d and d >= now().strftime("%Y-%m-%d"): return d, "JPX 결산 발표 예정일"
+    try:
+        mm = re.search(r"決算発表予定日\D{0,20}(\d{4})/(\d{1,2})/(\d{1,2})", text_of(mget(f"https://s.kabutan.jp/stocks/{code}/")))
+        if mm:
+            d2 = f"{mm.group(1)}-{int(mm.group(2)):02d}-{int(mm.group(3)):02d}"
+            if d2 >= now().strftime("%Y-%m-%d"): return d2, "가부탄"
+    except Exception as e: log("kabutan date error", code, e)
+    return None, None
+
+def date_cmd(st, chat, text):
+    """'발표일 2780 4385' → 다음 실적 발표 예정일"""
+    m = re.match(r"^/?(발표일|결산일|date)\s+(.+)$", text.strip(), re.I)
+    if not m: return False
+    out = []
+    for tok in re.split(r"[,\s]+", m.group(2).strip())[:10]:
+        if not tok: continue
+        try: c, _ = resolve(tok)
+        except Exception: c = None
+        if not c: out.append(f"'{tok}': 종목을 찾지 못함"); continue
+        d, src = next_ann(c)
+        wd = "월화수목금토일"[dt.date.fromisoformat(d).weekday()] if d else ""
+        out.append(f"{label_of(c)}: " + (f"<b>{d}({wd})</b> · {src}" if d else "예정일 미공표(회사가 아직 안 알림)"))
+    tg("sendMessage", {"chat_id": chat["id"], "text": "📅 다음 실적 발표 예정일\n" + "\n".join(out), "parse_mode": "HTML"})
+    return True
+
+def date_alerts(st):
+    """관심 종목(/add)의 실적 발표 전 영업일 아침 8시 이후 한 번: '내일 발표' 알림(2026-11-04 요청)"""
+    t = now()
+    if t.hour < 8 or t.weekday() >= 5 or st.get("date_alert_day") == t.strftime("%Y%m%d"): return
+    subs = st.get("subs") or {}
+    if not subs: st["date_alert_day"] = t.strftime("%Y%m%d"); return
+    nb = t.date() + dt.timedelta(days=1)
+    while nb.weekday() >= 5: nb += dt.timedelta(days=1)   # 금요일이면 다음 월요일 발표를 알림
+    sched = jp_state().get("sched") or {}
+    if not sched: return   # 공시봇 상태를 못 읽었으면 다음에 다시
+    st["date_alert_day"] = t.strftime("%Y%m%d")
+    for uid, codes in subs.items():
+        due = [c for c in codes if (sched.get(c) or [None])[0] == nb.isoformat()]
+        if not due: continue
+        tg("sendMessage", {"chat_id": int(uid), "text": f"📅 {nb.month}/{nb.day}({'월화수목금토일'[nb.weekday()]}) 실적 발표 예정 관심 종목\n"
+                           + "\n".join(label_of(c) for c in due) + "\n(JPX 결산 발표 예정일 기준 · 발표되면 카드가 자동으로 옵니다)"})
+        log("발표일 알림", uid[-4:], due)
+
+def ai_refill(st, limit=5):
+    """AI 요약이 실패해 사업 설명·실적 요인이 빈 채널 카드: 다시 만들어 캡션에 채움(2026-11-04 요청, 한 바퀴에 5장)"""
+    done = set(st.get("ai_refill_done") or [])
+    todo = [(cid, c) for cid, c in live_cards(st) if not (c.get("ai") or {}).get("bm") and cid not in done]
+    for cid, c in todo[:limit]:
+        done.add(cid)
+        try:
+            s_ = c["series"]; mt = metrics(s_, len(s_) - 1); q = mt["q"]
+            nums = (f"이번 분기 매출 {oku(q.get('rev'))}엔({yoy_txt(mt['rev_yoy'], mt['rev_st'])}), 영업이익 {oku(q.get('op'))}엔"
+                    f"({yoy_txt(mt['op_yoy'], mt['op_st'])}), 순이익 {oku(q.get('ni'))}엔({yoy_txt(mt['ni_yoy'], mt['ni_st'])})")
+            ai = ai_card({"name": c["name"], "code": c["code"], "sector": c.get("sector") or "", "profile": c.get("profile") or "", "nums": nums, "qual": c.get("qual") or ""})
+            if not ai or not ai.get("bm"): log("AI 요약 다시 만들기 실패", c["code"]); continue
+            c["ai"] = ai; c["name_ko"] = ai.get("name_ko") or c.get("name_ko")
+            if ai.get("theme") in THEMES: c["theme"] = ai["theme"]
+            cap = c.get("caption") or ""
+            if "비즈니스 모델" not in cap:
+                cap = re.sub(r"(▶️ <b>섹터</b>[^\n]*\n)", lambda m_: m_.group(1) + f"▶️ <b>비즈니스 모델</b> {esc(ai['bm'])}\n", cap, count=1)
+            if "왜 좋았나" not in cap and "실적 요인" not in cap:
+                blk = ["▶️ <b>왜 좋았나</b>"] + ([esc(ai["summary"])] if ai.get("summary") else [])
+                for k in ("P", "Q", "C", "etc"):
+                    v = (ai.get(k) or "").strip()
+                    if v and "원문 설명 없음" not in v: blk.append(f"<b>{'기타' if k == 'etc' else k}:</b> {esc(v)}")
+                i = cap.find("▶️ <b>주가</b>")
+                cap = cap[:i] + "\n".join(blk) + "\n\n" + cap[i:] if i >= 0 else cap + "\n\n" + "\n".join(blk)
+            c["caption"] = cap
+            r = tg("editMessageCaption", {"chat_id": CHANNEL, "message_id": c["msg"], "caption": shrink(cap) if len(cap) > 1024 else cap,
+                                          "parse_mode": "HTML", "reply_markup": keyboard(cid)})
+            log("AI 요약 채움", c["code"], "성공" if r.get("ok") else f"캡션 수정 실패 {LAST_ERR['d'][:80]}")
+        except Exception: traceback.print_exc()
+    st["ai_refill_done"] = sorted(done)[-300:]
+    return len(todo)
+
 def handle_text(st, chat, text):
     """채널 글·봇 개인 메시지로 온 종목명/코드 → 요청 분석 대기열"""
     text = (text or "").strip()
@@ -2261,6 +2442,7 @@ def handle_text(st, chat, text):
             if chat["id"] == st.get("owner"): tg("sendMessage", {"chat_id": chat["id"], "text": stats_text(st)})
             return
         if user_cmd(st, chat, text): return
+        if theme_cmd(st, chat, text) or date_cmd(st, chat, text): return
     if text.startswith("/start") or text.startswith("/help"):
         tg("sendMessage", {"chat_id": chat["id"], "text": HELP_TXT}); return
     try:
@@ -2573,7 +2755,7 @@ def finish_card(st, cid, a, row, prep, chat=None):
             "caption": cap, "ts": time.time(), "sector": a["sector"], "cap": a.get("cap"), "pdf": row.get("pdf"), "xbrl": row.get("xbrl"),
             "mat": mat_url, "mat_src": mat_src, "fem": fem, "series": a["series"][-8:], "hit": a["hit"],
             "r": {k: a["r"].get(k) for k in ("q", "start", "end", "fc", "fc_end", "rev", "op", "ni", "scope", "shares", "cf")}, "ret": a.get("ret"),
-            "ai": ai, "profile": a.get("profile", "")[:600], "qual": a.get("qual", "")[:8000], "chat": str(chat or CHANNEL)}
+            "ai": ai, "theme": (ai or {}).get("theme") if (ai or {}).get("theme") in THEMES else None, "profile": a.get("profile", "")[:600], "qual": a.get("qual", "")[:8000], "chat": str(chat or CHANNEL)}
         return msg
 
 def fanout_personal(st):
@@ -3052,6 +3234,12 @@ def main():
                 # weekly_post(st)   # 주간 정리 글은 보내지 않음(사용자 요청, 2026-10-31)
                 if not DRY:
                     try: weekly_top5(st)   # 대신 토요일 오전 투자 검토 후보 탑 5
+                    except Exception: traceback.print_exc()
+                if not DRY:
+                    try: date_alerts(st)
+                    except Exception: traceback.print_exc()
+                    try:
+                        if not DRAIN["on"]: ai_refill(st); theme_fill(st)
                     except Exception: traceback.print_exc()
                 cleanup(st); save(st)
         except Exception as e:
