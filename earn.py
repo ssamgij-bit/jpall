@@ -2277,7 +2277,7 @@ def theme_fill(st, force=False):
     todo = [c for _, c in live_cards(st) if not card_theme(c)]
     if not todo or (not force and time.time() - st.get("theme_try", 0) < 6 * 3600): return 0
     st["theme_try"] = time.time()
-    rows = "\n".join(f"{c['code']} | {c.get('name_ko') or c['name']} | 업종 {SECTOR_KO.get(c.get('sector'), c.get('sector'))} | "
+    rows = "\n".join(f"{c['code']} | {c.get('name_ko') or c['name']} | 업종 {SECTOR_KO.get(sector_norm(c.get('sector') or ''), '')} | "
                      f"{((c.get('ai') or {}).get('bm') or text_of(c.get('profile') or '')[:80])} | {((c.get('ai') or {}).get('summary') or '')}" for c in todo[:120])
     out = gemini_json(THEME_PROMPT.format(themes=" / ".join(THEMES), rows=rows), timeout=150)
     n = 0
@@ -2285,6 +2285,7 @@ def theme_fill(st, force=False):
         for c in todo:
             t = out.get(c["code"])
             if t in THEMES: c["theme"] = t; n += 1
+    if n == 0: st["theme_try"] = time.time() - 6 * 3600 + 1200   # AI 실패면 20분 뒤 다시
     log("테마 붙이기", f"{n}/{len(todo)}")
     return n
 
@@ -2305,7 +2306,7 @@ def theme_cmd(st, chat, text):
     except Exception as e: log("theme fill error", e)
     groups, drop = {}, 0
     for cid, c in live_cards(st):
-        th = card_theme(c) or "기타"
+        th = card_theme(c) or ("업종 " + SECTOR_KO.get(sector_norm(c.get("sector") or ""), "기타"))   # 테마를 아직 못 붙였으면 업종으로 임시 분류
         if no_ai and th in AI_THEMES: drop += 1; continue
         if no_one and "일회성 요인" in (c.get("caption") or ""): drop += 1; continue
         groups.setdefault(th, []).append(c)
@@ -2313,7 +2314,7 @@ def theme_cmd(st, chat, text):
     head = (f"📋 <b>스크리닝 통과 종목 {total}개</b> (채널 카드 기준, 분기 3개월 전년 동기 대비)"
             + (f"\n제외 {drop}개: " + " · ".join(x for x, f in (("AI 반도체·전자부품·데이터센터·반도체 상사", no_ai), ("일회성 표시 카드", no_one)) if f) if drop else ""))
     L = [head]
-    for th in THEMES:
+    for th in THEMES + sorted(k for k in groups if k not in THEMES):
         cs = sorted(groups.get(th) or [], key=lambda c: -(metrics(c["series"], len(c["series"]) - 1).get("op_yoy") or -1e9))
         if not cs: continue
         L.append(f"\n<b>■ {esc(th)} ({len(cs)})</b>")
@@ -2388,10 +2389,11 @@ def date_alerts(st):
 
 def ai_refill(st, limit=5):
     """AI 요약이 실패해 사업 설명·실적 요인이 빈 채널 카드: 다시 만들어 캡션에 채움(2026-11-04 요청, 한 바퀴에 5장)"""
-    done = set(st.get("ai_refill_done") or [])
-    todo = [(cid, c) for cid, c in live_cards(st) if not (c.get("ai") or {}).get("bm") and cid not in done]
+    tries = st.setdefault("ai_refill_n", {})   # 실패하면(AI 서버 503 등) 30분 뒤 다시, 최대 6번
+    todo = [(cid, c) for cid, c in live_cards(st) if not (c.get("ai") or {}).get("bm") and tries.get(cid, [0, 0])[0] < 6
+            and time.time() - tries.get(cid, [0, 0])[1] > 1800]
     for cid, c in todo[:limit]:
-        done.add(cid)
+        n_, _t = tries.get(cid, [0, 0]); tries[cid] = [n_ + 1, time.time()]
         try:
             s_ = c["series"]; mt = metrics(s_, len(s_) - 1); q = mt["q"]
             nums = (f"이번 분기 매출 {oku(q.get('rev'))}엔({yoy_txt(mt['rev_yoy'], mt['rev_st'])}), 영업이익 {oku(q.get('op'))}엔"
@@ -2415,7 +2417,7 @@ def ai_refill(st, limit=5):
                                           "parse_mode": "HTML", "reply_markup": keyboard(cid)})
             log("AI 요약 채움", c["code"], "성공" if r.get("ok") else f"캡션 수정 실패 {LAST_ERR['d'][:80]}")
         except Exception: traceback.print_exc()
-    st["ai_refill_done"] = sorted(done)[-300:]
+    st.pop("ai_refill_done", None)
     return len(todo)
 
 def handle_text(st, chat, text):
