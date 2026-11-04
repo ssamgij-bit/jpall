@@ -11,9 +11,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write   # 알림 보낸 기록(watch-state 브랜치) 저장
+      actions: write    # 멈춘 봇 다시 실행(2026-11-04)
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4   # 암호화된 주인 ID를 풀 stcrypt.py
+      - uses: actions/checkout@v5   # 암호화된 주인 ID를 풀 stcrypt.py
       - run: pip install -q jpholiday || true   # 일본 공휴일(휴장일엔 공시 0건이 정상)
       - name: 마지막 상태 저장 시각 확인 → 멈췄으면 주인에게 텔레그램 알림
         env:
@@ -50,6 +51,19 @@ jobs:
               mins = (dt.datetime.now(dt.timezone.utc) - t).total_seconds() / 60
               print(br, f"{mins:.0f}분 전 저장")
               flag(br, f"{name}: 마지막 실행 기록이 {mins / 60:.1f}시간 전입니다", mins >= 75)
+              # 40분 넘게 저장이 없고 실행 중·대기 중인 실행도 없으면 직접 다시 띄움(2026-11-04: 예약 실행 누락으로 1시간 멈춘 일)
+              wf = {"earn-state": "earn.yml", "state": "jpall.yml"}[br]
+              if mins >= 40 and not DRY:
+                  try:
+                      act = sum(len(get(f"https://api.github.com/repos/{repo}/actions/workflows/{wf}/runs?status={s_}&per_page=5").get("workflow_runs") or [])
+                                for s_ in ("in_progress", "queued", "pending", "waiting"))
+                      if act == 0:
+                          urllib.request.urlopen(urllib.request.Request(f"https://api.github.com/repos/{repo}/actions/workflows/{wf}/dispatches",
+                              data=json.dumps({"ref": "main"}).encode(), method="POST",
+                              headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"], "Accept": "application/vnd.github+json", "User-Agent": "watch"}), timeout=30)
+                          print(wf, "멈춤 → 다시 실행 요청")
+                  except Exception as e:
+                      print(wf, "다시 실행 실패", e)
           now = dt.datetime.now(dt.timezone.utc)
           kst_h = (now + dt.timedelta(hours=9)).hour
           # japan stock 봇(Cloudflare, 2분마다): 마지막으로 끝까지 돈 시각
