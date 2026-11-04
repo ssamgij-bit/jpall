@@ -2969,6 +2969,25 @@ def main():
                 log("규칙 변경 카드 삭제", c["code"], "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:80]}")
         st["perf_log"] = [p for p in st.get("perf_log", []) if p.get("cid") not in bad]
         st["fix_rule_1031"] = True; save(st)
+    if not st.get("fix_chart_1104") and not DRY:  # 한 번(2026-11-04 요청): 매출 먼저 차트로 바꾸기(10-31) 전에 올라간 카드 차트를 새 순서(① 매출 ② 영업이익)로 교체 — 코나미 먼저, 한 바퀴에 15장씩
+        done = set(st.get("fix_chart_1104_done") or [])
+        todo = sorted([k for k, v in st.get("cards", {}).items() if v.get("msg") and v.get("series") and not v.get("deleted") and not v.get("msg_gone")
+                       and float(v.get("ts") or 0) < 1793429400 and k not in done], key=lambda k: (st["cards"][k].get("code") != "9766", k))
+        for cid in todo[:15]:
+            c = st["cards"][cid]; done.add(cid)
+            try:
+                buf = io.BytesIO()
+                card_chart(f"{c.get('name_ko') or c['name']}({c['code']})", c["series"], c.get("fem") or 3, buf)
+                cap = c.get("caption") or ""
+                media = {"type": "photo", "media": "attach://photo", "caption": shrink(cap) if len(cap) > 1024 else cap, "parse_mode": "HTML"}
+                r = tg("editMessageMedia", {"chat_id": c.get("chat") or CHANNEL, "message_id": c["msg"], "media": json.dumps(media, ensure_ascii=False),
+                                            "reply_markup": keyboard(cid)}, files={"photo": ("c.png", buf.getvalue(), "image/png")})
+                log("차트 순서 교체", c.get("code"), "성공" if r.get("ok") else f"실패 {LAST_ERR['d'][:100]}")
+            except Exception: traceback.print_exc()
+            time.sleep(1.2)
+        st["fix_chart_1104_done"] = sorted(done)
+        if len(todo) <= 15: st["fix_chart_1104"] = True; st.pop("fix_chart_1104_done", None)
+        save(st)
     if st.get("fix_repost_2768") and not st.get("fix_sj_chart") and not DRY:  # 한 번: 먼저 올라간 소지츠 카드 차트를 새 차트(매출 먼저·순이익)로 교체
         st["fix_sj_chart"] = True; save(st)
         try:
