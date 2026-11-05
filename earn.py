@@ -735,9 +735,8 @@ def low_rev_check(a, ai):
     what = str(o.get("what") or "").strip()
     try: adj = float(o.get("adj_yoy")) if o.get("adj_yoy") not in (None, "") else None
     except (TypeError, ValueError): adj = None
-    if not what and ai is None:   # AI 확인 실패: 결산단신 본문에 매출 관련 사업 양도·연결 제외 문장이 있으면 일회성으로 봄
-        for sen in re.split(r"(?<=。)", a.get("qual") or ""):
-            if "売上" in sen and DIVEST_RE.search(sen): what = "사업 양도·연결 제외(본문 언급)"; break
+    # AI 확인 실패 때 본문 키워드로 예외를 주던 것은 없앰(2026-11-05: SANKYO — 재무제표 표 속 '投資有価証券売却' 글자에 걸려 매출 +4.9%인데 통과).
+    # AI가 일회성 요인을 확인한 경우에만 예외
     if what and (adj is None or adj >= th):
         return False, f"ℹ️ <b>매출 {rg:+.1f}%</b>는 일회성 요인({esc(what)}) 때문" + (f" · 빼면 {adj:+.1f}%" if adj is not None else "")
     return True, f"X7 매출 증가율 {th:.0f}% 미만({rg:+.1f}%)"
@@ -2416,9 +2415,30 @@ def ai_refill(st, limit=5):
             r = tg("editMessageCaption", {"chat_id": CHANNEL, "message_id": c["msg"], "caption": shrink(cap) if len(cap) > 1024 else cap,
                                           "parse_mode": "HTML", "reply_markup": keyboard(cid)})
             log("AI 요약 채움", c["code"], "성공" if r.get("ok") else f"캡션 수정 실패 {LAST_ERR['d'][:80]}")
+            if time.time() - c.get("ts", 0) < 47 * 3600: recheck_card(st, cid, c, "AI 요약을 다시 만든 뒤 재판별: ")   # AI 없이 판별된 카드는 AI 결과로 다시 확인(삭제 가능한 48시간 안만)
         except Exception: traceback.print_exc()
     st.pop("ai_refill_done", None)
     return len(todo)
+
+def recheck_card(st, cid, c, why_pre=""):
+    """채널 카드를 지금 규칙(R1~R5·X6 일회성·X7 매출 10% 미만)으로 다시 판별 → 못 미치면 삭제(48시간 안) 또는 제외 표시. 탈락 사유 또는 ''"""
+    s_ = c.get("series") or []
+    if len(s_) < 2: return ""
+    ai = c.get("ai") if isinstance(c.get("ai"), dict) else None
+    ok_, _h, why_ = judge(s_, len(s_) - 1)
+    a_ = {"series": s_, "qual": c.get("qual") or ""}
+    x6, _t6 = oneoff_check(a_, ai)
+    x7, w7 = low_rev_check(a_, ai)
+    if ok_ and not x6 and not x7: return ""
+    why_ = why_pre + (why_ or (w7 if x7 else "X6 일회성 요인으로 이익 증가" if x6 else "기준 미충족"))
+    r = tg("deleteMessage", {"chat_id": CHANNEL, "message_id": c["msg"]})
+    if not r.get("ok"):
+        cap = f"🚫 <b>스크리닝 기준 미충족으로 제외</b>({esc(why_)})\n\n" + (c.get("caption") or "")
+        tg("editMessageCaption", {"chat_id": CHANNEL, "message_id": c["msg"], "caption": shrink(cap) if len(cap) > 1024 else cap, "parse_mode": "HTML"})
+    c["deleted"] = True; c["rx"] = c.get("rx") or "deleted"
+    st["perf_log"] = [p for p in st.get("perf_log", []) if p.get("cid") != cid]
+    log("카드 재판별 탈락", c.get("code"), why_, "삭제" if r.get("ok") else "삭제 실패 → 제외 표시")
+    return why_
 
 def handle_text(st, chat, text):
     """채널 글·봇 개인 메시지로 온 종목명/코드 → 요청 분석 대기열"""
@@ -3128,6 +3148,14 @@ def main():
         st["perf_log"] = [p for p in st.get("perf_log", []) if p.get("cid") not in gone]
         st["fix_rule_1102"] = True; save(st)
         log("기준 변경 정리 끝", f"{len(gone)}건")
+    if not st.get("fix_recheck_1105") and not DRY:  # 한 번(2026-11-05): 최근 48시간 채널 카드를 지금 규칙으로 다시 판별(SANKYO 매출 +4.9% 통과 건) + 지난 카드 31장 삭제 재시도는 중단(사용자: 삭제 안 해도 됨)
+        st["fix_recheck_1105"] = True; st["fix_rule_1102b"] = True
+        for cid, c in list(st.get("cards", {}).items()):
+            if cid.startswith("q") or not c.get("msg") or c.get("deleted") or c.get("msg_gone") or str(c.get("chat") or CHANNEL) != str(CHANNEL): continue
+            if time.time() - c.get("ts", 0) < 47 * 3600:
+                try: recheck_card(st, cid, c)
+                except Exception: traceback.print_exc()
+        save(st)
     if not st.get("fix_rule_1102b") and not DRY and time.time() - st.get("fix_1102b_t", 0) > 3600:  # 한 번(2026-11-02 요청): 기준 변경으로 제외됐지만 48시간이 지나 삭제가 거부됐던 채널 카드 31장 다시 삭제(채널 '메시지 삭제' 권한 필요)
         ok_n, fail = 0, []
         for cid in ['260821524289', '260928541466', '261001544512', '261005546205', '261013549220', '261013549987', '261019552943', '261023555513', '261023555565', '261026555792', '261026556145', '261027556509', '261027556789', '261027556813', '261027557078', '261028557875', '261028558015', '261028558200', '261028558643', '261029558802', '261029559206', '261029559303', '261029559567', '261029559778', '261029559908', '261029559909', '261030560586', '261030560792', '261030560799', '261030561182', '261030561300']:
