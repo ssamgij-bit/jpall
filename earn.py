@@ -600,6 +600,17 @@ def card_chart(name, series, fy_end_month, path):
 THEMES = ["AI 반도체 장비", "AI 반도체 소재·부품", "전자부품·데이터센터", "반도체·FA 상사", "FA·설비투자·기계", "IT 서비스·SaaS·보안",
           "중소기업 지원·M&A", "게임·IP·콘텐츠", "내수 소비·식품·유통", "자동차·운송", "종합상사·자원·소재", "건설·부동산·인프라", "금융", "헬스케어", "기타"]
 AI_THEMES = THEMES[:4]   # '목록 AI 빼고' 때 빠지는 테마
+
+# X8 상사 제외(2026-11-05 요청): 도매업 업종 중 상사·도매가 주업인 회사(종합상사·전문상사·의약품 도매 등). 산리오·고베물산·코메다처럼 상사가 아닌 도매업 종목은 남김
+TRADER_NAME_RE = re.compile(r"商事|物産|通商|商会|トレーディング|貿易|商社|住友商|丸紅|伊藤忠|双日|豊田通")   # 가부탄 줄임 이름(住友商·豊田通) 포함
+_TRADER = {}   # 코드 → 상사 여부(AI 판정 저장, 상태 'trader')
+def is_trader(code, name, sector, ai=None):
+    if sector_norm(sector or "") != "卸売業": return False
+    t = (ai or {}).get("trader") if isinstance(ai, dict) else None
+    if isinstance(t, str): t = {"true": True, "false": False}.get(t.strip().lower())
+    if isinstance(t, bool): _TRADER[code] = t; return t
+    if code in _TRADER: return bool(_TRADER[code])
+    return bool(TRADER_NAME_RE.search(nfkc(name or "")))   # AI 판정이 없으면 회사명(○○商事·物産 등)으로
 CARD_PROMPT = """너는 일본 중소형주를 보는 한국 애널리스트다. 첨부 PDF(결산 설명 자료=IR 발표 자료, 있으면)와 아래 결산단신 본문(일본어)·수치를 읽고 한국어로 JSON을 써라.
 규칙
 - 자료에 적힌 내용만 쓴다. 추측 금지. 원인이 자료 어디에도 없으면 그 항목은 "원문 설명 없음".
@@ -616,6 +627,8 @@ CARD_PROMPT = """너는 일본 중소형주를 보는 한국 애널리스트다.
   amt = 그 금액(억 엔, 숫자, 1억 엔=100백만 엔). 이번 3개월 분기분을 우선, 분기 구분이 안 되면 누적 금액. 금액이 자료에 없으면 null, 없으면 0.
   main = 이 요인을 빼면 영업이익이 전년 동기보다 늘지 않았거나 증가분의 절반 이상이 이 요인인가(true/false).
 - theme: 이 회사의 이번 실적을 이끈 투자 테마를 다음 중 하나 그대로: {themes}
+- trader: 주업이 다른 회사 제품을 사서 파는 상사·도매(종합상사, 반도체·전자부품·FA·화학·철강·식품·의약품 등 전문상사·도매)이면 true.
+  자체 브랜드·제조·소매 점포·프랜차이즈 본부·캐릭터 IP·서비스가 주업이면 false.
 - rev_oneoff: 매출 증가율을 이번 분기에 일시적으로 끌어내린 요인만 적는다(자료에 적힌 것만).
   해당: 사업부·자회사 매각·양도, 연결 범위에서 제외, 수익 인식 기준 변경(총액→순액 등), 결산기 변경으로 비교 기간 불일치, 전년 동기의 대형 일회성 매출(기저 효과).
   제외: 수요 감소, 가격 인하, 환율, 경쟁 심화처럼 본업의 흐름인 것.
@@ -624,7 +637,7 @@ CARD_PROMPT = """너는 일본 중소형주를 보는 한국 애널리스트다.
  "P": "...", "Q": "...", "C": "...", "etc": "...",
  "oneoff": {{"what": "요인(없으면 빈 문자열)", "amt": 0, "main": false}},
  "ret_policy": "회사가 자료에 밝힌 주주환원 목표 한 줄(예: 총주주환원율 50% 이상·DOE 4%, 기간 포함). 자료에 없으면 빈 문자열",
- "theme": "위 목록 중 하나",
+ "theme": "위 목록 중 하나", "trader": false,
  "rev_oneoff": {{"what": "요인(없으면 빈 문자열)", "adj_yoy": null}}}}
 
 회사: {name} ({code}) · 업종: {sector}
@@ -2072,7 +2085,7 @@ HELP_TXT = ("일본 실적 스크리닝 봇 사용법\n"
             "스크리닝 기준을 통과한 종목은 지금처럼 채널에 올라갑니다.")
 
 
-GUIDE_VER = 12  # 공지 문구를 바꾸면 올림 → 고정 공지를 새 내용으로 수정
+GUIDE_VER = 13  # 공지 문구를 바꾸면 올림 → 고정 공지를 새 내용으로 수정
 def guide_text(me):
     R = RULES
     sec = ", ".join(sorted(dict.fromkeys(SECTOR_KO.get(x, x) for x in EXCL_SECTORS)))
@@ -2091,6 +2104,7 @@ def guide_text(me):
             "❌ 매출이 2개 분기 연속 전년보다 감소\n"
             f"❌ 시가총액 {R['X5_min_cap_oku']:,.0f}억 엔 미만\n"
             f"❌ 업종: {sec}\n"
+            "❌ 상사: 도매업 중 상사·도매가 주업인 기업(종합상사, 반도체·FA·화학·철강·의약품 등 전문상사·도매)\n"
             "※ 영업이익 항목이 없는 기업(IFRS 종합상사 등)은 영업이익 대신 순이익으로 판별\n"
             "❌ 관세 환급·회계 변경 등 일회성 요인을 빼면 조건에 못 미치거나, 이익 증가분의 절반 이상이 일회성\n"
             f"❌ 분기 매출 증가율 +{R['X7_min_rev_yoy']:.0f}% 미만(사업부 매각·연결 제외 등 일회성 요인 때문이면 다른 조건 충족 시 통과)\n\n"
@@ -2271,6 +2285,29 @@ THEME_PROMPT = """아래 일본 상장사 각각에 이번 실적을 이끈 투�
 출력: {{"코드": "테마", ...}} JSON 하나
 {rows}"""
 
+TRADER_PROMPT = """아래 일본 도매업 상장사 각각이 '상사'인지 판정하라.
+true = 주업이 다른 회사 제품을 사서 파는 상사·도매(종합상사, 반도체·전자부품·FA·화학·철강·식품·의약품·의료기기 등 전문상사·도매).
+false = 자체 브랜드·제조·소매 점포·프랜차이즈 본부·캐릭터 IP·금융·서비스가 주업.
+출력: {{"코드": true 또는 false, ...}} JSON 하나
+{rows}"""
+
+def trader_fill(st):
+    """채널 카드 중 도매업이고 상사 판정이 없는 종목을 Gemini로 한 번에 판정(1시간에 한 번 시도)"""
+    todo = [c for _, c in live_cards(st) if sector_norm(c.get("sector") or "") == "卸売業" and c["code"] not in _TRADER
+            and not isinstance((c.get("ai") or {}).get("trader"), bool)]
+    if not todo or time.time() - st.get("trader_try", 0) < 3600: return 0
+    st["trader_try"] = time.time()
+    rows = "\n".join(f"{c['code']} | {c.get('name_ko') or c['name']} | {((c.get('ai') or {}).get('bm') or '')}" for c in todo)
+    out = gemini_json(TRADER_PROMPT.format(rows=rows), timeout=120)
+    n = 0
+    if isinstance(out, dict):
+        for c in todo:
+            v = out.get(c["code"])
+            if isinstance(v, str): v = {"true": True, "false": False}.get(v.lower())
+            if isinstance(v, bool): _TRADER[c["code"]] = v; n += 1
+    log("상사 판정", f"{n}/{len(todo)}", [c["code"] for c in todo if _TRADER.get(c["code"])])
+    return n
+
 def theme_fill(st, force=False):
     """테마가 없는 채널 카드에 Gemini로 한 번에 테마를 붙임(6시간에 한 번 시도)"""
     todo = [c for _, c in live_cards(st) if not card_theme(c)]
@@ -2301,16 +2338,19 @@ def theme_cmd(st, chat, text):
     no_ai = bool(re.search(r"AI|에이아이|반도체", arg, re.I)) and bool(re.search(r"빼|제외|없이|말고", arg))
     no_one = "일회성" in arg
     try:
+        trader_fill(st)
         if any(not card_theme(c) for _, c in live_cards(st)): theme_fill(st, force=True)
     except Exception as e: log("theme fill error", e)
     groups, drop = {}, 0
+    n_tr = 0
     for cid, c in live_cards(st):
+        if is_trader(c["code"], c.get("name"), c.get("sector"), c.get("ai")): n_tr += 1; continue   # 상사는 목록에서도 뺌(X8)
         th = card_theme(c) or ("업종 " + SECTOR_KO.get(sector_norm(c.get("sector") or ""), "기타"))   # 테마를 아직 못 붙였으면 업종으로 임시 분류
         if no_ai and th in AI_THEMES: drop += 1; continue
         if no_one and "일회성 요인" in (c.get("caption") or ""): drop += 1; continue
         groups.setdefault(th, []).append(c)
     total = sum(len(v) for v in groups.values())
-    head = (f"📋 <b>스크리닝 통과 종목 {total}개</b> (채널 카드 기준, 분기 3개월 전년 동기 대비)"
+    head = (f"📋 <b>스크리닝 통과 종목 {total}개</b> (채널 카드 기준, 분기 3개월 전년 동기 대비" + (f", 상사 {n_tr}개 제외" if n_tr else "") + ")"
             + (f"\n제외 {drop}개: " + " · ".join(x for x, f in (("AI 반도체·전자부품·데이터센터·반도체 상사", no_ai), ("일회성 표시 카드", no_one)) if f) if drop else ""))
     L = [head]
     for th in THEMES + sorted(k for k in groups if k not in THEMES):
@@ -2579,6 +2619,7 @@ def flash_card(st, row, rows):
         hits = downs
     kb = kb_finance(code)
     if up and kb["sector"] in EXCL_SECTORS: log("속보 제외 업종", code); return False
+    if up and is_trader(code, row.get("name"), kb["sector"]): log("속보 제외 상사", code); return False
     cap, profile = kb_profile(code)
     if up and (cap is None or cap < RULES["X5_min_cap_oku"]): log("속보 시총 미달·확인 불가", code, cap); return False
     name = name_of(code, row["name"], None)
@@ -2730,10 +2771,15 @@ def prepare_card(a, row):
                 f"({yoy_txt(m['op_yoy'], m['op_st'])}), 순이익 {oku(m['q'].get('ni'))}엔({yoy_txt(m['ni_yoy'], m['ni_st'])})")
         try: a["val"] = valuation(a["code"])
         except Exception as e: log("valuation error", e)
+        if a.get("pass") and not a.get("ondemand") and _TRADER.get(a["code"]) is True and sector_norm(a.get("sector") or "") == "卸売業":
+            return {"skip": "X8 상사(도매업 중 상사·도매가 주업)"}   # 이미 상사로 판정된 종목은 AI 호출 없이 바로 탈락
         mat_pdf, mat_url, mat_src = find_mat_pdf(a, row)
         ai = ai_card({"name": a["name"], "code": a["code"], "sector": a["sector"], "profile": a.get("profile", ""), "nums": nums, "qual": a.get("qual", "")}, mat_pdf)
         if ai is not None and mat_pdf: ai["_src"] = mat_src
         skip = ""
+        if a.get("pass") and is_trader(a["code"], a.get("name"), a.get("sector"), ai):
+            skip = "X8 상사(도매업 중 상사·도매가 주업)"
+            if a.get("ondemand"): a["pass"] = False; a["why"] = skip
         try:
             excl, a["oneoff"] = oneoff_check(a, ai)
             if excl and a.get("pass"):
@@ -3064,6 +3110,7 @@ def new_code():
 def main():
     t0 = time.time()
     st = load()
+    _TRADER.update(st.get("trader") or {}); st["trader"] = _TRADER   # 상사 판정 저장분
     if st.get("qbasis_ver") != QBASIS_VER:   # 분기 기준으로 바뀜 → 예전(누적 기준) 리포트·IR 요약은 다시 만들도록
         for c in (st.get("cards") or {}).values():
             c.pop("rep_file", None); c.pop("ir_texts", None)
@@ -3269,7 +3316,7 @@ def main():
                     try: date_alerts(st)
                     except Exception: traceback.print_exc()
                     try:
-                        if not DRAIN["on"]: ai_refill(st); theme_fill(st)
+                        if not DRAIN["on"]: ai_refill(st); theme_fill(st); trader_fill(st)
                     except Exception: traceback.print_exc()
                 cleanup(st); save(st)
         except Exception as e:
