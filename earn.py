@@ -2718,7 +2718,12 @@ def process_day(st, day, test=False):
     if not todo: return 0
     log(day, "결산단신", len(todo))
     passed = 0
+    t_tick = time.time()
     for row in reversed(todo):  # 오래된 순
+        if not test and time.time() - t_tick > 15:   # 실적 몰리는 날(수백 건) 판별 중에도 15초마다 요청·버튼 처리(2026-11-12: 판별에 묶여 봇이 몇 시간 응답 없던 문제)
+            t_tick = time.time()
+            try: poll_buttons(st, wait=0); do_reports(st)
+            except Exception: traceback.print_exc()
         cid = re.sub(r"\D", "", row["id"])[-12:]
         try:
             a = analyze(row, rows, st)
