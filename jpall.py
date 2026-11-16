@@ -288,9 +288,12 @@ def kget(url, timeout=20):
             return http(url, timeout=timeout, **({"headers": ua} if ua else {}))
         except Exception as e:
             last = e
-            if getattr(e, "code", None) not in (403, 405, 429): raise
+            if getattr(e, "code", None) not in (403, 405, 429, 451) and not re.search(r"timed out|reset|refused", str(e), re.I): raise
             time.sleep(3 + 5 * k)
     gw, key = os.environ.get("EARN_GATEWAY_URL") or os.environ.get("GATEWAY_URL"), os.environ.get("EARN_GATEWAY_KEY") or os.environ.get("GATEWAY_KEY")
+    if gw and not key and os.environ.get("EARN_TOKEN"):   # 실적 봇 관문 키 = 실적 봇 토큰에서 만든 값(earn.py _gw_key와 같음)
+        import hashlib
+        key = hashlib.sha256(("earn-gateway-v1:" + os.environ["EARN_TOKEN"]).encode()).hexdigest()
     if gw and key and gw != "off":
         return http(gw.rstrip("/") + "/fetch?u=" + urllib.parse.quote(url, safe=""), timeout=timeout + 20, headers={"x-key": key})
     raise last
@@ -342,10 +345,13 @@ def kabutan_lastfy(s, before=None):
     return best
 def kabutan_quarters(code, s=None):
     """[(시작일, 종료일, 매출, 영업익, 경상익, 순이익, EPS)] 백만엔 단위, 오래된 순"""
-    try:
-        s = s or kabutan_html(code)
-    except Exception:
-        return []
+    if not s:
+        for k in range(2):   # 실적 몰리는 15:30에 가부탄이 막히는 일이 있어 한 번 더(2026-11-16: 메르카리 추이가 이번 분기만 나옴)
+            try: s = kabutan_html(code); break
+            except Exception as e:
+                log("kabutan quarters error", code, str(e)[:80])
+                if k == 0: time.sleep(6)
+        if not s: return []
     i = s.find("3ヵ月決算");
     if i < 0: return []
     seg = s[i:i + 20000]
@@ -500,16 +506,22 @@ def body_results(row, st):
                 avg = sum(hp) / len(hp) if hp else None
                 lines.append(f"{lab} 진척률 : {prog:.0f}% (누적 {q}Q 기준" + (f" · 과거 {len(hp)}년 평균 {avg:.0f}%" if avg is not None else "") + ")")
                 HL.update(prog=prog, prog_hist=avg, prog_n=len(hp), prog_lab=lab)
-    # 최근 분기 추이
+    # 최근 실적 추이(2026-11-16 요청: 한국 공시봇처럼 '2026.3Q 64억/ 7억/ 2억' 형식으로 이번 분기 포함 5개 분기, 기간은 달력 기준 분기)
+    cal = lambda d: f"{d.year}.{(d.month - 1) // 3 + 1}Q"
     hist = []
+    cur_in_kq = any(k[1].year == end.year and k[1].month == end.month for k in kq)
     if single and single.get("rev") is not None:
-        m0 = (end.month - 2 - 1) % 12 + 1
-        hist.append(f"{str(end.year)[2:]}.{m0:02d}-{end.month:02d} {oku(single['rev'])}/ {oku(single.get('op'))}/ {oku(single.get('ni'))} (이번)")
-    for k in reversed([k for k in kq if k[1] < end.replace(day=1)][-4:]):
-        hist.append(f"{k[0].strftime('%y.%m')}-{k[1].month:02d} {mo(k[2])}/ {mo(k[3])}/ {mo(k[5])}")
+        hist.append(f"{cal(end)} {oku(single['rev'])}/ {oku(single.get('op'))}/ {oku(single.get('ni'))}")
+        past = [k for k in kq if k[1] < end.replace(day=1)][-4:]
+    else:   # 이번 분기 단독을 못 구했으면 가부탄 표에 이번 분기가 올라와 있을 때 그것부터
+        past = [k for k in kq if k[1] <= end][-5:] if cur_in_kq else [k for k in kq if k[1] < end.replace(day=1)][-4:]
+    for k in reversed(past):
+        hist.append(f"{cal(k[1])} {mo(k[2])}/ {mo(k[3])}/ {mo(k[5])}")
+    if not kq: log("가부탄 분기표를 못 받음 → 실적 추이 이번 분기만", row.get("code"))
     if hist:
         if lines[-1]: lines.append("")
-        lines.append("<b>최근 분기 실적 추이</b> (매출/ 영업익/ 순이익)")
+        lines.append("<b>최근 실적 추이</b>")
+        lines.append("(기간/ 매출/ 영업익/ 순익)")
         lines += hist
     try:
         HL["chart"] = res_chart(row, kq, single, end)
