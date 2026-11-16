@@ -64,6 +64,8 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.JPALL_GEMINI_KEY || secrets.GEMINI_API_KEY }}   # 공시 채널 전용 키(있으면) — 없으면 공용 키
           GEMINI_API_KEY_FALLBACK: ${{ secrets.GEMINI_API_KEY }}   # 전용 키 한도가 차면 공용 키로
           WATCH_KEY: ${{ secrets.WATCH_KEY }}
+          EARN_TOKEN: ${{ secrets.EARN_TOKEN }}   # 가부탄이 막힐 때 실적 봇의 즉시 응답 관문으로 받기 위한 키 계산용
+          EARN_GATEWAY_URL: https://earn-gateway.ssamgij.workers.dev
           RUN_SECONDS: "1680"
         run: python jpall.py
 
