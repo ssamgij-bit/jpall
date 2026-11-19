@@ -2977,6 +2977,41 @@ def top5_val(c, q):
     if pbr and 0 < pbr < 200: out.append(f"PBR {pbr:.2f}배")
     return " · ".join(out)
 
+# ───────────────────────── 토요일 14시: 한·일·미 주간 관심사(구글 트렌드 급상승·앱·위키백과·유튜브) → 주인 개인 대화 ─────────────────────────
+TRENDS = {"th": None, "res": None}
+def weekly_trends(st):
+    import threading, trends_weekly as TW
+    ts = st.setdefault("trends_state", {})
+    try: TW.snap_apps(ts)   # 앱 순위 기준점(하루 한 번)
+    except Exception as e: log("app snapshot error", e)
+    n = now(); wk = n.strftime("%G-%V")
+    if n.weekday() != 5 or n.hour < 14 or st.get("trends_done") == wk or not st.get("owner"): return
+    if TRENDS["th"] is None:
+        if time.time() - st.get("trends_try", 0) < 600: return
+        st["trends_try"] = time.time()
+        snap = json.loads(json.dumps(ts))
+        lab = f"{(n - dt.timedelta(days=7)):%m/%d}~{(n - dt.timedelta(days=1)):%m/%d}"
+        def work():
+            try:
+                data = TW.collect(snap, log=log)
+                TRENDS["res"] = [TW.render(geo, data[geo], TW.ai_notes(data[geo], gemini_json), lab) for geo, *_ in TW.GEOS]
+            except Exception:
+                traceback.print_exc(); TRENDS["res"] = []
+        TRENDS["res"] = None; TRENDS["th"] = threading.Thread(target=work, daemon=True); TRENDS["th"].start()
+        log("주간 관심사 수집 시작"); return
+    if TRENDS["th"].is_alive(): return
+    msgs, TRENDS["th"] = TRENDS["res"] or [], None
+    if not msgs: log("주간 관심사 수집 실패 → 10분 뒤 다시"); return
+    for m in msgs:
+        parts, buf = [], ""
+        for line in m.split("\n"):
+            if len(buf) + len(line) > 3800: parts.append(buf); buf = ""
+            buf += line + "\n"
+        parts.append(buf)
+        for p_ in parts:
+            tg("sendMessage", {"chat_id": st["owner"], "text": p_, "parse_mode": "HTML", "disable_web_page_preview": True}); time.sleep(1)
+    st["trends_done"] = wk; log("주간 관심사 발송", len(msgs))
+
 def weekly_top5(st):
     """토요일 오전: 이번 주 채널 통과 카드 중 투자 검토 후보 탑 5(AI 선별)를 채널에 게시"""
     n = now(); wk = n.strftime("%G-%V")
@@ -3314,6 +3349,9 @@ def main():
                     try: monthly_scorecard(st)   # 매달 첫 주: 규칙 성적표(주인에게)
                     except Exception: traceback.print_exc()
                 # weekly_post(st)   # 주간 정리 글은 보내지 않음(사용자 요청, 2026-10-31)
+                if not DRY:
+                    try: weekly_trends(st)
+                    except Exception: traceback.print_exc()
                 if not DRY:
                     try: weekly_top5(st)   # 대신 토요일 오전 투자 검토 후보 탑 5
                     except Exception: traceback.print_exc()
