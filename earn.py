@@ -3349,9 +3349,7 @@ def main():
                     try: monthly_scorecard(st)   # 매달 첫 주: 규칙 성적표(주인에게)
                     except Exception: traceback.print_exc()
                 # weekly_post(st)   # 주간 정리 글은 보내지 않음(사용자 요청, 2026-10-31)
-                if not DRY:
-                    try: weekly_trends(st)
-                    except Exception: traceback.print_exc()
+                # weekly_trends(st)   # 주간 관심사는 일본 뉴스+커뮤니티 채널(jpnews trends.py)로 옮김(2026-11-19)
                 if not DRY:
                     try: weekly_top5(st)   # 대신 토요일 오전 투자 검토 후보 탑 5
                     except Exception: traceback.print_exc()
