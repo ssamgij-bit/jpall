@@ -712,16 +712,15 @@ def oneoff_check(a, ai):
     if not what or (amt == 0 and not main):
         sc = oneoff_scan(a.get("qual"))
         if not sc: return False, ""
-        what, amt = sc; main = amt is None and ai is None   # AI 확인을 못 했고 금액도 모르면 보수적으로 제외
+        what, amt = sc; main = False   # 2026-11-19: 금액을 모르면 추정이므로 제외하지 않고 경고만(요넥스 2Q 관세 환급 사례)
     series = a["series"]; q = series[-1]; op = q.get("op")
     by_end = {x["end"]: x for x in series}; py = by_end.get(ym_add(q["end"], -12)) or {}
     excl, adj_txt = main, ""
-    if not amt and not main and op is not None:   # 금액 미공개(2026-11-04): 영업이익 증가율이 매출의 3배 넘게 튀면 증익 대부분이 일회성으로 보고 제외(타다노: 관세 환급, 매출 +26%·영업이익 +346%)
+    if not amt and not main and op is not None:   # 금액 미공개: 2026-11-19부터 제외하지 않고 경고만(사용자 요청 — 추정만으로 탈락시키지 않음. 이전엔 영업이익 증가율이 매출의 3배 넘으면 제외)
         m_ = metrics(series, len(series) - 1)
         oy, ry = m_.get("op_yoy"), m_.get("rev_yoy")
         if oy is not None and oy >= 50 and oy >= 3 * max(ry or 0, 5):
-            excl = True
-            adj_txt = f" · 금액 미공개, 영업이익 {oy:+.0f}%가 매출({(ry or 0):+.0f}%)보다 크게 튀어 증익 상당 부분이 일회성으로 추정"
+            adj_txt = f" · 금액 미공개, 영업이익 {oy:+.0f}%가 매출({(ry or 0):+.0f}%)보다 크게 높아 증익 일부가 일회성일 수 있음(확인 필요)"
     if amt and op is not None:
         adj = op - amt * 100
         s2 = [dict(x) for x in series]; s2[-1]["op"] = adj
