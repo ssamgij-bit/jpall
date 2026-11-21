@@ -2253,7 +2253,7 @@ def main():
         try: maybe_digest(st)
         except Exception: traceback.print_exc()
         for fn in (lambda: watch_sync(st), lambda: tg_commands(st, names), lambda: maybe_followup(st), lambda: hold_work(st, names), lambda: maybe_preview(st, names),
-                   lambda: perf_update(st), lambda: maybe_weekly(st), lambda: maybe_ideas(st)):
+                   lambda: perf_update(st), lambda: maybe_ideas(st)):   # 주간 신호 성과 점검(maybe_weekly)은 보내지 않음(사용자 요청, 2026-11-21)
             try: fn()
             except Exception as e: log("extra error", e)
         q = st.get("queue", [])
