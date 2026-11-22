@@ -87,7 +87,14 @@ jobs:
           NAMES = {"run.yml": "일본 뉴스 봇", "highs.yml": "신고가·상승률 봇", "community.yml": "일본 커뮤니티 봇", "morning.yml": "아침 브리핑", "weather.yml": "서울 날씨 알림"}
           for f, name in NAMES.items():
               try:
-                  r = (get(f"https://api.github.com/repos/{repo.split('/')[0]}/jpnews/actions/workflows/{f}/runs?per_page=1").get("workflow_runs") or [None])[0]
+                  rs_ = get(f"https://api.github.com/repos/{repo.split('/')[0]}/jpnews/actions/workflows/{f}/runs?per_page=5").get("workflow_runs") or []
+                  # 사람이 취소한 수동 실행(시작 전 대기 중 취소 등, 15분 안에 끝난 cancelled)은 건너뛰고 그다음 실행으로 판단(2026-11-22)
+                  def _short_cancel(x):
+                      if x.get("conclusion") != "cancelled": return False
+                      a = dt.datetime.fromisoformat((x.get("run_started_at") or x["created_at"]).replace("Z", "+00:00"))
+                      b = dt.datetime.fromisoformat(x["updated_at"].replace("Z", "+00:00"))
+                      return (b - a).total_seconds() < 900
+                  r = next((x for x in rs_ if not _short_cancel(x)), None)
                   if not r: continue
                   ca = dt.datetime.fromisoformat(r["created_at"].replace("Z", "+00:00"))
                   ua = dt.datetime.fromisoformat(r["updated_at"].replace("Z", "+00:00"))
