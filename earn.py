@@ -1686,6 +1686,72 @@ def jp_summaries():
     _JPSUM["t"] = time.time()
     _JPSUM["run"] = POOL.submit(_jps_job, key)
 
+# ───── japan stock 봇: 관심 종목 뉴스 수집 대행(2026-11-29) ─────
+# 워커(Cloudflare) 서버에서는 야후 파이낸스 재팬이 403, 구글 뉴스가 503으로 막혀 종목 뉴스가 거의 안 들어옴
+# → 여기(GitHub)서 대신 모아 워커로 보냄. 거르기(종목명 일치·잡음)·중복 제거·발송은 워커가 기존 기준 그대로 함
+_JPNEWS = {"t": 0, "run": None, "ptr": 0}
+JPNEWS_EVERY = 240      # 4분마다
+JPNEWS_PER_RUN = 12     # 한 번에 확인할 종목 수(워커가 주인 종목을 앞에 줌)
+
+def _yahoo_news(code):
+    h = http(f"https://finance.yahoo.co.jp/quote/{code}.T/news", timeout=20).decode("utf-8", "ignore")
+    out = []
+    for m in re.finditer(r'<a href="(/news/detail/[0-9a-f]+)"[^>]*>(?:(?!</a>)[\s\S])*?<h3[^>]*>([\s\S]*?)</h3>([\s\S]*?)</a>', h):
+        title = nfkc(html.unescape(re.sub(r"<[^>]+>", "", m.group(2)))).strip()
+        sup = [x.strip() for x in re.sub(r"<[^>]+>", "|", m.group(3)).split("|") if x.strip()]
+        y = (now() - dt.timedelta(days=1))
+        if not any(re.fullmatch(r"\d{1,2}:\d{2}", x) or x == f"{y.month}/{y.day}" for x in sup):
+            continue   # 오늘(시각 표시)·어제(날짜 표시) 기사만 — 중복은 워커가 거름
+        src = next((x for x in sup if not re.fullmatch(r"\d{1,2}[:/]\d{1,2}", x)), "Yahoo!ファイナンス")
+        out.append({"code": code, "title": title, "url": "https://finance.yahoo.co.jp" + m.group(1), "src": src, "via": "yahoo"})
+    return out[:10]
+
+def _gnews(code, q):
+    u = "https://news.google.com/rss/search?q=" + urllib.parse.quote(f'"{q}" when:1d') + "&hl=ja&gl=JP&ceid=JP:ja"
+    x = http(u, timeout=20).decode("utf-8", "ignore")
+    out = []
+    for b in re.findall(r"<item>([\s\S]*?)</item>", x)[:8]:
+        def g(tag):
+            m = re.search(rf"<{tag}[^>]*>([\s\S]*?)</{tag}>", b)
+            return html.unescape(re.sub(r"<!\[CDATA\[|\]\]>", "", m.group(1))).strip() if m else ""
+        title, src, link = nfkc(g("title")), g("source"), g("link")
+        if src and title.endswith(" - " + src):
+            title = title[:-(len(src) + 3)]
+        if title and link:
+            out.append({"code": code, "title": title, "url": link, "src": src or "Google News", "via": "gnews"})
+    return out
+
+def _jpnews_job(key):
+    try:
+        codes = json.loads(http(JPS_URL + "/newscodes", timeout=20, headers={"x-watch-key": key})).get("codes") or []
+    except Exception as e:
+        log("jps newscodes error", str(e)[:80]); return
+    if not codes: return
+    k = min(JPNEWS_PER_RUN, len(codes))
+    batch = [codes[(_JPNEWS["ptr"] + i) % len(codes)] for i in range(k)]
+    _JPNEWS["ptr"] = (_JPNEWS["ptr"] + k) % len(codes)
+    items, err = [], {"yahoo": 0, "gnews": 0}
+    for c in batch:
+        try: items += _yahoo_news(c["code"])
+        except Exception: err["yahoo"] += 1
+        if c.get("q"):
+            try: items += _gnews(c["code"], c["q"])
+            except Exception: err["gnews"] += 1
+        time.sleep(1)
+    try:
+        r = http(JPS_URL + "/newspush", timeout=30, data=json.dumps({"items": items}, ensure_ascii=False).encode(),
+                 headers={"x-watch-key": key, "content-type": "application/json"}).decode()
+        log("japan stock 뉴스 수집 대행:", k, "종목", len(items), "건 →", r[:120], "| 실패", err)
+    except Exception as e:
+        log("jps newspush error", str(e)[:80])
+
+def jp_news():
+    """4분마다: japan stock 봇 관심 종목 뉴스를 대신 수집(작업 스레드, 메인 루프는 막지 않음)"""
+    key = os.environ.get("WATCH_KEY")
+    if not key or time.time() - _JPNEWS["t"] < JPNEWS_EVERY or (_JPNEWS["run"] and not _JPNEWS["run"].done()): return
+    _JPNEWS["t"] = time.time()
+    _JPNEWS["run"] = POOL.submit(_jpnews_job, key)
+
 _JPFIND = {"t": 0, "run": None}
 def _find_job(key, st):
     """japan stock 봇 /find(찾기) 요청 → 종목 통합 보기를 만들어 돌려줌(earn_find.py)"""
@@ -3336,6 +3402,8 @@ def main():
             try: jp_summaries()   # 부가 기능: 실패해도 아래 결산 판별을 막지 않음
             except Exception: traceback.print_exc()
             try: jp_find(st)   # japan stock 봇 /find 종목 통합 보기
+            except Exception: traceback.print_exc()
+            try: jp_news()   # japan stock 봇 관심 종목 뉴스 수집 대행
             except Exception: traceback.print_exc()
             if time.time() - last_scan > 90:
                 last_scan = time.time()
