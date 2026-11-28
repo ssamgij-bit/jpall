@@ -87,6 +87,12 @@ jobs:
                   mk = (time.time() * 1000 - (gk.get("ok_at") or 0)) / 60000
                   ge = str(gk.get("err") or "원인 기록 없음")[:120]
                   flag("kicker", f"봇 실행 대행(japan stock 서버 → GitHub): {mk:.0f}분째 실행을 못 띄움 — {ge} (GitHub 토큰 만료·권한 확인 필요)", mk >= 30)
+                  try:   # 토큰 만료 2주 전부터 알림(만료되면 GitHub 봇 전체가 멈춤)
+                      ex_ = dt.date.fromisoformat(str(gk.get("exp") or "")[:10])
+                      left_ = (ex_ - dt.datetime.now(dt.timezone.utc).date()).days
+                      flag("gh_token", f"GitHub 토큰(bot-kicker)이 {left_}일 뒤({ex_}) 만료됩니다 — 새 토큰을 만들어 Cloudflare의 GH_DISPATCH_TOKEN에 넣어 주세요", left_ <= 14)
+                  except ValueError:
+                      pass
           except Exception as e:
               print("jp-disclosure-bot health error", e)
               flag("jpstock", f"japan stock 봇: 상태 확인 실패({str(e)[:60]})", True)
@@ -153,7 +159,7 @@ jobs:
           new = [k for k in stale if t_now - alerted.get(k, 0) > 86400]   # 처음 생긴 문제, 또는 하루 넘게 계속되는 문제
           back = [k for k in list(alerted) if not k.startswith("_") and k in checked and k not in stale]   # 알렸던 문제 중 이제 정상인 것
           NAMEK = {"earn-state": "실적 스크리닝 봇", "state": "일본공시봇(JP_ALL)", "jpstock": "japan stock 봇",
-                   "jpstock_tr": "japan stock 제목 번역", "jpstock_sum": "japan stock 요약", "jpstock_news": "japan stock 뉴스 수집 대행", "kicker": "봇 실행 대행",
+                   "jpstock_tr": "japan stock 제목 번역", "jpstock_sum": "japan stock 요약", "jpstock_news": "japan stock 뉴스 수집 대행", "kicker": "봇 실행 대행", "gh_token": "GitHub 토큰 만료 예고",
                    "news_sum": "일본 뉴스 봇 요약", "news_tri": "일본 뉴스 봇 선별", "newsrepo": "뉴스 저장소 접근", "naver": "네이버 프리미엄 요약 봇(맥)", **NAMES}
           lines = [stale[k] for k in new] + [f"✅ 복구: {NAMEK.get(k, k)}" for k in back]
           sent = False
