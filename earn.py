@@ -1624,6 +1624,16 @@ def _article_text(url):
     try: h = raw.decode((m.group(1).decode() if m else "utf-8"), "ignore")
     except LookupError: h = raw.decode("utf-8", "ignore")
     h = re.sub(r"(?is)<(script|style|noscript|header|footer|nav|aside)[^>]*>.*?</\1>", " ", h)
+    # 본문이 <p>가 아니라 한 덩어리 <div>(줄바꿈 <br>)에 든 사이트(야후 파이낸스 재팬 등, 2026-11-29: 요약 누락의 주원인)
+    m = re.search(r'<div[^>]*class="[^"]*(?:ArticleDetail__body|RichBody|article[-_]?[bB]ody|articleBody)[^"]*"[^>]*>', h)
+    if m:
+        depth, i = 1, m.end()
+        for t in re.finditer(r"<(/?)div\b", h[m.end():m.end() + 60000]):
+            depth += -1 if t.group(1) else 1
+            if depth == 0: i = m.end() + t.start(); break
+        else: i = min(len(h), m.end() + 20000)
+        d = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", h[m.end():i]))).strip()
+        if len(d) >= 120: return d
     ps = [html.unescape(re.sub(r"<[^>]+>", "", p)).strip() for p in re.findall(r"(?is)<p[^>]*>(.*?)</p>", h)]
     ps = [p for p in ps if len(p) >= 25 and not re.search(r"Copyright|無断転載|ログイン|会員登録|cookie", p, re.I)]
     t = re.sub(r"\s+", " ", " ".join(ps))
