@@ -1656,6 +1656,7 @@ def _jps_job(key):
             try:
                 real = _gn_decode(x["url"])
                 body = _article_text(real)
+                if "フラッシュニュースです" in body[:80]: body = ""   # 제목만 옮긴 속보(본문 없음) — 제목뿐인 내용을 요약이라고 붙이지 않음
                 if len(body) > 120:
                     j = gemini_json(JPS_NEWS_SYS.format(title=x["title"], body=body[:3500]), timeout=60, models=MON_MODELS) or {}
                     lines = [re.sub(r"^\s*(?:[•\-*・]|\d{1,2}[.)])\s*", "", str(l)).strip() for l in (j.get("lines") or [])][:3]
@@ -1703,11 +1704,14 @@ _JPNEWS = {"t": 0, "run": None, "ptr": 0}
 JPNEWS_EVERY = 240      # 4분마다
 JPNEWS_PER_RUN = 12     # 한 번에 확인할 종목 수(워커가 주인 종목을 앞에 줌)
 
+_JPNEWS_NOISE = re.compile(r"【アナリスト予想】.*対前週|^本日の【|ランキング|銘柄カルテ|転換銘柄一覧|雲抜け銘柄一覧|リターン・リバーサル|新株交付リスト|レーティング[週日]報")
+
 def _yahoo_news(code):
     h = http(f"https://finance.yahoo.co.jp/quote/{code}.T/news", timeout=20).decode("utf-8", "ignore")
     out = []
     for m in re.finditer(r'<a href="(/news/detail/[0-9a-f]+)"[^>]*>(?:(?!</a>)[\s\S])*?<h3[^>]*>([\s\S]*?)</h3>([\s\S]*?)</a>', h):
         title = nfkc(html.unescape(re.sub(r"<[^>]+>", "", m.group(2)))).strip()
+        if _JPNEWS_NOISE.search(title): continue   # 자동 생성 기사(컨센서스 주간 변동·기술적 신호 목록·순위표 등)는 알림 가치가 낮아 뺌(2026-11-29)
         sup = [x.strip() for x in re.sub(r"<[^>]+>", "|", m.group(3)).split("|") if x.strip()]
         y = (now() - dt.timedelta(days=1))
         if not any(re.fullmatch(r"\d{1,2}:\d{2}", x) or x == f"{y.month}/{y.day}" for x in sup):
