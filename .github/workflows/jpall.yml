@@ -2,7 +2,7 @@ name: JP_ALL
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # 10분마다 시작 시도(실행 중이면 대기). GitHub 예약 실행은 몇 시간씩 밀리므로 끝날 때 다음 실행을 직접 띄움(이어 달리기)
+    - cron: "*/10 * * * *"   # 10분마다 한 번(8분 돌고 끝). 예약 실행이 몇 시간씩 밀려 japan stock 봇 서버(Cloudflare)가 같은 시간표로 대신 띄움. 2026-11-29: 끝날 때 다음 실행을 직접 띄우던 이어 달리기는 없앰(GitHub 상시 실행 규정 위반 위험 — jpnews 저장소가 비활성화된 일)
   workflow_dispatch: {}
 
 concurrency:
@@ -11,12 +11,11 @@ concurrency:
 
 permissions:
   contents: write
-  actions: write
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
 
@@ -66,7 +65,7 @@ jobs:
           WATCH_KEY: ${{ secrets.WATCH_KEY }}
           EARN_TOKEN: ${{ secrets.EARN_TOKEN }}   # 가부탄이 막힐 때 실적 봇의 즉시 응답 관문으로 받기 위한 키 계산용
           EARN_GATEWAY_URL: https://earn-gateway.ssamgij.workers.dev
-          RUN_SECONDS: "1680"
+          RUN_SECONDS: "480"   # 한 번 8분(예약 실행 간격 10분 안에 끝남)
         run: python jpall.py
 
       - name: 상태 저장(state 브랜치에 덮어쓰기)
@@ -80,17 +79,3 @@ jobs:
           git add -A
           git commit -qm "state $(date -u +%FT%TZ)" || exit 0
           git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" state
-
-      - name: 다음 실행 이어 붙이기(예약 실행이 늦거나 안 돌 때 대비)
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # 이미 대기 중이거나 실행 중인 다른 JP_ALL 실행이 있으면 건너뜀(중복 방지)
-          n=$(gh run list -R "${{ github.repository }}" --workflow jpall.yml --limit 20 --json status,databaseId \
-               -q '[.[] | select((.status=="queued" or .status=="in_progress" or .status=="pending" or .status=="waiting") and .databaseId != ${{ github.run_id }})] | length')
-          if [ "${n:-0}" = "0" ]; then gh workflow run jpall.yml -R "${{ github.repository }}" --ref main && echo "다음 실행 요청"; else echo "다른 실행 $n개 있음 → 건너뜀"; fi
-          # 서로 살리기(2026-11-04): 실적 스크리닝이 실행 중·대기 중이 아니면 띄움 — 예약 실행이 밀리고 이어 붙이기가 끊겨 1시간 넘게 멈춘 일이 있었음
-          m=$(gh run list -R "${{ github.repository }}" --workflow earn.yml --limit 10 --json status \
-               -q '[.[] | select(.status=="queued" or .status=="in_progress" or .status=="pending" or .status=="waiting")] | length' 2>/dev/null || echo 1)
-          if [ "${m:-1}" = "0" ]; then gh workflow run earn.yml -R "${{ github.repository }}" --ref main && echo "실적 스크리닝 멈춤 → 다시 실행 요청" || true; fi
